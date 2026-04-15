@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .categories import FULL_ROTATION_CATEGORIES, HINGE_CATEGORIES, PRISMATIC_CATEGORIES, SUPPORTED_CATEGORIES
-from .part_segmentation import build_mujoco_body_part_segmentation, segmentation_to_part_mask_u16
-from .serialization import load_json, save_json
+from ..core.categories import FULL_ROTATION_CATEGORIES, HINGE_CATEGORIES, PRISMATIC_CATEGORIES, SUPPORTED_CATEGORIES
+from ..core.serialization import load_json, save_json
+from ..perception.part_segmentation import build_mujoco_body_part_segmentation, segmentation_to_part_mask_u16
 
 
 def _normalize(vec: list[float]) -> list[float]:

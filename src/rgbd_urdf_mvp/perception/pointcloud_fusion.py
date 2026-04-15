@@ -8,9 +8,9 @@ from pathlib import Path
 from statistics import median
 from typing import Iterable
 
-from .mujoco_recorder import orbit_camera_pose
+from ..core.serialization import load_episode, save_json
+from ..sim.mujoco_recorder import orbit_camera_pose
 from .part_segmentation import part_name_lookup
-from .serialization import load_episode, save_json
 
 
 @dataclass(slots=True)

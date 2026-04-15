@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .categories import FULL_ROTATION_CATEGORIES, HINGE_CATEGORIES, PRISMATIC_CATEGORIES
-from .geometry import primitive_volume, write_obj
-from .models import EpisodeInput, PrimitiveBox, ReconstructionArtifact
+from ..core.categories import FULL_ROTATION_CATEGORIES, HINGE_CATEGORIES, PRISMATIC_CATEGORIES
+from ..core.geometry import primitive_volume, write_obj
+from ..core.models import EpisodeInput, PrimitiveBox, ReconstructionArtifact
 
 
 DEFAULT_PRIMITIVES: dict[str, list[PrimitiveBox]] = {

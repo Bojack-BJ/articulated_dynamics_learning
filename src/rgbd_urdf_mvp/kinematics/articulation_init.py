@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .categories import FULL_ROTATION_CATEGORIES, HINGE_CATEGORIES, PRISMATIC_CATEGORIES
-from .geometry import primitive_volume
-from .models import (
+from ..core.categories import FULL_ROTATION_CATEGORIES, HINGE_CATEGORIES, PRISMATIC_CATEGORIES
+from ..core.geometry import primitive_volume
+from ..core.models import (
     ArticulationArtifact,
     EpisodeInput,
     JointArtifact,

@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .categories import SUPPORTED_CATEGORIES, normalize_category
+from ..core.categories import SUPPORTED_CATEGORIES, normalize_category
 from .usda_to_obj import convert_usda_to_obj
 from .usd_joint_parser import USDJointDef, extract_joints_from_usd_file, usd_joint_to_mjcf_string
 

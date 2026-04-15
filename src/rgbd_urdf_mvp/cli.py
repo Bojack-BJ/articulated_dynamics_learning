@@ -2,20 +2,30 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
-from .categories import SUPPORTED_CATEGORIES, normalize_category
+from .core.categories import SUPPORTED_CATEGORIES, normalize_category
+from .core.cli_config import YAMLSubsetError, expand_config_argv
 from .pipeline import RGBDToURDFPipeline
-from .serialization import load_episode, validate_episode
+from .core.serialization import load_episode, validate_episode
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the project CLI.
+
+    The parser stays grouped by workflow so the file remains readable even
+    though the project exposes recording, pointcloud, articulation, and export
+    commands from one entry point.
+    """
     parser = argparse.ArgumentParser(description="RGB-D to URDF MVP scaffold")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    # Episode-level schema checks.
     validate_parser = subparsers.add_parser("validate-episode", help="Validate an episode manifest")
     validate_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
 
+    # End-to-end scaffold pipeline.
     run_parser = subparsers.add_parser("run", help="Run the end-to-end MVP pipeline")
     run_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
     run_parser.add_argument(
@@ -24,7 +34,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("outputs") / "run",
         help="Directory for pipeline outputs",
     )
+    run_parser.add_argument(
+        "--path",
+        choices=["feedforward", "optimization"],
+        default="optimization",
+        help=(
+            "Pipeline path. 'feedforward' stops after articulation init; "
+            "'optimization' runs the temporal refinement stage before export."
+        ),
+    )
 
+    # 4D pointcloud fusion and inspection.
     fuse_parser = subparsers.add_parser(
         "fuse-pointcloud",
         help="Fuse multi-view depth observations into a time-indexed 4D point cloud",
@@ -83,7 +103,91 @@ def build_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="Default rendered point radius in pixels",
     )
+    viewer_parser.add_argument(
+        "--part-poses-json",
+        type=Path,
+        default=None,
+        help="Optional part_poses.json override used for joint overlays",
+    )
+    viewer_parser.add_argument(
+        "--joint-inference-json",
+        type=Path,
+        default=None,
+        help="Optional joint_inference.json override used for joint overlays",
+    )
 
+    # Part-level perception and kinematics from pointclouds.
+    part_pose_parser = subparsers.add_parser(
+        "estimate-part-poses",
+        help="Estimate per-part per-frame 6D poses from a part-labeled fused pointcloud",
+    )
+    part_pose_parser.add_argument(
+        "input",
+        type=Path,
+        help="Path to fusion_manifest.json or pointcloud_4d.ply with part_id labels",
+    )
+    part_pose_parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Where to write the estimated part pose artifact",
+    )
+    part_pose_parser.add_argument(
+        "--min-points-per-part",
+        type=int,
+        default=24,
+        help="Minimum per-frame point count required to emit a valid pose sample",
+    )
+    part_pose_parser.add_argument(
+        "--anchor-part-id",
+        type=int,
+        default=None,
+        help="Optional part id to use as the relative-pose anchor instead of auto-selecting the base/static part",
+    )
+
+    joint_parser = subparsers.add_parser(
+        "infer-joints",
+        help="Infer joint type, axis, and pivot from per-part per-frame pose tracks",
+    )
+    joint_parser.add_argument(
+        "input",
+        type=Path,
+        help="Path to part_poses.json",
+    )
+    joint_parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Where to write the inferred joint artifact",
+    )
+    joint_parser.add_argument(
+        "--rotation-threshold-rad",
+        type=float,
+        default=0.20,
+        help="Minimum rotation range required to classify a moving part as revolute",
+    )
+    joint_parser.add_argument(
+        "--translation-threshold-m",
+        type=float,
+        default=0.02,
+        help="Minimum translation range required to classify a moving part as prismatic when rotation is small",
+    )
+
+    inferred_export_parser = subparsers.add_parser(
+        "export-inferred-articulation",
+        help="Build articulation_artifact + URDF/MJCF from episode, part poses, and inferred joints",
+    )
+    inferred_export_parser.add_argument("episode", type=Path, help="Path to episode.json")
+    inferred_export_parser.add_argument("part_poses", type=Path, help="Path to part_poses.json")
+    inferred_export_parser.add_argument("joint_inference", type=Path, help="Path to joint_inference.json")
+    inferred_export_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for articulation and URDF outputs (defaults to <joint_inference_dir>/inferred_articulation)",
+    )
+
+    # MuJoCo recording and mask generation.
     render_masks_parser = subparsers.add_parser(
         "render-mujoco-masks",
         help="Render target-object segmentation masks for an existing MuJoCo episode",
@@ -346,8 +450,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point.
+
+    In addition to normal subcommands, the CLI accepts a single YAML/JSON config
+    file path or `--config config.yaml`, which expands into ordinary argv before
+    argparse handles the command.
+    """
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        expanded_argv = expand_config_argv(raw_argv, parser)
+    except YAMLSubsetError as exc:
+        parser.error(str(exc))
+    args = parser.parse_args(expanded_argv)
 
     if args.command == "validate-episode":
         episode = load_episode(args.episode)
@@ -366,12 +481,16 @@ def main(argv: list[str] | None = None) -> int:
             for error in errors:
                 print(error)
             return 1
-        result = RGBDToURDFPipeline().run(episode, args.output_dir)
-        print(json.dumps(result.to_dict(), indent=2))
+        result = RGBDToURDFPipeline().run(
+            episode,
+            args.output_dir,
+            path_mode=str(args.path),
+        )
+        print(json.dumps({"path_mode": str(args.path), **result.to_dict()}, indent=2))
         return 0
 
     if args.command == "fuse-pointcloud":
-        from .pointcloud_fusion import EpisodePointCloudFuser, PointCloudFusionConfig
+        from .perception.pointcloud_fusion import EpisodePointCloudFuser, PointCloudFusionConfig
 
         manifest_path = EpisodePointCloudFuser(
             PointCloudFusionConfig(
@@ -388,7 +507,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "visualize-pointcloud":
-        from .pointcloud_viz import PointCloudViewerBuilder, PointCloudVisualizationConfig
+        from .perception.pointcloud_viz import PointCloudViewerBuilder, PointCloudVisualizationConfig
 
         html_path = PointCloudViewerBuilder(
             PointCloudVisualizationConfig(
@@ -396,13 +515,62 @@ def main(argv: list[str] | None = None) -> int:
                 output_html=args.output_html,
                 max_points_per_frame=max(1, int(args.max_points_per_frame)),
                 point_radius_px=float(args.point_radius_px),
+                part_pose_path=args.part_poses_json,
+                joint_inference_path=args.joint_inference_json,
             )
         ).build()
         print(json.dumps({"viewer_html": str(html_path.resolve())}, indent=2))
         return 0
 
+    if args.command == "estimate-part-poses":
+        from .perception.part_pose import PartPoseEstimationConfig, PartPoseEstimator
+
+        output_json = PartPoseEstimator(
+            PartPoseEstimationConfig(
+                input_path=args.input,
+                output_json=args.output_json,
+                min_points_per_part=max(1, int(args.min_points_per_part)),
+                anchor_part_id=args.anchor_part_id,
+            )
+        ).estimate()
+        print(json.dumps({"part_pose_artifact": str(output_json.resolve())}, indent=2))
+        return 0
+
+    if args.command == "infer-joints":
+        from .kinematics.joint_inference import JointInferenceConfig, JointInferencer
+
+        output_json = JointInferencer(
+            JointInferenceConfig(
+                input_path=args.input,
+                output_json=args.output_json,
+                rotation_threshold_rad=float(args.rotation_threshold_rad),
+                translation_threshold_m=float(args.translation_threshold_m),
+            )
+        ).infer()
+        print(json.dumps({"joint_inference_artifact": str(output_json.resolve())}, indent=2))
+        return 0
+
+    if args.command == "export-inferred-articulation":
+        from .kinematics.inferred_articulation import InferredArticulationPipeline, InferredArticulationPipelineConfig
+
+        output_dir = (
+            args.output_dir
+            if args.output_dir is not None
+            else args.joint_inference.resolve().parent / "inferred_articulation"
+        )
+        result = InferredArticulationPipeline().run(
+            InferredArticulationPipelineConfig(
+                episode_path=args.episode,
+                part_pose_path=args.part_poses,
+                joint_inference_path=args.joint_inference,
+                output_dir=output_dir,
+            )
+        )
+        print(json.dumps(result.to_dict(), indent=2))
+        return 0
+
     if args.command == "render-mujoco-masks":
-        from .mujoco_recorder import MuJoCoMaskRenderConfig, MuJoCoMaskRenderer
+        from .sim.mujoco_recorder import MuJoCoMaskRenderConfig, MuJoCoMaskRenderer
 
         episode_path = MuJoCoMaskRenderer(
             MuJoCoMaskRenderConfig(
@@ -417,7 +585,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "record-mujoco":
-        from .mujoco_recorder import MuJoCoEpisodeRecorder, MuJoCoRecordConfig
+        from .sim.mujoco_recorder import MuJoCoEpisodeRecorder, MuJoCoRecordConfig
 
         frame_count = int(args.frames)
         frame_dt = float(args.frame_dt)

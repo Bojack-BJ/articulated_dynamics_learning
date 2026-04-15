@@ -4,9 +4,9 @@ import math
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-from .geometry import combine_bounds, shifted_boxes, size_from_bounds, write_obj
-from .models import ArticulationArtifact, EpisodeInput, PartArtifact, PrimitiveBox, URDFPackage
-from .serialization import save_json
+from ..core.geometry import combine_bounds, shifted_boxes, size_from_bounds, write_obj
+from ..core.models import ArticulationArtifact, EpisodeInput, PartArtifact, PrimitiveBox, URDFPackage
+from ..core.serialization import save_json
 
 
 def _format_xyz(values: list[float]) -> str:
@@ -153,43 +153,153 @@ class URDFExporter:
         worldbody = ET.SubElement(root, "worldbody")
 
         part_map = {part.name: part for part in articulation.parts}
-        base_part = part_map.get("base_link")
-        moving_part = part_map.get("moving_link")
-        joint = articulation.joints[0] if articulation.joints else None
-        if base_part is None or moving_part is None or joint is None:
+        if not part_map:
             ET.ElementTree(root).write(mjcf_path, encoding="utf-8", xml_declaration=True)
             return
 
-        base_body = ET.SubElement(worldbody, "body", name=base_part.name, pos="0 0 0")
-        for box in base_part.primitive_boxes[:3]:
-            ET.SubElement(
-                base_body,
-                "geom",
-                type="box",
-                pos=_format_xyz(box.center),
-                size=_format_xyz([dimension / 2.0 for dimension in box.size]),
-                rgba="0.7 0.7 0.7 1",
-            )
+        children_by_parent: dict[str, list] = {}
+        child_names = set()
+        for joint in articulation.joints:
+            if joint.parent not in part_map or joint.child not in part_map:
+                continue
+            children_by_parent.setdefault(joint.parent, []).append(joint)
+            child_names.add(joint.child)
 
-        moving_body = ET.SubElement(base_body, "body", name=moving_part.name, pos=_format_xyz(joint.origin))
-        ET.SubElement(
-            moving_body,
-            "joint",
-            name=joint.name,
-            type="hinge" if joint.joint_type == "revolute" else "slide",
-            axis=_format_xyz(joint.axis),
-            range=_format_xyz(joint.limits),
-        )
-        link_frame = list(moving_part.canonical_pose.get("translation", [0.0, 0.0, 0.0]))
-        local_boxes = shifted_boxes(moving_part.primitive_boxes, link_frame)
-        for box in local_boxes[:3]:
-            ET.SubElement(
-                moving_body,
-                "geom",
-                type="box",
-                pos=_format_xyz(box.center),
-                size=_format_xyz([dimension / 2.0 for dimension in box.size]),
-                rgba="0.8 0.3 0.3 1",
+        roots = [part for part in articulation.parts if part.name not in child_names]
+        if not roots:
+            roots = list(articulation.parts[:1])
+
+        visited: set[str] = set()
+        # URDF already stores an explicit link/joint graph. The MJCF stub
+        # rebuilds that graph recursively as nested MuJoCo bodies.
+        for root_part in roots:
+            self._append_mjcf_body(
+                parent_node=worldbody,
+                part=root_part,
+                part_map=part_map,
+                children_by_parent=children_by_parent,
+                visited=visited,
+                body_pos=list(root_part.canonical_pose.get("translation", [0.0, 0.0, 0.0])),
+                depth=0,
             )
 
         ET.ElementTree(root).write(mjcf_path, encoding="utf-8", xml_declaration=True)
+
+    def _append_mjcf_body(
+        self,
+        parent_node: ET.Element,
+        part: PartArtifact,
+        part_map: dict[str, PartArtifact],
+        children_by_parent: dict[str, list],
+        visited: set[str],
+        body_pos: list[float],
+        depth: int,
+    ) -> None:
+        if part.name in visited:
+            return
+        visited.add(part.name)
+
+        body = ET.SubElement(parent_node, "body", name=part.name, pos=_format_xyz(body_pos))
+        self._append_mjcf_geoms(body, part, depth)
+
+        for joint in children_by_parent.get(part.name, []):
+            child_part = part_map.get(joint.child)
+            if child_part is None:
+                continue
+            child_body = ET.SubElement(body, "body", name=child_part.name, pos=_format_xyz(joint.origin))
+            joint_type = self._mjcf_joint_type(joint.joint_type)
+            if joint_type is not None:
+                ET.SubElement(
+                    child_body,
+                    "joint",
+                    name=joint.name,
+                    type=joint_type,
+                    axis=_format_xyz(joint.axis),
+                    range=_format_xyz(joint.limits),
+                )
+            self._append_mjcf_geoms(child_body, child_part, depth + 1)
+            visited.add(child_part.name)
+            for nested_joint in children_by_parent.get(child_part.name, []):
+                nested_part = part_map.get(nested_joint.child)
+                if nested_part is None:
+                    continue
+                self._append_mjcf_child_subtree(
+                    child_body,
+                    nested_part,
+                    nested_joint,
+                    part_map,
+                    children_by_parent,
+                    visited,
+                    depth + 2,
+                )
+
+    def _append_mjcf_child_subtree(
+        self,
+        parent_body: ET.Element,
+        part: PartArtifact,
+        joint,
+        part_map: dict[str, PartArtifact],
+        children_by_parent: dict[str, list],
+        visited: set[str],
+        depth: int,
+    ) -> None:
+        if part.name in visited:
+            return
+        body = ET.SubElement(parent_body, "body", name=part.name, pos=_format_xyz(joint.origin))
+        joint_type = self._mjcf_joint_type(joint.joint_type)
+        if joint_type is not None:
+            ET.SubElement(
+                body,
+                "joint",
+                name=joint.name,
+                type=joint_type,
+                axis=_format_xyz(joint.axis),
+                range=_format_xyz(joint.limits),
+            )
+        self._append_mjcf_geoms(body, part, depth)
+        visited.add(part.name)
+        for nested_joint in children_by_parent.get(part.name, []):
+            nested_part = part_map.get(nested_joint.child)
+            if nested_part is None:
+                continue
+            self._append_mjcf_child_subtree(
+                body,
+                nested_part,
+                nested_joint,
+                part_map,
+                children_by_parent,
+                visited,
+                depth + 1,
+            )
+
+    def _append_mjcf_geoms(self, body: ET.Element, part: PartArtifact, depth: int) -> None:
+        link_frame = list(part.canonical_pose.get("translation", [0.0, 0.0, 0.0]))
+        local_boxes = shifted_boxes(part.primitive_boxes, link_frame)
+        rgba = self._mjcf_rgba(part, depth)
+        for box in local_boxes[:3]:
+            ET.SubElement(
+                body,
+                "geom",
+                type="box",
+                pos=_format_xyz(box.center),
+                size=_format_xyz([dimension / 2.0 for dimension in box.size]),
+                rgba=rgba,
+            )
+
+    def _mjcf_joint_type(self, joint_type: str) -> str | None:
+        if joint_type == "revolute":
+            return "hinge"
+        if joint_type == "prismatic":
+            return "slide"
+        return None
+
+    def _mjcf_rgba(self, part: PartArtifact, depth: int) -> str:
+        if part.role == "static":
+            return "0.70 0.70 0.70 1"
+        palette = [
+            "0.83 0.36 0.36 1",
+            "0.36 0.67 0.87 1",
+            "0.73 0.58 0.29 1",
+            "0.41 0.74 0.52 1",
+        ]
+        return palette[depth % len(palette)]

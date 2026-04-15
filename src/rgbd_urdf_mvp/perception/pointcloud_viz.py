@@ -5,7 +5,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-from .serialization import load_json
+from ..core.serialization import load_json
 
 
 @dataclass(slots=True)
@@ -14,6 +14,8 @@ class PointCloudVisualizationConfig:
     output_html: str | Path | None = None
     max_points_per_frame: int = 4000
     point_radius_px: float = 2.0
+    part_pose_path: str | Path | None = None
+    joint_inference_path: str | Path | None = None
     canvas_width: int = 1200
     canvas_height: int = 860
 
@@ -193,7 +195,153 @@ def _build_static_dynamic_payload(
     }
 
 
-def _load_visualization_payload(path: Path, max_points_per_frame: int) -> tuple[dict[str, object], Path]:
+def _resolve_optional_artifact_path(
+    input_path: Path,
+    explicit_path: str | Path | None,
+    default_name: str,
+) -> Path | None:
+    if explicit_path is not None:
+        candidate = Path(explicit_path).expanduser().resolve()
+        return candidate if candidate.exists() else None
+    candidate = input_path.parent / default_name
+    return candidate if candidate.exists() else None
+
+
+def _matvec3(matrix: list[list[float]], vec: list[float]) -> list[float]:
+    return [sum(matrix[row][col] * vec[col] for col in range(3)) for row in range(3)]
+
+
+def _add3(a: list[float], b: list[float]) -> list[float]:
+    return [x + y for x, y in zip(a, b)]
+
+
+def _norm3(vec: list[float]) -> float:
+    return math.sqrt(sum(value * value for value in vec))
+
+
+def _normalize3(vec: list[float], fallback: list[float] | None = None) -> list[float]:
+    length = _norm3(vec)
+    if length < 1e-9:
+        return list(fallback) if fallback is not None else [0.0, 0.0, 1.0]
+    return [value / length for value in vec]
+
+
+def _load_joint_overlay_payload(
+    input_path: Path,
+    frames: list[dict[str, object]],
+    bounds: dict[str, list[float]],
+    part_pose_path: str | Path | None,
+    joint_inference_path: str | Path | None,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    resolved_part_pose_path = _resolve_optional_artifact_path(input_path, part_pose_path, "part_poses.json")
+    resolved_joint_path = _resolve_optional_artifact_path(input_path, joint_inference_path, "joint_inference.json")
+    if resolved_part_pose_path is None or resolved_joint_path is None:
+        return [], {
+            "has_joint_overlays": False,
+            "joint_overlay_count": 0,
+            "joint_inference_path": None,
+            "part_pose_path": None,
+        }
+
+    part_pose_artifact = load_json(resolved_part_pose_path)
+    joint_artifact = load_json(resolved_joint_path)
+    part_samples_by_id: dict[int, dict[int, dict[str, object]]] = {}
+    for part in part_pose_artifact.get("parts", []):
+        if not isinstance(part, dict):
+            continue
+        part_id = int(part.get("part_id", 0))
+        frame_samples: dict[int, dict[str, object]] = {}
+        for sample in part.get("samples", []):
+            if not isinstance(sample, dict) or not bool(sample.get("valid", False)):
+                continue
+            if "rotation_matrix" not in sample or "translation" not in sample:
+                continue
+            frame_samples[int(sample.get("frame_index", 0))] = {
+                "rotation_matrix": [[float(value) for value in row] for row in sample["rotation_matrix"]],
+                "translation": [float(value) for value in sample["translation"]],
+            }
+        part_samples_by_id[part_id] = frame_samples
+
+    if not part_samples_by_id:
+        return [], {
+            "has_joint_overlays": False,
+            "joint_overlay_count": 0,
+            "joint_inference_path": str(resolved_joint_path),
+            "part_pose_path": str(resolved_part_pose_path),
+        }
+
+    max_extent = max(
+        1e-3,
+        *(bounds["upper"][axis] - bounds["lower"][axis] for axis in range(3)),
+    )
+    line_length_m = 0.35 * max_extent
+    overlays_by_frame: dict[int, list[dict[str, object]]] = {
+        int(frame["frame_index"]): [] for frame in frames
+    }
+    overlay_count = 0
+
+    for joint in joint_artifact.get("joints", []):
+        if not isinstance(joint, dict):
+            continue
+        parent_part_id = int(joint.get("parent_part_id", 0))
+        child_part_id = int(joint.get("child_part_id", 0))
+        axis_parent = [float(value) for value in joint.get("axis", [0.0, 0.0, 1.0])]
+        pivot_parent = [float(value) for value in joint.get("pivot", [0.0, 0.0, 0.0])]
+        q_by_frame = {
+            int(sample.get("frame_index", 0)): float(sample.get("q", 0.0))
+            for sample in joint.get("q_samples", [])
+            if isinstance(sample, dict)
+        }
+        parent_track = part_samples_by_id.get(parent_part_id, {})
+        if not parent_track:
+            continue
+
+        for frame in frames:
+            frame_index = int(frame["frame_index"])
+            parent_pose = parent_track.get(frame_index)
+            if parent_pose is None:
+                continue
+            parent_rotation = parent_pose["rotation_matrix"]
+            parent_translation = parent_pose["translation"]
+            axis_world = _normalize3(_matvec3(parent_rotation, axis_parent), fallback=axis_parent)
+            pivot_world = _add3(_matvec3(parent_rotation, pivot_parent), parent_translation)
+            overlays_by_frame.setdefault(frame_index, []).append(
+                {
+                    "joint_name": str(joint.get("name", f"joint_{child_part_id}")),
+                    "joint_type": str(joint.get("joint_type", "fixed")),
+                    "parent_part_id": parent_part_id,
+                    "parent_name": str(joint.get("parent_name", f"part_{parent_part_id}")),
+                    "child_part_id": child_part_id,
+                    "child_name": str(joint.get("child_name", f"part_{child_part_id}")),
+                    "pivot_world": [float(value) for value in pivot_world],
+                    "axis_world": [float(value) for value in axis_world],
+                    "q": float(q_by_frame.get(frame_index, 0.0)),
+                    "line_length_m": line_length_m,
+                }
+            )
+            overlay_count += 1
+
+    return [
+        {
+            "frame_index": int(frame["frame_index"]),
+            "items": overlays_by_frame.get(int(frame["frame_index"]), []),
+        }
+        for frame in frames
+    ], {
+        "has_joint_overlays": overlay_count > 0,
+        "joint_overlay_count": overlay_count,
+        "joint_inference_path": str(resolved_joint_path),
+        "part_pose_path": str(resolved_part_pose_path),
+        "joint_overlay_line_length_m": line_length_m,
+    }
+
+
+def _load_visualization_payload(
+    path: Path,
+    max_points_per_frame: int,
+    part_pose_path: str | Path | None = None,
+    joint_inference_path: str | Path | None = None,
+) -> tuple[dict[str, object], Path]:
     if path.suffix.lower() == ".json":
         manifest = load_json(path)
         ply_path = Path(manifest["pointcloud_4d_path"])
@@ -246,15 +394,24 @@ def _load_visualization_payload(path: Path, max_points_per_frame: int) -> tuple[
         bounds=meta["bounds"],
         voxel_size=voxel_size,
     )
+    joint_frames, joint_meta = _load_joint_overlay_payload(
+        path,
+        prepared_frames,
+        bounds=meta["bounds"],
+        part_pose_path=part_pose_path,
+        joint_inference_path=joint_inference_path,
+    )
     meta["render_point_count"] = sum(len(frame["points"]) for frame in prepared_frames)
     meta["max_points_per_frame"] = max_points_per_frame
     meta["has_part_labels"] = bool(meta.get("part_ids_present"))
     meta.update(static_meta)
+    meta.update(joint_meta)
     return {
         "meta": meta,
         "frames": prepared_frames,
         "static_points": static_points,
         "dynamic_frames": dynamic_frames,
+        "joint_frames": joint_frames,
     }, output_html
 
 
@@ -500,6 +657,7 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
       <div class="subtoolbar">
         <button id="colorHeight">Color: Height</button>
         <button id="colorPart">Color: Part</button>
+        <button id="toggleJoints">Show Joints</button>
       </div>
       <canvas id="viewer" width="{config.canvas_width}" height="{config.canvas_height}"></canvas>
       <div class="projection-grid">
@@ -549,6 +707,7 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
   const modeDynamic = document.getElementById("modeDynamic");
   const colorHeight = document.getElementById("colorHeight");
   const colorPart = document.getElementById("colorPart");
+  const toggleJoints = document.getElementById("toggleJoints");
   const statusEl = document.getElementById("status");
   const canvas = document.getElementById("viewer");
   const ctx = canvas.getContext("2d");
@@ -561,8 +720,10 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
   const frames = DATA.frames;
   const dynamicFrames = DATA.dynamic_frames || frames;
   const staticPoints = DATA.static_points || [];
+  const jointFrames = DATA.joint_frames || [];
   const meta = DATA.meta;
   const hasPartLabels = Boolean(meta.has_part_labels);
+  const hasJointOverlays = Boolean(meta.has_joint_overlays);
   const bounds = meta.bounds || {{ lower: [0,0,0], upper: [1,1,1] }};
   const center = bounds.lower.map((value, index) => (value + bounds.upper[index]) / 2);
   const extents = bounds.upper.map((value, index) => Math.max(1e-6, value - bounds.lower[index]));
@@ -572,6 +733,7 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
   let lastTick = 0;
   let viewMode = "current_static";
   let colorMode = hasPartLabels ? "part" : "height";
+  let showJoints = hasJointOverlays;
 
   function formatNumber(value) {{
     return Number(value).toFixed(3);
@@ -607,6 +769,9 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
       <div class="meta-line"><span>Point cloud</span><strong><code>${{meta.pointcloud_path}}</code></strong></div>
       <div class="meta-line"><span>Pose source</span><strong>${{(meta.pose_sources_used || []).join(", ") || "n/a"}}</strong></div>
       <div class="meta-line"><span>Part ids</span><strong>${{(meta.part_ids_present || []).join(", ") || "none"}}</strong></div>
+      <div class="meta-line"><span>Joint overlays</span><strong>${{meta.joint_overlay_count || 0}}</strong></div>
+      <div class="meta-line"><span>Part poses</span><strong><code>${{meta.part_pose_path || "n/a"}}</code></strong></div>
+      <div class="meta-line"><span>Joint inference</span><strong><code>${{meta.joint_inference_path || "n/a"}}</code></strong></div>
       ${{legendHtml}}
     `;
   }}
@@ -665,6 +830,84 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
     return pointColor(zNorm, alpha);
   }}
 
+  function projectPointForMain(point, yaw, pitch, scale) {{
+    const rotated = rotate(point, yaw, pitch);
+    const [sx, sy, perspective] = project(rotated, scale);
+    return {{ sx, sy, perspective }};
+  }}
+
+  function jointEndpoints(item) {{
+    const axis = item.axis_world || [0, 0, 1];
+    const pivot = item.pivot_world || [0, 0, 0];
+    const half = 0.5 * Number(item.line_length_m || meta.joint_overlay_line_length_m || 0.2);
+    return {{
+      start: [
+        pivot[0] - axis[0] * half,
+        pivot[1] - axis[1] * half,
+        pivot[2] - axis[2] * half,
+      ],
+      end: [
+        pivot[0] + axis[0] * half,
+        pivot[1] + axis[1] * half,
+        pivot[2] + axis[2] * half,
+      ],
+      pivot,
+    }};
+  }}
+
+  function drawJointOverlaysMain(overlays, yaw, pitch, scale, radiusBase) {{
+    if (!showJoints || !hasJointOverlays) return;
+    ctx.save();
+    ctx.lineWidth = 1.5;
+    for (const item of overlays) {{
+      const endpoints = jointEndpoints(item);
+      const start = projectPointForMain(endpoints.start, yaw, pitch, scale);
+      const end = projectPointForMain(endpoints.end, yaw, pitch, scale);
+      const pivot = projectPointForMain(endpoints.pivot, yaw, pitch, scale);
+      const color = partColor(item.child_part_id, 0.95);
+      ctx.strokeStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(start.sx, start.sy);
+      ctx.lineTo(end.sx, end.sy);
+      ctx.stroke();
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(pivot.sx, pivot.sy, Math.max(2.0, radiusBase * 1.4), 0, Math.PI * 2);
+      ctx.fill();
+    }}
+    ctx.restore();
+  }}
+
+  function drawProjectionJointOverlays(pctx, axisA, axisB, pad, overlays) {{
+    if (!showJoints || !hasJointOverlays) return;
+    const aMin = bounds.lower[axisA];
+    const aSpan = Math.max(1e-6, bounds.upper[axisA] - bounds.lower[axisA]);
+    const bMin = bounds.lower[axisB];
+    const bSpan = Math.max(1e-6, bounds.upper[axisB] - bounds.lower[axisB]);
+    for (const item of overlays) {{
+      const endpoints = jointEndpoints(item);
+      const start = endpoints.start;
+      const end = endpoints.end;
+      const pivot = endpoints.pivot;
+      const sx0 = pad + ((start[axisA] - aMin) / aSpan) * (pctx.canvas.width - 2 * pad);
+      const sy0 = pctx.canvas.height - pad - ((start[axisB] - bMin) / bSpan) * (pctx.canvas.height - 2 * pad);
+      const sx1 = pad + ((end[axisA] - aMin) / aSpan) * (pctx.canvas.width - 2 * pad);
+      const sy1 = pctx.canvas.height - pad - ((end[axisB] - bMin) / bSpan) * (pctx.canvas.height - 2 * pad);
+      const px = pad + ((pivot[axisA] - aMin) / aSpan) * (pctx.canvas.width - 2 * pad);
+      const py = pctx.canvas.height - pad - ((pivot[axisB] - bMin) / bSpan) * (pctx.canvas.height - 2 * pad);
+      pctx.strokeStyle = partColor(item.child_part_id, 0.95);
+      pctx.lineWidth = 1.5;
+      pctx.beginPath();
+      pctx.moveTo(sx0, sy0);
+      pctx.lineTo(sx1, sy1);
+      pctx.stroke();
+      pctx.fillStyle = partColor(item.child_part_id, 0.95);
+      pctx.beginPath();
+      pctx.arc(px, py, 3.0, 0, Math.PI * 2);
+      pctx.fill();
+    }}
+  }}
+
   function drawProjection(canvasEl, axisA, axisB, title) {{
     const pctx = canvasEl.getContext("2d");
     pctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
@@ -710,6 +953,8 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
       const frame = dynamicFrames[frameIndex] || {{points: []}};
       drawProjectionPoints(frame.points, 0.95, true);
     }}
+    const jointFrame = jointFrames[frameIndex] || {{items: []}};
+    drawProjectionJointOverlays(pctx, axisA, axisB, pad, jointFrame.items || []);
   }}
 
   function render() {{
@@ -765,7 +1010,9 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
 
     const frame = frames[frameIndex] || {{ time_s: 0, points: [] }};
     const dynamicFrame = dynamicFrames[frameIndex] || {{points: []}};
-    statusEl.textContent = `time=${{formatNumber(frame.time_s)}} s | frame=${{frameIndex}} | points=${{frame.points.length}} | dynamic=${{dynamicFrame.points.length}} | mode=${{viewMode}} | color=${{colorMode}}`;
+    const jointFrame = jointFrames[frameIndex] || {{items: []}};
+    drawJointOverlaysMain(jointFrame.items || [], yaw, pitch, scale, radiusBase);
+    statusEl.textContent = `time=${{formatNumber(frame.time_s)}} s | frame=${{frameIndex}} | points=${{frame.points.length}} | dynamic=${{dynamicFrame.points.length}} | joints=${{(jointFrame.items || []).length}} | mode=${{viewMode}} | color=${{colorMode}}`;
     drawProjection(projectionCanvases.front, 0, 2, "X vs Z");
     drawProjection(projectionCanvases.side, 1, 2, "Y vs Z");
     drawProjection(projectionCanvases.top, 0, 1, "X vs Y");
@@ -848,11 +1095,24 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
   modeDynamic.addEventListener("click", () => setMode("dynamic"));
   colorHeight.addEventListener("click", () => setColorMode("height"));
   colorPart.addEventListener("click", () => setColorMode("part"));
+  toggleJoints.addEventListener("click", () => {{
+    if (!hasJointOverlays) return;
+    showJoints = !showJoints;
+    toggleJoints.classList.toggle("primary", showJoints);
+    render();
+  }});
 
   if (!hasPartLabels) {{
     colorPart.disabled = true;
     colorPart.style.opacity = "0.45";
     colorPart.style.cursor = "default";
+  }}
+  if (!hasJointOverlays) {{
+    toggleJoints.disabled = true;
+    toggleJoints.style.opacity = "0.45";
+    toggleJoints.style.cursor = "default";
+  }} else {{
+    toggleJoints.classList.toggle("primary", showJoints);
   }}
 
   let drag = null;
@@ -904,6 +1164,8 @@ class PointCloudViewerBuilder:
         payload, default_output = _load_visualization_payload(
             input_path,
             max_points_per_frame=max(1, int(self.config.max_points_per_frame)),
+            part_pose_path=self.config.part_pose_path,
+            joint_inference_path=self.config.joint_inference_path,
         )
         output_html = (
             Path(self.config.output_html).resolve()

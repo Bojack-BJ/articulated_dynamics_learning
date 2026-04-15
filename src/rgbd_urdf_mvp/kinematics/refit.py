@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from statistics import fmean
 
-from .models import ArticulationArtifact, EpisodeInput, StateSample
+from ..core.models import ArticulationArtifact, EpisodeInput, StateSample
 
 
 def clamp(value: float, lower: float, upper: float) -> float:
