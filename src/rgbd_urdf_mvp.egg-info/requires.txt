@@ -1,0 +1,10 @@
+
+[simulation]
+mujoco>=3.1.0
+numpy>=1.26
+
+[viz]
+pillow>=10.0.0
+numpy>=1.26
+imageio>=2.34.0
+imageio-ffmpeg>=0.5.0

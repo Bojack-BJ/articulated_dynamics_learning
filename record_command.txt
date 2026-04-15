@@ -1,0 +1,19 @@
+Microwave:
+PYTHONPATH=src python3 -m rgbd_urdf_mvp record-mujoco examples/mujoco_models/Microwave011.xml \
+  --category microwave \
+  --object-id microwave011 \
+  --output-dir outputs/recordings \
+  --duration-s 4 \
+  --fps 20 \
+  --control-mode free \
+  --auto-initial-qvel-from-limits \
+  --auto-initial-qvel-direction-mode away-from-qpos0 \
+  --auto-initial-qvel-min-abs 25.0 \
+  --perturbation-scale 0.0 \
+  --video \
+  --camera-distance 1.2 \
+  --all-joints \
+  --camera-mode triview \
+  --camera-triview-spacing-deg 90 \
+  --random-initial-qpos
+  

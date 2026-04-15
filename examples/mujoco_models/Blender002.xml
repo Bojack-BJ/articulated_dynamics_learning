@@ -1,0 +1,130 @@
+<mujoco model="Blender002">
+  <compiler
+    angle="radian"
+    assetdir="../../examples/mujoco_models/Blender002_obj"
+    texturedir="../../Lightwheel/Blender002/texture"
+  />
+
+  <visual>
+    <global offwidth="1024" offheight="1024" />
+  </visual>
+
+  <asset>
+    <texture name="T_Blender002_BC001" type="2d" file="T_Blender002_BC001.png" />
+    <material
+      name="material_0"
+      texture="T_Blender002_BC001"
+      rgba="1 1 1 1"
+      texuniform="false"
+      texrepeat="1 1"
+      specular="0"
+      reflectance="0"
+      shininess="0"
+    />
+    <texture name="T_Blender002_N001" type="2d" file="T_Blender002_N001.png" />
+    <material
+      name="material_1"
+      texture="T_Blender002_N001"
+      rgba="1 1 1 1"
+      texuniform="false"
+      texrepeat="1 1"
+      specular="0"
+      reflectance="0"
+      shininess="0"
+    />
+    <texture name="T_Blender002_ORM001" type="2d" file="T_Blender002_ORM001.png" />
+    <material
+      name="material_2"
+      texture="T_Blender002_ORM001"
+      rgba="1 1 1 1"
+      texuniform="false"
+      texrepeat="1 1"
+      specular="0"
+      reflectance="0"
+      shininess="0"
+    />
+    <mesh name="Blender002_Body001" file="Blender002_Body001.obj" />
+    <mesh name="Blender002_Body002" file="Blender002_Body002.obj" />
+    <mesh name="Blender002_Button001" file="Blender002_Button001.obj" />
+    <mesh name="Blender002_Jug001" file="Blender002_Jug001.obj" />
+    <mesh name="Blender002_Jug001_Clear" file="Blender002_Jug001_Clear.obj" />
+    <mesh name="Blender002_Blade001" file="Blender002_Blade001.obj" />
+    <mesh name="Blender002_Lid001" file="Blender002_Lid001.obj" />
+    <mesh name="Blender002_Knob001" file="Blender002_Knob001.obj" />
+  </asset>
+
+  <worldbody>
+    <geom name="ground" type="plane" size="5 5 0.1" rgba="0.9 0.9 0.9 1" />
+    <light pos="0 0 3" dir="0 0 -1" diffuse="0.7 0.7 0.7" specular="0.3 0.3 0.3" />
+    <light pos="2 2 2" dir="-1 -1 -1" diffuse="0.6 0.6 0.6" specular="0.2 0.2 0.2" />
+
+    <!-- Main object body -->
+    <body name="Blender002" pos="0 0 0.208583">
+    <inertial pos="0 0 0" quat="1 0 0 0" mass="3.995814" diaginertia="1 1 1" />
+      
+      <geom type="mesh" mesh="Blender002_Body001" material="material_0" />
+      <geom type="mesh" mesh="Blender002_Body002" material="material_0" />
+
+      <body name="Blender002_Button001" pos="0 0 0">
+        <joint
+          name="Button001_joint"
+          type="slide"
+          axis="0.000000 1.000000 0.000000"
+          pos="-0.019041 -0.056367 -0.043471"
+          damping="1.0"
+          limited="true"
+          range="0.000000 0.002000"
+        />
+        <geom type="mesh" mesh="Blender002_Button001" material="material_0" />
+      </body>
+      <body name="Blender002_Jug001" pos="0 0 0">
+        <joint
+          name="Jug001_joint"
+          type="slide"
+          axis="0.000000 0.000000 1.000000"
+          pos="0.016907 0.010881 0.078508"
+          damping="1.0"
+          limited="true"
+          range="0.000000 0.100000"
+        />
+        <geom type="mesh" mesh="Blender002_Jug001" material="material_0" />
+        <geom type="mesh" mesh="Blender002_Jug001_Clear" material="material_0" />
+        <body name="Blender002_Blade001" pos="0 0 0">
+          <joint
+            name="Blade001_joint"
+            type="hinge"
+            axis="0.000000 0.000000 1.000000"
+            pos="-0.020283 0.011425 0.028785"
+            damping="0.0"
+            limited="false"
+          />
+          <geom type="mesh" mesh="Blender002_Blade001" material="material_0" />
+        </body>
+        <body name="Blender002_Lid001" pos="0 0 0">
+          <joint
+            name="Lid001_joint"
+            type="slide"
+            axis="0.000000 0.000000 1.000000"
+            pos="0.007768 0.010882 0.181177"
+            damping="1.0"
+            limited="true"
+            range="0.000000 0.100000"
+          />
+          <geom type="mesh" mesh="Blender002_Lid001" material="material_0" />
+        </body>
+      </body>
+      <body name="Blender002_Knob001" pos="0 0 0">
+        <joint
+          name="Knob001_joint"
+          type="hinge"
+          axis="0.000000 1.000000 0.000000"
+          pos="-0.021078 -0.087395 -0.132159"
+          damping="0.05"
+          limited="true"
+          range="0.000000 4.712389"
+        />
+        <geom type="mesh" mesh="Blender002_Knob001" material="material_0" />
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

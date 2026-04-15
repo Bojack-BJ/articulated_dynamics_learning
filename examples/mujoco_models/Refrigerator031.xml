@@ -1,0 +1,133 @@
+<mujoco model="Refrigerator031">
+  <compiler
+    angle="radian"
+    assetdir="../../examples/mujoco_models/Refrigerator031_obj"
+    texturedir="../../Lightwheel/Refrigerator031/texture"
+  />
+
+  <visual>
+    <global offwidth="1024" offheight="1024" />
+  </visual>
+
+  <asset>
+    <texture name="T_Refrigerator031_BC001" type="2d" file="T_Refrigerator031_BC001.png" />
+    <material
+      name="material_0"
+      texture="T_Refrigerator031_BC001"
+      rgba="1 1 1 1"
+      texuniform="false"
+      texrepeat="1 1"
+      specular="0"
+      reflectance="0"
+      shininess="0"
+    />
+    <texture name="T_Refrigerator031_ORM001" type="2d" file="T_Refrigerator031_ORM001.png" />
+    <material
+      name="material_1"
+      texture="T_Refrigerator031_ORM001"
+      rgba="1 1 1 1"
+      texuniform="false"
+      texrepeat="1 1"
+      specular="0"
+      reflectance="0"
+      shininess="0"
+    />
+    <mesh name="Refrigerator031_Body001_Clear" file="Refrigerator031_Body001_Clear.obj" />
+    <mesh name="Refrigerator031_Body001" file="Refrigerator031_Body001.obj" />
+    <mesh name="Refrigerator031_freezer_door" file="Refrigerator031_freezer_door.obj" />
+    <mesh name="Refrigerator031_freezer_drawer0" file="Refrigerator031_freezer_drawer0.obj" />
+    <mesh name="Refrigerator031_freezer_drawer1" file="Refrigerator031_freezer_drawer1.obj" />
+    <mesh name="Refrigerator031_fridge_door_Clear" file="Refrigerator031_fridge_door_Clear.obj" />
+    <mesh name="Refrigerator031_fridge_door" file="Refrigerator031_fridge_door.obj" />
+    <mesh name="Refrigerator031_fridge_drawer0" file="Refrigerator031_fridge_drawer0.obj" />
+    <mesh name="Refrigerator031_fridge_drawer1" file="Refrigerator031_fridge_drawer1.obj" />
+  </asset>
+
+  <worldbody>
+    <geom name="ground" type="plane" size="5 5 0.1" rgba="0.9 0.9 0.9 1" />
+    <light pos="0 0 3" dir="0 0 -1" diffuse="0.7 0.7 0.7" specular="0.3 0.3 0.3" />
+    <light pos="2 2 2" dir="-1 -1 -1" diffuse="0.6 0.6 0.6" specular="0.2 0.2 0.2" />
+
+    <!-- Main object body -->
+    <body name="Refrigerator031" pos="0 0 0.946877">
+    <inertial pos="0 0 0" quat="1 0 0 0" mass="57.640775" diaginertia="1 1 1" />
+      
+      <geom type="mesh" mesh="Refrigerator031_Body001_Clear" material="material_0" />
+      <geom type="mesh" mesh="Refrigerator031_Body001" material="material_0" />
+
+      <body name="Refrigerator031_freezer_door" pos="0 0 0">
+        <joint
+          name="freezer_door_joint"
+          type="hinge"
+          axis="0.000000 0.000000 -1.000000"
+          pos="-0.413870 -0.350109 0.001723"
+          damping="1.0"
+          limited="true"
+          range="0.000000 1.570796"
+        />
+        <geom type="mesh" mesh="Refrigerator031_freezer_door" material="material_0" />
+      </body>
+      <body name="Refrigerator031_freezer_drawer0" pos="0 0 0">
+        <joint
+          name="freezer_drawer0_joint"
+          type="slide"
+          axis="0.000000 -1.000000 0.000000"
+          pos="-0.232655 -0.017051 -0.755172"
+          damping="1.0"
+          limited="true"
+          range="0.000000 0.380000"
+        />
+        <geom type="mesh" mesh="Refrigerator031_freezer_drawer0" material="material_0" />
+      </body>
+      <body name="Refrigerator031_freezer_drawer1" pos="0 0 0">
+        <joint
+          name="freezer_drawer1_joint"
+          type="slide"
+          axis="0.000000 -1.000000 0.000000"
+          pos="-0.232655 -0.017051 -0.359806"
+          damping="1.0"
+          limited="true"
+          range="0.000000 0.380000"
+        />
+        <geom type="mesh" mesh="Refrigerator031_freezer_drawer1" material="material_0" />
+      </body>
+      <body name="Refrigerator031_fridge_door" pos="0 0 0">
+        <joint
+          name="fridge_door_joint"
+          type="hinge"
+          axis="0.000000 0.000000 1.000000"
+          pos="0.413762 -0.347951 0.002113"
+          damping="1.0"
+          limited="true"
+          range="0.000000 1.570796"
+        />
+        <geom type="mesh" mesh="Refrigerator031_fridge_door_Clear" material="material_0" />
+        <geom type="mesh" mesh="Refrigerator031_fridge_door" material="material_0" />
+      </body>
+      <body name="Refrigerator031_fridge_drawer0" pos="0 0 0">
+        <joint
+          name="fridge_drawer0_joint"
+          type="slide"
+          axis="0.000000 -1.000000 0.000000"
+          pos="0.173050 -0.010061 -0.736732"
+          damping="1.0"
+          limited="true"
+          range="0.000000 0.380000"
+        />
+        <geom type="mesh" mesh="Refrigerator031_fridge_drawer0" material="material_0" />
+      </body>
+      <body name="Refrigerator031_fridge_drawer1" pos="0 0 0">
+        <joint
+          name="fridge_drawer1_joint"
+          type="slide"
+          axis="0.000000 -1.000000 0.000000"
+          pos="0.173050 -0.010061 -0.342444"
+          damping="1.0"
+          limited="true"
+          range="0.000000 0.380000"
+        />
+        <geom type="mesh" mesh="Refrigerator031_fridge_drawer1" material="material_0" />
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

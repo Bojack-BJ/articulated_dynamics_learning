@@ -1,0 +1,129 @@
+<mujoco model="CoffeeMachine039">
+  <compiler
+    angle="radian"
+    assetdir="../../examples/mujoco_models/CoffeeMachine039_obj"
+    texturedir="../../Lightwheel/CoffeeMachine039/texture"
+  />
+
+  <visual>
+    <global offwidth="1024" offheight="1024" />
+  </visual>
+
+  <asset>
+    <texture name="T_CoffeeMachine039_BC001" type="2d" file="T_CoffeeMachine039_BC001.png" />
+    <material
+      name="material_0"
+      texture="T_CoffeeMachine039_BC001"
+      rgba="1 1 1 1"
+      texuniform="false"
+      texrepeat="1 1"
+      specular="0"
+      reflectance="0"
+      shininess="0"
+    />
+    <texture name="T_CoffeeMachine039_ORM001" type="2d" file="T_CoffeeMachine039_ORM001.png" />
+    <material
+      name="material_1"
+      texture="T_CoffeeMachine039_ORM001"
+      rgba="1 1 1 1"
+      texuniform="false"
+      texrepeat="1 1"
+      specular="0"
+      reflectance="0"
+      shininess="0"
+    />
+    <mesh name="CoffeeMachine039_Body001" file="CoffeeMachine039_Body001.obj" />
+    <mesh name="CoffeeMachine039_Button001" file="CoffeeMachine039_Button001.obj" />
+    <mesh name="CoffeeMachine039_Button002" file="CoffeeMachine039_Button002.obj" />
+    <mesh name="CoffeeMachine039_Container001_Clear" file="CoffeeMachine039_Container001_Clear.obj" />
+    <mesh name="CoffeeMachine039_Lid003" file="CoffeeMachine039_Lid003.obj" />
+    <mesh name="CoffeeMachine039_Lid001" file="CoffeeMachine039_Lid001.obj" />
+    <mesh name="CoffeeMachine039_Lid002" file="CoffeeMachine039_Lid002.obj" />
+  </asset>
+
+  <worldbody>
+    <geom name="ground" type="plane" size="5 5 0.1" rgba="0.9 0.9 0.9 1" />
+    <light pos="0 0 3" dir="0 0 -1" diffuse="0.7 0.7 0.7" specular="0.3 0.3 0.3" />
+    <light pos="2 2 2" dir="-1 -1 -1" diffuse="0.6 0.6 0.6" specular="0.2 0.2 0.2" />
+
+    <!-- Main object body -->
+    <body name="CoffeeMachine039" pos="0 0 0.173010">
+    <inertial pos="0 0 0" quat="1 0 0 0" mass="12.013709" diaginertia="1 1 1" />
+      
+      <geom type="mesh" mesh="CoffeeMachine039_Body001" material="material_0" />
+
+      <body name="CoffeeMachine039_Button001" pos="0 0 0">
+        <joint
+          name="Button001_joint"
+          type="slide"
+          axis="-0.402952 0.915221 0.000000"
+          pos="0.045185 -0.192405 0.072756"
+          damping="1.0"
+          limited="true"
+          range="0.000000 0.003000"
+        />
+        <geom type="mesh" mesh="CoffeeMachine039_Button001" material="material_0" />
+      </body>
+      <body name="CoffeeMachine039_Button002" pos="0 0 0">
+        <joint
+          name="Button002_joint"
+          type="slide"
+          axis="0.368636 0.928790 0.038165"
+          pos="-0.044163 -0.193179 0.074602"
+          damping="1.0"
+          limited="true"
+          range="0.000000 0.004000"
+        />
+        <geom type="mesh" mesh="CoffeeMachine039_Button002" material="material_0" />
+      </body>
+      <body name="CoffeeMachine039_Container001_Clear" pos="0 0 0">
+        <joint
+          name="Container001_Clear_joint"
+          type="slide"
+          axis="0.000000 0.000000 1.000000"
+          pos="0.000135 0.216824 -0.024764"
+          damping="1.0"
+          limited="true"
+          range="0.000000 0.080000"
+        />
+        <geom type="mesh" mesh="CoffeeMachine039_Container001_Clear" material="material_0" />
+        <body name="CoffeeMachine039_Lid003" pos="0 0 0">
+          <joint
+            name="Lid003_joint"
+            type="hinge"
+            axis="1.000000 0.000000 0.000000"
+            pos="0.000137 0.160653 0.127579"
+            damping="1.0"
+            limited="true"
+            range="0.000000 1.570796"
+          />
+          <geom type="mesh" mesh="CoffeeMachine039_Lid003" material="material_0" />
+        </body>
+      </body>
+      <body name="CoffeeMachine039_Lid001" pos="0 0 0">
+        <joint
+          name="Lid001_joint"
+          type="hinge"
+          axis="-1.000000 0.000000 0.000000"
+          pos="-0.000146 -0.012672 0.168101"
+          damping="1.0"
+          limited="true"
+          range="0.000000 1.570796"
+        />
+        <geom type="mesh" mesh="CoffeeMachine039_Lid001" material="material_0" />
+      </body>
+      <body name="CoffeeMachine039_Lid002" pos="0 0 0">
+        <joint
+          name="Lid002_joint"
+          type="slide"
+          axis="0.000000 0.000000 1.000000"
+          pos="-0.000024 -0.221003 -0.106341"
+          damping="1.0"
+          limited="true"
+          range="0.000000 0.080000"
+        />
+        <geom type="mesh" mesh="CoffeeMachine039_Lid002" material="material_0" />
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

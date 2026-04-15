@@ -1,0 +1,79 @@
+<mujoco model="Microwave041">
+  <compiler
+    angle="radian"
+    assetdir="../../examples/mujoco_models/Microwave041_obj"
+    texturedir="../../Lightwheel/Microwave041/texture"
+  />
+
+  <visual>
+    <global offwidth="1024" offheight="1024" />
+  </visual>
+
+  <asset>
+    <texture name="T_Microwave041_BC001" type="2d" file="T_Microwave041_BC001.png" />
+    <material
+      name="material_0"
+      texture="T_Microwave041_BC001"
+      rgba="1 1 1 1"
+      texuniform="false"
+      texrepeat="1 1"
+      specular="0"
+      reflectance="0"
+      shininess="0"
+    />
+    <texture name="T_Microwave041_ORM001" type="2d" file="T_Microwave041_ORM001.png" />
+    <material
+      name="material_1"
+      texture="T_Microwave041_ORM001"
+      rgba="1 1 1 1"
+      texuniform="false"
+      texrepeat="1 1"
+      specular="0"
+      reflectance="0"
+      shininess="0"
+    />
+    <mesh name="Microwave041_Body001" file="Microwave041_Body001.obj" />
+    <mesh name="Microwave041_door_Clear" file="Microwave041_door_Clear.obj" />
+    <mesh name="Microwave041_door" file="Microwave041_door.obj" />
+    <mesh name="Microwave041_Disc001" file="Microwave041_Disc001.obj" />
+  </asset>
+
+  <worldbody>
+    <geom name="ground" type="plane" size="5 5 0.1" rgba="0.9 0.9 0.9 1" />
+    <light pos="0 0 3" dir="0 0 -1" diffuse="0.7 0.7 0.7" specular="0.3 0.3 0.3" />
+    <light pos="2 2 2" dir="-1 -1 -1" diffuse="0.6 0.6 0.6" specular="0.2 0.2 0.2" />
+
+    <!-- Main object body -->
+    <body name="Microwave041" pos="0 0 0.176000">
+    <inertial pos="0 0 0" quat="1 0 0 0" mass="19.898885" diaginertia="1 1 1" />
+      
+      <geom type="mesh" mesh="Microwave041_Body001" material="material_0" />
+
+      <body name="Microwave041_Disc001" pos="0 0 0">
+        <joint
+          name="Disc001_joint"
+          type="hinge"
+          axis="0.000000 0.000000 1.000000"
+          pos="-0.070377 -0.036144 -0.125623"
+          damping="1.0"
+          limited="true"
+          range="0.000000 359.999989"
+        />
+        <geom type="mesh" mesh="Microwave041_Disc001" material="material_0" />
+      </body>
+      <body name="Microwave041_door" pos="0 0 0">
+        <joint
+          name="microjoint"
+          type="hinge"
+          axis="0.000000 0.000000 1.000000"
+          pos="-0.293211 -0.232038 0.000000"
+          damping="1.0"
+          limited="true"
+          range="-1.570796 0.000000"
+        />
+        <geom type="mesh" mesh="Microwave041_door_Clear" material="material_0" />
+        <geom type="mesh" mesh="Microwave041_door" material="material_0" />
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

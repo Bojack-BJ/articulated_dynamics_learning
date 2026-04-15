@@ -1,0 +1,496 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from .categories import SUPPORTED_CATEGORIES, normalize_category
+from .pipeline import RGBDToURDFPipeline
+from .serialization import load_episode, validate_episode
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="RGB-D to URDF MVP scaffold")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    validate_parser = subparsers.add_parser("validate-episode", help="Validate an episode manifest")
+    validate_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
+
+    run_parser = subparsers.add_parser("run", help="Run the end-to-end MVP pipeline")
+    run_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
+    run_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("outputs") / "run",
+        help="Directory for pipeline outputs",
+    )
+
+    fuse_parser = subparsers.add_parser(
+        "fuse-pointcloud",
+        help="Fuse multi-view depth observations into a time-indexed 4D point cloud",
+    )
+    fuse_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
+    fuse_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for fused point cloud outputs (defaults to <episode_dir>/pointcloud_4d)",
+    )
+    fuse_parser.add_argument("--pixel-stride", type=int, default=4, help="Depth sampling stride")
+    fuse_parser.add_argument("--voxel-size-m", type=float, default=0.015, help="Voxel size for view fusion")
+    fuse_parser.add_argument(
+        "--bbox-margin-m",
+        type=float,
+        default=0.20,
+        help="Margin added to the estimated object bounds",
+    )
+    fuse_parser.add_argument(
+        "--near-depth-band-m",
+        type=float,
+        default=0.35,
+        help="Near-depth band used during object bootstrap",
+    )
+    fuse_parser.add_argument(
+        "--no-shared-pose-fallback",
+        action="store_true",
+        help="Fail instead of falling back to the central pose when per-view poses are missing",
+    )
+
+    viewer_parser = subparsers.add_parser(
+        "visualize-pointcloud",
+        help="Build a self-contained HTML viewer for a 4D point cloud manifest or PLY",
+    )
+    viewer_parser.add_argument(
+        "input",
+        type=Path,
+        help="Path to fusion_manifest.json or pointcloud_4d.ply",
+    )
+    viewer_parser.add_argument(
+        "--output-html",
+        type=Path,
+        default=None,
+        help="Where to write the viewer HTML",
+    )
+    viewer_parser.add_argument(
+        "--max-points-per-frame",
+        type=int,
+        default=4000,
+        help="Maximum rendered points per frame after uniform downsampling",
+    )
+    viewer_parser.add_argument(
+        "--point-radius-px",
+        type=float,
+        default=2.0,
+        help="Default rendered point radius in pixels",
+    )
+
+    render_masks_parser = subparsers.add_parser(
+        "render-mujoco-masks",
+        help="Render target-object segmentation masks for an existing MuJoCo episode",
+    )
+    render_masks_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
+    render_masks_parser.add_argument(
+        "--model",
+        type=Path,
+        default=None,
+        help="Optional MJCF model path override",
+    )
+    render_masks_parser.add_argument(
+        "--mask-format",
+        choices=["pgm", "png"],
+        default="pgm",
+        help="Mask output format",
+    )
+    render_masks_parser.add_argument(
+        "--part-segmentation-masks",
+        action="store_true",
+        help="Also render indexed per-part masks using MuJoCo body/geom priors",
+    )
+    render_masks_parser.add_argument(
+        "--output-episode",
+        type=Path,
+        default=None,
+        help="Optional output episode JSON path (defaults to in-place update)",
+    )
+
+    record_parser = subparsers.add_parser(
+        "record-mujoco",
+        help="Record a sim RGB-D episode from a MuJoCo articulated object",
+    )
+    record_parser.add_argument("model", type=Path, help="Path to MJCF XML or URDF model")
+    record_parser.add_argument(
+        "--category",
+        type=normalize_category,
+        choices=list(SUPPORTED_CATEGORIES),
+        required=True,
+    )
+    record_parser.add_argument("--object-id", required=True, help="Object instance id")
+    record_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("outputs") / "recordings",
+        help="Directory for recorded episode outputs",
+    )
+    record_parser.add_argument("--frames", type=int, default=48, help="Number of frames to record")
+    record_parser.add_argument("--sim-dt", type=float, default=1.0 / 240.0, help="MuJoCo sim timestep")
+    record_parser.add_argument(
+        "--frame-dt",
+        type=float,
+        default=0.1,
+        help="Wall-clock interval represented by consecutive frames",
+    )
+    record_parser.add_argument(
+        "--duration-s",
+        type=float,
+        default=None,
+        help="Total recording duration in seconds (overrides --frames when combined with --fps)",
+    )
+    record_parser.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="Recorded frame rate in Hz (used with --duration-s; sets frame_dt=1/fps)",
+    )
+    record_parser.add_argument("--width", type=int, default=640, help="RGB-D frame width")
+    record_parser.add_argument("--height", type=int, default=480, help="RGB-D frame height")
+    record_parser.add_argument(
+        "--rgb-format",
+        choices=["ppm", "png"],
+        default="ppm",
+        help="RGB output format",
+    )
+    record_parser.add_argument(
+        "--depth-format",
+        choices=["pgm", "png"],
+        default="pgm",
+        help="Depth output format (pgm is 16-bit PGM; png is 16-bit PNG)",
+    )
+    record_parser.add_argument(
+        "--camera-distance",
+        type=float,
+        default=1,
+        help="Orbit camera distance from lookat",
+    )
+    record_parser.add_argument(
+        "--camera-elevation-deg",
+        type=float,
+        default=-28.0,
+        help="Orbit camera elevation in degrees",
+    )
+    record_parser.add_argument(
+        "--camera-azimuth-start-deg",
+        type=float,
+        default=50.0,
+        help="Orbit camera start azimuth in degrees",
+    )
+    record_parser.add_argument(
+        "--camera-azimuth-span-deg",
+        type=float,
+        default=90.0,
+        help="Orbit camera azimuth sweep span in degrees",
+    )
+    record_parser.add_argument(
+        "--camera-fovy-deg",
+        type=float,
+        default=90.0,
+        help="Vertical field of view in degrees",
+    )
+    record_parser.add_argument(
+        "--camera-mode",
+        choices=["orbit", "triview"],
+        default="orbit",
+        help="Camera mode: orbit sweep or fixed tri-view capture",
+    )
+    record_parser.add_argument(
+        "--camera-triview-spacing-deg",
+        type=float,
+        default=45.0,
+        help="Azimuth spacing (deg) between neighboring views in triview mode",
+    )
+    record_parser.add_argument(
+        "--lookat",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=(0.0, 0.0, 0.3),
+        help="Orbit camera lookat center in world frame",
+    )
+    record_parser.add_argument(
+        "--perturbation-scale",
+        type=float,
+        default=1,
+        help="Random perturbation force magnitude",
+    )
+
+    record_parser.add_argument(
+        "--control-mode",
+        choices=["track", "free"],
+        default="track",
+        help="Control mode: 'track' uses PD tracking; 'free' only applies initial conditions then runs with no external force",
+    )
+    record_parser.add_argument(
+        "--random-initial-qpos",
+        action="store_true",
+        help="In free mode, initialize each controlled hinge/slide joint position randomly within its limits",
+    )
+    record_parser.add_argument(
+        "--auto-initial-qvel-from-limits",
+        action="store_true",
+        help=(
+            "In free mode, infer each controlled joint's initial qvel direction/magnitude from its limits and initial qpos"
+        ),
+    )
+    record_parser.add_argument(
+        "--auto-initial-qvel-min-abs",
+        type=float,
+        default=1.0,
+        help="Minimum absolute initial qvel used by --auto-initial-qvel-from-limits when --initial-qvel is 0",
+    )
+    record_parser.add_argument(
+        "--auto-initial-qvel-max-abs",
+        type=float,
+        default=8.0,
+        help="Maximum absolute initial qvel allowed in --auto-initial-qvel-from-limits",
+    )
+    record_parser.add_argument(
+        "--auto-initial-qvel-direction-mode",
+        choices=["away-from-qpos0", "toward-lower", "toward-upper"],
+        default="away-from-qpos0",
+        help="Direction mode for --auto-initial-qvel-from-limits",
+    )
+    record_parser.add_argument(
+        "--initial-qvel",
+        type=float,
+        default=0.0,
+        help="Initial joint velocity for the selected hinge/slide DOF",
+    )
+    record_parser.add_argument(
+        "--kick-force",
+        type=float,
+        default=0.0,
+        help="External force/torque applied along the selected DOF during the kick window",
+    )
+    record_parser.add_argument(
+        "--kick-start-s",
+        type=float,
+        default=0.0,
+        help="Kick window start time in seconds (simulation time)",
+    )
+    record_parser.add_argument(
+        "--kick-duration-s",
+        type=float,
+        default=0.0,
+        help="Kick window duration in seconds (0 disables kick)",
+    )
+    record_parser.add_argument("--control-kp", type=float, default=30.0, help="Joint tracking P gain")
+    record_parser.add_argument("--control-kd", type=float, default=3.0, help="Joint tracking D gain")
+    record_parser.add_argument("--seed", type=int, default=0, help="Random seed")
+
+    record_parser.add_argument(
+        "--joint-name",
+        type=str,
+        default=None,
+        help="Name of the hinge/slide joint to drive/record (defaults to first hinge/slide)",
+    )
+    record_parser.add_argument(
+        "--joint-id",
+        type=int,
+        default=None,
+        help="MuJoCo joint id of the hinge/slide joint to drive/record (defaults to first hinge/slide)",
+    )
+    record_parser.add_argument(
+        "--all-joints",
+        action="store_true",
+        help="Apply initial velocity/forces to all hinge+slide joints (requires --control-mode free)",
+    )
+
+    record_parser.add_argument(
+        "--video",
+        action="store_true",
+        help="Also write an mp4 RGB video into the recorded episode directory",
+    )
+    record_parser.add_argument(
+        "--video-fps",
+        type=float,
+        default=None,
+        help="Video frame rate override (defaults to 1/frame_dt)",
+    )
+    record_parser.add_argument(
+        "--segmentation-masks",
+        action="store_true",
+        help="Also render binary target-object masks for each frame/view",
+    )
+    record_parser.add_argument(
+        "--part-segmentation-masks",
+        action="store_true",
+        help="Also render indexed per-part masks using MuJoCo body/geom priors",
+    )
+    record_parser.add_argument(
+        "--mask-format",
+        choices=["pgm", "png"],
+        default="pgm",
+        help="Mask output format when --segmentation-masks is enabled",
+    )
+    record_parser.add_argument(
+        "--disable-target-mesh-collision",
+        action="store_true",
+        help="Disable collision on the target object's mesh geoms while keeping them rendered",
+    )
+    record_parser.add_argument(
+        "--hide-clear-meshes",
+        action="store_true",
+        help="Hide target-object mesh geoms whose names contain 'Clear' from RGB/depth/mask rendering",
+    )
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command == "validate-episode":
+        episode = load_episode(args.episode)
+        errors = validate_episode(episode)
+        if errors:
+            for error in errors:
+                print(error)
+            return 1
+        print(f"Episode '{episode.object_instance_id}' is valid for category '{episode.category}'.")
+        return 0
+
+    if args.command == "run":
+        episode = load_episode(args.episode)
+        errors = validate_episode(episode)
+        if errors:
+            for error in errors:
+                print(error)
+            return 1
+        result = RGBDToURDFPipeline().run(episode, args.output_dir)
+        print(json.dumps(result.to_dict(), indent=2))
+        return 0
+
+    if args.command == "fuse-pointcloud":
+        from .pointcloud_fusion import EpisodePointCloudFuser, PointCloudFusionConfig
+
+        manifest_path = EpisodePointCloudFuser(
+            PointCloudFusionConfig(
+                episode_path=args.episode,
+                output_dir=args.output_dir,
+                pixel_stride=max(1, int(args.pixel_stride)),
+                voxel_size_m=float(args.voxel_size_m),
+                bbox_margin_m=float(args.bbox_margin_m),
+                near_depth_band_m=float(args.near_depth_band_m),
+                allow_shared_pose_fallback=not bool(args.no_shared_pose_fallback),
+            )
+        ).fuse()
+        print(json.dumps({"manifest_path": str(manifest_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "visualize-pointcloud":
+        from .pointcloud_viz import PointCloudViewerBuilder, PointCloudVisualizationConfig
+
+        html_path = PointCloudViewerBuilder(
+            PointCloudVisualizationConfig(
+                input_path=args.input,
+                output_html=args.output_html,
+                max_points_per_frame=max(1, int(args.max_points_per_frame)),
+                point_radius_px=float(args.point_radius_px),
+            )
+        ).build()
+        print(json.dumps({"viewer_html": str(html_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "render-mujoco-masks":
+        from .mujoco_recorder import MuJoCoMaskRenderConfig, MuJoCoMaskRenderer
+
+        episode_path = MuJoCoMaskRenderer(
+            MuJoCoMaskRenderConfig(
+                episode_path=args.episode,
+                model_path=args.model,
+                mask_format=args.mask_format,
+                part_segmentation_masks=bool(args.part_segmentation_masks),
+                output_episode_path=args.output_episode,
+            )
+        ).render()
+        print(json.dumps({"episode_path": str(episode_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "record-mujoco":
+        from .mujoco_recorder import MuJoCoEpisodeRecorder, MuJoCoRecordConfig
+
+        frame_count = int(args.frames)
+        frame_dt = float(args.frame_dt)
+        if args.duration_s is not None or args.fps is not None:
+            if args.duration_s is None or args.fps is None:
+                parser.error("--duration-s and --fps must be provided together")
+            if args.duration_s <= 0.0:
+                parser.error("--duration-s must be positive")
+            if args.fps <= 0.0:
+                parser.error("--fps must be positive")
+            frame_dt = 1.0 / float(args.fps)
+            frame_count = max(1, int(round(float(args.duration_s) * float(args.fps))))
+
+        if args.kick_start_s < 0.0:
+            parser.error("--kick-start-s must be >= 0")
+        if args.kick_duration_s < 0.0:
+            parser.error("--kick-duration-s must be >= 0")
+        if args.kick_duration_s == 0.0 and args.kick_force != 0.0:
+            parser.error("--kick-force requires --kick-duration-s > 0")
+
+        if args.all_joints and (args.joint_name is not None or args.joint_id is not None):
+            parser.error("--all-joints cannot be combined with --joint-name/--joint-id")
+        if args.joint_name is not None and args.joint_id is not None:
+            parser.error("Provide only one of --joint-name or --joint-id")
+
+        config = MuJoCoRecordConfig(
+            model_path=args.model,
+            output_dir=args.output_dir,
+            object_instance_id=args.object_id,
+            category=args.category,
+            frame_count=frame_count,
+            sim_dt=args.sim_dt,
+            frame_dt=frame_dt,
+            width=args.width,
+            height=args.height,
+            rgb_format=args.rgb_format,
+            depth_format=args.depth_format,
+            camera_distance=args.camera_distance,
+            camera_elevation_deg=args.camera_elevation_deg,
+            camera_azimuth_start_deg=args.camera_azimuth_start_deg,
+            camera_azimuth_span_deg=args.camera_azimuth_span_deg,
+            camera_fovy_deg=args.camera_fovy_deg,
+            camera_mode=args.camera_mode,
+            camera_triview_spacing_deg=args.camera_triview_spacing_deg,
+            lookat=tuple(args.lookat),
+            perturbation_scale=args.perturbation_scale,
+            control_kp=args.control_kp,
+            control_kd=args.control_kd,
+            seed=args.seed,
+            control_mode=args.control_mode,
+            random_initial_qpos=bool(args.random_initial_qpos),
+            auto_initial_qvel_from_limits=bool(args.auto_initial_qvel_from_limits),
+            auto_initial_qvel_direction_mode=args.auto_initial_qvel_direction_mode,
+            auto_initial_qvel_min_abs=float(args.auto_initial_qvel_min_abs),
+            auto_initial_qvel_max_abs=float(args.auto_initial_qvel_max_abs),
+            initial_joint_qvel=args.initial_qvel,
+            kick_force=args.kick_force,
+            kick_start_s=args.kick_start_s,
+            kick_duration_s=args.kick_duration_s,
+            make_video=bool(args.video),
+            video_fps=args.video_fps,
+            segmentation_masks=bool(args.segmentation_masks),
+            part_segmentation_masks=bool(args.part_segmentation_masks),
+            mask_format=args.mask_format,
+            disable_target_mesh_collision=bool(args.disable_target_mesh_collision),
+            hide_clear_meshes=bool(args.hide_clear_meshes),
+            joint_name=args.joint_name,
+            joint_id=args.joint_id,
+            all_joints=bool(args.all_joints),
+        )
+        episode_path = MuJoCoEpisodeRecorder(config).record()
+        print(json.dumps({"episode_path": str(episode_path.resolve())}, indent=2))
+        return 0
+
+    parser.error(f"Unhandled command: {args.command}")
+    return 2

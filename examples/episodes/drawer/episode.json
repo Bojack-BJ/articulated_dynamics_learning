@@ -1,0 +1,98 @@
+{
+  "object_instance_id": "drawer-demo-001",
+  "category": "drawer",
+  "camera_intrinsics": {
+    "fx": 525.0,
+    "fy": 525.0,
+    "cx": 320.0,
+    "cy": 240.0
+  },
+  "frames": [
+    {
+      "timestamp_s": 0.0,
+      "rgb_path": "examples/assets/drawer/rgb.ppm",
+      "depth_path": "examples/assets/drawer/depth.pgm",
+      "camera_pose": [
+        [1.0, 0.0, 0.0, 1.2],
+        [0.0, 1.0, 0.0, -0.5],
+        [0.0, 0.0, 1.0, 0.9],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "action_log": {
+        "target_open_fraction": 0.0
+      },
+      "observation_confidence": 0.95
+    },
+    {
+      "timestamp_s": 0.1,
+      "rgb_path": "examples/assets/drawer/rgb.ppm",
+      "depth_path": "examples/assets/drawer/depth.pgm",
+      "camera_pose": [
+        [1.0, 0.0, 0.0, 1.15],
+        [0.0, 1.0, 0.0, -0.35],
+        [0.0, 0.0, 1.0, 0.92],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "action_log": {
+        "target_open_fraction": 0.35
+      },
+      "observation_confidence": 0.94
+    },
+    {
+      "timestamp_s": 0.2,
+      "rgb_path": "examples/assets/drawer/rgb.ppm",
+      "depth_path": "examples/assets/drawer/depth.pgm",
+      "camera_pose": [
+        [1.0, 0.0, 0.0, 1.1],
+        [0.0, 1.0, 0.0, -0.2],
+        [0.0, 0.0, 1.0, 0.91],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "action_log": {
+        "target_open_fraction": 0.7
+      },
+      "observation_confidence": 0.93
+    },
+    {
+      "timestamp_s": 0.3,
+      "rgb_path": "examples/assets/drawer/rgb.ppm",
+      "depth_path": "examples/assets/drawer/depth.pgm",
+      "camera_pose": [
+        [1.0, 0.0, 0.0, 1.05],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.92],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "action_log": {
+        "target_open_fraction": 1.0
+      },
+      "observation_confidence": 0.94
+    }
+  ],
+  "metadata": {
+    "joint_limits": [0.0, 0.35],
+    "generated_primitives": [
+      {
+        "name": "cabinet",
+        "center": [0.0, 0.0, 0.45],
+        "size": [1.2, 0.6, 0.9],
+        "observed_ratio": 0.94,
+        "generated": false
+      },
+      {
+        "name": "drawer_box",
+        "center": [0.12, 0.0, 0.36],
+        "size": [0.85, 0.42, 0.24],
+        "observed_ratio": 0.88,
+        "generated": false
+      },
+      {
+        "name": "hallucinated_pull_cluster",
+        "center": [0.6, 0.34, 0.38],
+        "size": [0.1, 0.06, 0.05],
+        "observed_ratio": 0.09,
+        "generated": true
+      }
+    ]
+  }
+}
