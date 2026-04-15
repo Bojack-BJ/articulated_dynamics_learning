@@ -1,0 +1,4 @@
+command: run
+episode: examples/episodes/door/episode.json
+output-dir: outputs/door_demo_yaml
+path: optimization

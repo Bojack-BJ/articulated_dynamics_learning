@@ -1,0 +1,13 @@
+command: record-mujoco
+args:
+  model: examples/mujoco_models/Refrigerator031.xml
+  category: refrigerator
+  object-id: refrigerator031_yaml
+  output-dir: outputs/recordings
+  duration-s: 4
+  fps: 20
+  camera-mode: triview
+  camera-triview-spacing-deg: 90
+  lookat: [0.0, 0.0, 0.0]
+  segmentation-masks: true
+  part-segmentation-masks: true
