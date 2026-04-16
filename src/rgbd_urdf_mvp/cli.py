@@ -187,6 +187,51 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory for articulation and URDF outputs (defaults to <joint_inference_dir>/inferred_articulation)",
     )
 
+    hunyuan_parser = subparsers.add_parser(
+        "hunyuan3d-generate",
+        help="Request a remote Hunyuan3D API server and save the generated 3D asset",
+    )
+    hunyuan_parser.add_argument("--server-url", required=True, help="Base URL of the Hunyuan3D API server")
+    hunyuan_parser.add_argument("--output", type=Path, required=True, help="Output model path, usually .glb")
+    hunyuan_parser.add_argument(
+        "--image",
+        type=Path,
+        nargs="+",
+        default=None,
+        help=(
+            "One or more input image paths. A single path uses Hunyuan3D single-view mode; "
+            "multiple paths are sent as a multiview payload."
+        ),
+    )
+    hunyuan_parser.add_argument(
+        "--image-views",
+        nargs="+",
+        choices=["front", "left", "right", "back"],
+        default=None,
+        help=(
+            "View names matching --image order for multiview generation. "
+            "Defaults to front left right back truncated to the number of images."
+        ),
+    )
+    hunyuan_parser.add_argument("--text", type=str, default=None, help="Optional text prompt")
+    hunyuan_parser.add_argument("--mesh", type=Path, default=None, help="Optional input mesh for texture generation")
+    hunyuan_parser.add_argument("--mode", choices=["async", "sync"], default="async", help="Use /send polling or /generate")
+    hunyuan_parser.add_argument("--texture", action="store_true", help="Request texture generation when supported")
+    hunyuan_parser.add_argument("--seed", type=int, default=1234, help="Generation seed")
+    hunyuan_parser.add_argument("--type", default="glb", help="Requested output type, e.g. glb or obj")
+    hunyuan_parser.add_argument("--octree-resolution", type=int, default=None, help="Optional Hunyuan3D octree resolution")
+    hunyuan_parser.add_argument("--num-inference-steps", type=int, default=None, help="Optional diffusion step count")
+    hunyuan_parser.add_argument("--guidance-scale", type=float, default=None, help="Optional guidance scale")
+    hunyuan_parser.add_argument("--face-count", type=int, default=None, help="Optional target face count")
+    hunyuan_parser.add_argument("--timeout-s", type=float, default=1800.0, help="Async polling timeout")
+    hunyuan_parser.add_argument("--poll-interval-s", type=float, default=5.0, help="Async polling interval")
+    hunyuan_parser.add_argument(
+        "--api-token",
+        type=str,
+        default=None,
+        help="Optional bearer token for a reverse proxy, tunnel, or API gateway",
+    )
+
     # MuJoCo recording and mask generation.
     render_masks_parser = subparsers.add_parser(
         "render-mujoco-masks",
@@ -567,6 +612,37 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         print(json.dumps(result.to_dict(), indent=2))
+        return 0
+
+    if args.command == "hunyuan3d-generate":
+        from .perception.hunyuan3d_client import Hunyuan3DClient, Hunyuan3DGenerationConfig
+
+        output_path = Hunyuan3DClient(
+            server_url=args.server_url,
+            api_token=args.api_token,
+            timeout_s=min(float(args.timeout_s), 120.0),
+        ).generate(
+            Hunyuan3DGenerationConfig(
+                server_url=args.server_url,
+                output_path=args.output,
+                image_path=args.image,
+                image_views=args.image_views,
+                text=args.text,
+                mesh_path=args.mesh,
+                mode=args.mode,
+                texture=bool(args.texture),
+                seed=int(args.seed),
+                output_type=args.type,
+                octree_resolution=args.octree_resolution,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale,
+                face_count=args.face_count,
+                timeout_s=float(args.timeout_s),
+                poll_interval_s=float(args.poll_interval_s),
+                api_token=args.api_token,
+            )
+        )
+        print(json.dumps({"generated_model_path": str(output_path.resolve())}, indent=2))
         return 0
 
     if args.command == "render-mujoco-masks":

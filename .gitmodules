@@ -1,0 +1,4 @@
+[submodule "Hunyuan3D-2"]
+	path = Hunyuan3D-2
+	url = git@github.com:Bojack-BJ/Hunyuan3D-2.git
+	branch = rgbd-urdf-api-server

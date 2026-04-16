@@ -14,7 +14,70 @@ The current code is scaffold-first. It is meant to keep the full contract execut
 - Project overview: [docs/overview.md](docs/overview.md)
 - MuJoCo recording and USD-to-MJCF conversion: [docs/mujoco-recording.md](docs/mujoco-recording.md)
 - RGB-D fusion, part segmentation, and viewer workflow: [docs/pointcloud.md](docs/pointcloud.md)
+- Remote 3D generation client/server setup: [docs/remote-generation.md](docs/remote-generation.md)
 - Research-stack replacement points: [docs/research-stack.md](docs/research-stack.md)
+
+## Installation
+
+Clone the repository with the Hunyuan3D server submodule:
+
+```bash
+git clone --recurse-submodules git@github.com:Bojack-BJ/articulated_dynamics_learning.git
+cd articulated_dynamics_learning
+```
+
+If you already cloned the repository without submodules:
+
+```bash
+git submodule update --init --recursive
+```
+
+Create a local Python environment for the RGB-D to URDF project:
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[simulation,viz]"
+```
+
+Run the smoke tests:
+
+```bash
+PYTHONPATH=src python -m unittest discover -s tests -v
+```
+
+The `Hunyuan3D-2/` directory is a submodule pointing to this project's fork of
+the Hunyuan3D sample server. On the remote GPU machine, install that server in
+its own environment:
+
+```bash
+cd Hunyuan3D-2
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+
+# Install PyTorch first using the wheel that matches your CUDA version.
+# See https://pytorch.org/get-started/locally/
+
+python -m pip install -r requirements.txt
+python -m pip install -e .
+```
+
+Texture generation may need the optional Hunyuan3D rasterizer extensions:
+
+```bash
+cd hy3dgen/texgen/custom_rasterizer
+python setup.py install
+cd ../../..
+cd hy3dgen/texgen/differentiable_renderer
+python setup.py install
+cd ../../..
+```
+
+For remote mesh generation, run the Hunyuan3D API server on the GPU machine and
+call it from the Mac client. The full setup is documented in
+[docs/remote-generation.md](docs/remote-generation.md).
 
 ## Quick Start
 
@@ -24,15 +87,19 @@ Validate an episode:
 PYTHONPATH=src python3 -m rgbd_urdf_mvp validate-episode examples/episodes/door/episode.json
 ```
 
-`validate-episode` 是一个轻量 schema check，用来在真正跑 pipeline 前先排掉明显坏输入。它目前会检查：
+`validate-episode` is a lightweight schema check that catches obviously broken
+inputs before the pipeline starts. It currently checks:
 
-- `category` 是否在当前支持列表里
-- episode 是否至少有一帧
-- 每帧 `camera_pose` 和 `camera_poses_by_view` 是否是 `4x4`
-- `mask_path` / `part_mask_path` / `*_paths_by_view` 的类型是否正确
-- `timestamp_s` 是否非负
+- whether `category` is in the supported list
+- whether the episode contains at least one frame
+- whether each frame `camera_pose` and `camera_poses_by_view` is `4x4`
+- whether `mask_path` / `part_mask_path` / `*_paths_by_view` have the expected types
+- whether `timestamp_s` is non-negative
 
-它不做几何正确性验证，也不会判断点云/深度是否真的对齐。它的作用是尽早发现 manifest 结构错误，避免后面的 fusion / pose / URDF 流程在更深的位置才报错。
+It does not validate geometric correctness, and it does not tell you whether
+depth, pointclouds, or poses are actually aligned. Its purpose is to catch
+manifest-structure errors early so fusion / pose / URDF stages fail less
+deeply and more clearly.
 
 Run the scaffold pipeline:
 
@@ -46,16 +113,48 @@ Pipeline path switch:
 PYTHONPATH=src python3 -m rgbd_urdf_mvp run examples/episodes/door/episode.json --output-dir outputs/door_demo_ff --path feedforward
 ```
 
-`run` 现在支持两条 path：
+`run` currently supports two paths:
 
 - `feedforward`
   - `reconstruction -> articulation init -> export`
-  - 用来快速跑通形状到 URDF 的前向链路
+  - useful for a fast shape-to-URDF forward pass
 - `optimization`
   - `reconstruction -> articulation init -> temporal refit -> export`
-  - 当前默认路径，也是目前项目里更完整、主要在走的实现
+  - the current default path and the more complete implementation in this repo
 
-也就是说，目前这个 scaffold 的主线更偏 `optimization-based path`，因为它会在 articulation init 之后继续做时序 refit，显式产出更稳定的 `q, qdot`。
+At the moment, the scaffold is primarily centered on the
+`optimization-based path`, because it continues after articulation
+initialization into temporal refit and explicitly produces more stable `q`
+and `qdot`.
+
+## Pipeline Flow
+
+```text
+Episode Input
+  RGB-D + camera poses + actions
+        |
+        v
+Reconstruction
+  canonical mesh / primitives
+        |
+        v
+Articulation Init
+  parts + joints + limits
+        |
+        v
+Pipeline Path
+  |-- feedforward ---> URDF / MJCF Export
+  |
+  `-- optimization --> Temporal Refit
+                          smooth q, derive qdot
+                              |
+                              v
+                        URDF / MJCF Export
+                              |
+                              v
+Pipeline Result
+  articulation artifact + URDF package
+```
 
 Use a YAML config instead of long CLI flags:
 
@@ -72,7 +171,8 @@ output-dir: outputs/door_demo_yaml
 path: optimization
 ```
 
-同一个机制也适用于参数更多的命令，比如 `record-mujoco`：
+The same mechanism also works for commands with many parameters, such as
+`record-mujoco`:
 
 ```yaml
 command: record-mujoco
@@ -90,13 +190,15 @@ args:
   part-segmentation-masks: true
 ```
 
-然后直接运行：
+Then run it directly:
 
 ```bash
 PYTHONPATH=src python3 -m rgbd_urdf_mvp configs/record_refrigerator.yaml
 ```
 
-如果还想临时覆盖一两个字段，也可以在配置文件后面继续跟普通 CLI 参数；后写的参数会覆盖前面的配置值。
+If you want to override one or two fields temporarily, you can still append
+normal CLI flags after the config file. Later CLI arguments override values
+coming from the config file.
 
 Fuse and inspect a recorded MuJoCo episode:
 
@@ -114,24 +216,24 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ## Package Layout
 
-`src/rgbd_urdf_mvp` 现在按职责拆成了几个子包：
+`src/rgbd_urdf_mvp` is now split into a few subpackages by responsibility:
 
 - `core`
-  - 数据模型、类别定义、几何 helper、序列化
+  - data models, category definitions, geometry helpers, serialization
 - `sim`
-  - MuJoCo 录制、mask 重渲染、USD/MJCF 转换
+  - MuJoCo recording, mask rerendering, USD/MJCF conversion
 - `perception`
-  - reconstruction、4D pointcloud fusion、part segmentation、part pose、viewer
+  - reconstruction, 4D pointcloud fusion, part segmentation, part pose, viewer
 - `kinematics`
-  - articulation init、temporal refit、joint inference、inferred articulation export
+  - articulation init, temporal refit, joint inference, inferred articulation export
 - `export`
-  - URDF / MJCF 导出
+  - URDF / MJCF export
 
-根目录保留少量顶层入口：
+The package root keeps a small number of top-level entry points:
 
-- [cli.py](src/rgbd_urdf_mvp/cli.py): 命令行入口
+- [cli.py](src/rgbd_urdf_mvp/cli.py): command-line entry point
 - [pipeline.py](src/rgbd_urdf_mvp/pipeline.py): scaffold end-to-end pipeline
-- [__init__.py](src/rgbd_urdf_mvp/__init__.py): 对外稳定导出 `RGBDToURDFPipeline` 和 `load_episode`
+- [__init__.py](src/rgbd_urdf_mvp/__init__.py): stable public exports for `RGBDToURDFPipeline` and `load_episode`
 
 ## What Is Implemented
 

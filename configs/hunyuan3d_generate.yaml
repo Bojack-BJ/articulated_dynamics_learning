@@ -1,0 +1,15 @@
+command: hunyuan3d-generate
+args:
+  server-url: https://your-public-generation-endpoint.example.com
+  image:
+    - path/to/front.png
+    - path/to/left.png
+    - path/to/right.png
+  image-views:
+    - front
+    - left
+    - right
+  output: outputs/generated/object.glb
+  mode: async
+  timeout-s: 1800
+  poll-interval-s: 5
