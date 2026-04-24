@@ -22,6 +22,13 @@ viz = [
 	"imageio-ffmpeg>=0.5.0",
 ]
 
+tracking = [
+	"torch>=2.1",
+	"torchvision>=0.16",
+	"pillow>=10.0.0",
+	"numpy>=1.26",
+]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

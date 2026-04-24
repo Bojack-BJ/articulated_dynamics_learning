@@ -4,3 +4,5 @@ __pycache__/
 outputs/
 .venv/
 Lightwheel/
+.cache/
+MUJOCO_LOG.TXT

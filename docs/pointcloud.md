@@ -69,11 +69,17 @@ This adds:
 
 ## Estimate Per-Part 6D Poses
 
-Once the fused pointcloud already carries `part_id`, estimate a 6D pose for each part at each frame:
+There are currently two supported pose estimators:
+
+- `pca`: baseline estimator that fits a PCA frame to each per-frame part pointcloud.
+- `tracks`: CoTracker-based estimator that tracks part-mask seed pixels, backprojects them to 3D, and fits a rigid transform from persistent 3D correspondences.
+
+The PCA path only needs a fused pointcloud with `part_id`. It is simple, but thin or symmetric parts can suffer from PCA axis flips:
 
 ```bash
 PYTHONPATH=src python3 -m rgbd_urdf_mvp estimate-part-poses \
-  outputs/recordings/door-mj-partseg-001/pointcloud_4d_partseg/fusion_manifest.json
+  outputs/recordings/door-mj-partseg-001/pointcloud_4d_partseg/fusion_manifest.json \
+  --method pca
 ```
 
 This writes `part_poses.json` next to the manifest by default.
@@ -86,6 +92,46 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp estimate-part-poses \
   --output-json outputs/recordings/door-mj-partseg-001/pointcloud_4d_partseg/part_poses_custom.json \
   --anchor-part-id 1 \
   --min-points-per-part 32
+```
+
+The CoTracker path uses the original RGB-D episode and part masks. Install the
+optional tracking dependencies first:
+
+```bash
+python -m pip install -e ".[tracking]"
+```
+
+On Mac, use `--device auto`, `--device mps`, or `--device cpu`. Do not pass
+`--device cuda` unless you are on a CUDA machine. The repository already ships
+with `co-tracker/` as a submodule, so initialize submodules after cloning:
+
+```bash
+git submodule update --init --recursive
+```
+
+Track part pixels and backproject visible samples into world-frame 3D tracks:
+
+```bash
+TORCH_HOME="$PWD/.cache/torch" PYTHONPATH=src python3 -m rgbd_urdf_mvp track-part-pixels \
+  outputs/recordings/door-mj-partseg-001/episode.json \
+  --output-json outputs/recordings/door-mj-partseg-001/pointcloud_4d_partseg/part_tracks.json \
+  --cotracker-repo ./co-tracker \
+  --cotracker-checkpoint ./co-tracker/ckpt/scaled_offline.pth \
+  --device auto \
+  --reference-frame 0 \
+  --seed-stride-px 16 \
+  --max-tracks-per-part-view 128
+```
+
+Then fit per-part SE(3) trajectories from those 3D correspondences:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp estimate-part-poses \
+  outputs/recordings/door-mj-partseg-001/pointcloud_4d_partseg/part_tracks.json \
+  --method tracks \
+  --output-json outputs/recordings/door-mj-partseg-001/pointcloud_4d_partseg/part_poses.json \
+  --anchor-part-id 1 \
+  --min-tracks-per-part 4
 ```
 
 The artifact contains:

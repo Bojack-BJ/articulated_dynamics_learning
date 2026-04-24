@@ -8,7 +8,7 @@ from pathlib import Path
 from .core.categories import SUPPORTED_CATEGORIES, normalize_category
 from .core.cli_config import YAMLSubsetError, expand_config_argv
 from .pipeline import RGBDToURDFPipeline
-from .core.serialization import load_episode, validate_episode
+from .core.serialization import load_episode, load_json, validate_episode
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -117,6 +117,70 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # Part-level perception and kinematics from pointclouds.
+    part_tracker_parser = subparsers.add_parser(
+        "track-part-pixels",
+        help="Track part-mask seed pixels with CoTracker and backproject them into 3D tracks",
+    )
+    part_tracker_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
+    part_tracker_parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Where to write the 3D track artifact (defaults to <episode_dir>/part_tracks.json)",
+    )
+    part_tracker_parser.add_argument(
+        "--device",
+        choices=["auto", "mps", "cpu", "cuda"],
+        default="auto",
+        help="PyTorch device. On Mac, 'auto' uses MPS when available and otherwise CPU.",
+    )
+    part_tracker_parser.add_argument(
+        "--cotracker-repo",
+        type=Path,
+        default=None,
+        help="Optional local co-tracker checkout for torch.hub source=local",
+    )
+    part_tracker_parser.add_argument(
+        "--cotracker-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional local CoTracker checkpoint path used instead of torch.hub downloading weights",
+    )
+    part_tracker_parser.add_argument(
+        "--cotracker-model",
+        default="cotracker3_offline",
+        help="torch.hub CoTracker model entry point",
+    )
+    part_tracker_parser.add_argument(
+        "--reference-frame",
+        type=int,
+        default=0,
+        help="Frame used for seed pixels and canonical 3D references; pass -1 to auto-pick per part",
+    )
+    part_tracker_parser.add_argument("--seed-stride-px", type=int, default=16, help="Pixel stride for mask seed sampling")
+    part_tracker_parser.add_argument(
+        "--max-tracks-per-part-view",
+        type=int,
+        default=128,
+        help="Maximum seed tracks per part per view",
+    )
+    part_tracker_parser.add_argument(
+        "--visibility-threshold",
+        type=float,
+        default=0.5,
+        help="Minimum CoTracker visibility score required for a valid 3D sample",
+    )
+    part_tracker_parser.add_argument(
+        "--no-part-mask-consistency",
+        action="store_true",
+        help="Do not require tracked pixels to remain inside the same part mask before backprojection",
+    )
+    part_tracker_parser.add_argument(
+        "--no-backward-tracking",
+        action="store_true",
+        help="Disable CoTracker backward tracking from the reference frame",
+    )
+
     part_pose_parser = subparsers.add_parser(
         "estimate-part-poses",
         help="Estimate per-part per-frame 6D poses from a part-labeled fused pointcloud",
@@ -124,7 +188,13 @@ def build_parser() -> argparse.ArgumentParser:
     part_pose_parser.add_argument(
         "input",
         type=Path,
-        help="Path to fusion_manifest.json or pointcloud_4d.ply with part_id labels",
+        help="Path to fusion_manifest.json / pointcloud_4d.ply for PCA, or part_tracks.json for track-based poses",
+    )
+    part_pose_parser.add_argument(
+        "--method",
+        choices=["auto", "pca", "tracks"],
+        default="auto",
+        help="Pose estimator. 'pca' uses fused pointcloud PCA; 'tracks' uses 3D CoTracker correspondences.",
     )
     part_pose_parser.add_argument(
         "--output-json",
@@ -143,6 +213,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional part id to use as the relative-pose anchor instead of auto-selecting the base/static part",
+    )
+    part_pose_parser.add_argument(
+        "--min-tracks-per-part",
+        type=int,
+        default=4,
+        help="Minimum visible 3D tracks required per frame when --method tracks is used",
     )
 
     joint_parser = subparsers.add_parser(
@@ -171,6 +247,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.02,
         help="Minimum translation range required to classify a moving part as prismatic when rotation is small",
+    )
+    joint_parser.add_argument(
+        "--mujoco-prior",
+        choices=["auto", "off", "required"],
+        default="auto",
+        help=(
+            "Use MJCF joint metadata when it is available through the recording manifest. "
+            "'auto' uses it as a simulation/debug prior, 'off' keeps pure geometry inference, "
+            "and 'required' fails if no prior can be found."
+        ),
     )
 
     inferred_export_parser = subparsers.add_parser(
@@ -567,17 +653,58 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"viewer_html": str(html_path.resolve())}, indent=2))
         return 0
 
-    if args.command == "estimate-part-poses":
-        from .perception.part_pose import PartPoseEstimationConfig, PartPoseEstimator
+    if args.command == "track-part-pixels":
+        from .perception.part_tracking import PartPixelTracker, PartPixelTrackingConfig
 
-        output_json = PartPoseEstimator(
-            PartPoseEstimationConfig(
-                input_path=args.input,
+        output_json = PartPixelTracker(
+            PartPixelTrackingConfig(
+                episode_path=args.episode,
                 output_json=args.output_json,
-                min_points_per_part=max(1, int(args.min_points_per_part)),
-                anchor_part_id=args.anchor_part_id,
+                device=str(args.device),
+                cotracker_repo=args.cotracker_repo,
+                cotracker_checkpoint=args.cotracker_checkpoint,
+                cotracker_model=str(args.cotracker_model),
+                reference_frame=int(args.reference_frame),
+                seed_stride_px=max(1, int(args.seed_stride_px)),
+                max_tracks_per_part_view=max(1, int(args.max_tracks_per_part_view)),
+                visibility_threshold=float(args.visibility_threshold),
+                require_part_mask_consistency=not bool(args.no_part_mask_consistency),
+                allow_backward_tracking=not bool(args.no_backward_tracking),
             )
-        ).estimate()
+        ).track()
+        print(json.dumps({"part_tracks_artifact": str(output_json.resolve())}, indent=2))
+        return 0
+
+    if args.command == "estimate-part-poses":
+        method = str(args.method)
+        if method == "auto" and args.input.suffix.lower() == ".json":
+            payload = load_json(args.input)
+            method = "tracks" if isinstance(payload.get("tracks"), list) else "pca"
+        elif method == "auto":
+            method = "pca"
+
+        if method == "tracks":
+            from .perception.part_tracking import TrackPartPoseEstimationConfig, TrackPartPoseEstimator
+
+            output_json = TrackPartPoseEstimator(
+                TrackPartPoseEstimationConfig(
+                    input_path=args.input,
+                    output_json=args.output_json,
+                    min_tracks_per_part=max(3, int(args.min_tracks_per_part)),
+                    anchor_part_id=args.anchor_part_id,
+                )
+            ).estimate()
+        else:
+            from .perception.part_pose import PartPoseEstimationConfig, PartPoseEstimator
+
+            output_json = PartPoseEstimator(
+                PartPoseEstimationConfig(
+                    input_path=args.input,
+                    output_json=args.output_json,
+                    min_points_per_part=max(1, int(args.min_points_per_part)),
+                    anchor_part_id=args.anchor_part_id,
+                )
+            ).estimate()
         print(json.dumps({"part_pose_artifact": str(output_json.resolve())}, indent=2))
         return 0
 
@@ -590,6 +717,7 @@ def main(argv: list[str] | None = None) -> int:
                 output_json=args.output_json,
                 rotation_threshold_rad=float(args.rotation_threshold_rad),
                 translation_threshold_m=float(args.translation_threshold_m),
+                mujoco_prior=args.mujoco_prior,
             )
         ).infer()
         print(json.dumps({"joint_inference_artifact": str(output_json.resolve())}, indent=2))

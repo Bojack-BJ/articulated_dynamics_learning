@@ -12,6 +12,7 @@ The current code is scaffold-first. It is meant to keep the full contract execut
 ## Start Here
 
 - Project overview: [docs/overview.md](docs/overview.md)
+- End-to-end model-to-joint-inference tutorial: [docs/end-to-end-articulation.md](docs/end-to-end-articulation.md)
 - MuJoCo recording and USD-to-MJCF conversion: [docs/mujoco-recording.md](docs/mujoco-recording.md)
 - RGB-D fusion, part segmentation, and viewer workflow: [docs/pointcloud.md](docs/pointcloud.md)
 - Remote 3D generation client/server setup: [docs/remote-generation.md](docs/remote-generation.md)
@@ -19,7 +20,7 @@ The current code is scaffold-first. It is meant to keep the full contract execut
 
 ## Installation
 
-Clone the repository with the Hunyuan3D server submodule:
+Clone the repository with submodules:
 
 ```bash
 git clone --recurse-submodules git@github.com:Bojack-BJ/articulated_dynamics_learning.git
@@ -41,15 +42,39 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[simulation,viz]"
 ```
 
+Optional CoTracker support for track-based part trajectories:
+
+```bash
+python -m pip install -e ".[tracking]"
+```
+
+On Mac, the tracking command defaults to `--device auto`, which uses PyTorch
+MPS when available and CPU otherwise. CUDA is never selected unless
+`--device cuda` is passed explicitly.
+
+If you do not want `torch.hub` to download weights automatically, place the
+checkpoint at `co-tracker/ckpt/scaled_offline.pth` and pass it explicitly:
+
+```bash
+TORCH_HOME="$PWD/.cache/torch" PYTHONPATH=src python -m rgbd_urdf_mvp track-part-pixels \
+  outputs/recordings/microwave011/episode.json \
+  --cotracker-repo ./co-tracker \
+  --cotracker-checkpoint ./co-tracker/ckpt/scaled_offline.pth \
+  --device auto
+```
+
 Run the smoke tests:
 
 ```bash
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-The `Hunyuan3D-2/` directory is a submodule pointing to this project's fork of
-the Hunyuan3D sample server. On the remote GPU machine, install that server in
-its own environment:
+The repository includes these submodules:
+
+- `Hunyuan3D-2/`: this project's fork of the Hunyuan3D sample server
+- `co-tracker/`: the official CoTracker repository used by the track-based part trajectory path
+
+On the remote GPU machine, install `Hunyuan3D-2/` in its own environment:
 
 ```bash
 cd Hunyuan3D-2
