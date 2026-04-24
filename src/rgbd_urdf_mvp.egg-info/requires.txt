@@ -3,6 +3,12 @@
 mujoco>=3.1.0
 numpy>=1.26
 
+[tracking]
+torch>=2.1
+torchvision>=0.16
+pillow>=10.0.0
+numpy>=1.26
+
 [viz]
 pillow>=10.0.0
 numpy>=1.26

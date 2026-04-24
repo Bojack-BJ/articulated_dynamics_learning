@@ -9,7 +9,18 @@ from .models import ArticulationArtifact, EpisodeInput, ReconstructionArtifact
 
 
 def load_json(path: str | Path) -> dict[str, Any]:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    json_path = Path(path)
+    try:
+        return json.loads(json_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raw_path = str(path)
+        stripped_path = raw_path.strip()
+        if stripped_path != raw_path:
+            hint = f"Path has leading/trailing whitespace: {raw_path!r}."
+            if Path(stripped_path).exists():
+                hint += f" Did you mean {stripped_path!r}?"
+            raise FileNotFoundError(hint) from exc
+        raise
 
 
 def save_json(data: dict[str, Any], path: str | Path) -> None:

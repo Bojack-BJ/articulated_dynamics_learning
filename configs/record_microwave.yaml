@@ -1,23 +1,23 @@
 command: record-mujoco
 args:
-  model: examples/mujoco_models/Refrigerator031.xml
-  category: refrigerator
-  object-id: refrigerator031
+  model: examples/mujoco_models/Microwave011.xml
+  category: microwave
+  object-id: microwave011
   output-dir: outputs/recordings
   duration-s: 4
   fps: 60
   control-mode: free
-  joint-name: freezer_door_joint
+  joint-name: microjoint
   auto-initial-qvel-from-limits: true
   auto-initial-qvel-direction-mode: away-from-qpos0
-  auto-initial-qvel-min-abs: 0.5
-  auto-initial-qvel-max-abs: 1.0
+  auto-initial-qvel-min-abs: 6.0
+  auto-initial-qvel-max-abs: 8.0
   perturbation-scale: 0.0
   video: true
-  camera-distance: 2.2
+  camera-distance: 1.2
   camera-mode: triview
   camera-triview-spacing-deg: 90
-  lookat: [0.0, 0.0, 1.0]
+  lookat: [0.0, 0.0, 0.0]
   disable-target-mesh-collision: true
   segmentation-masks: true
   part-segmentation-masks: true

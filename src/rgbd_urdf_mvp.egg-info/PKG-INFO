@@ -12,52 +12,115 @@ Requires-Dist: pillow>=10.0.0; extra == "viz"
 Requires-Dist: numpy>=1.26; extra == "viz"
 Requires-Dist: imageio>=2.34.0; extra == "viz"
 Requires-Dist: imageio-ffmpeg>=0.5.0; extra == "viz"
+Provides-Extra: tracking
+Requires-Dist: torch>=2.1; extra == "tracking"
+Requires-Dist: torchvision>=0.16; extra == "tracking"
+Requires-Dist: pillow>=10.0.0; extra == "tracking"
+Requires-Dist: numpy>=1.26; extra == "tracking"
 
-# RGB-D -> 3D Generation -> PARTICULATE -> URDF MVP
+# Articulated Dynamics Learning From RGB-D
 
-This repository implements a runnable research scaffold for the MVP plan:
+This repository contains a runnable scaffold for:
 
 - `sim RGB-D + camera poses -> canonical mesh`
-- `canonical mesh -> category-prior articulation init`
+- `canonical mesh -> articulation init`
 - `temporal refit -> q, qdot`
 - `articulation -> kinematic + collision URDF`
 
-The current implementation is intentionally scaffold-first:
+The current code is scaffold-first. It is meant to keep the full contract executable now, while leaving clean replacement points for real reconstruction, PARTICULATE, and dynamics-identification backends.
 
-- It defines the artifact contracts you asked for.
-- It keeps a clean replacement boundary for a real `3D generation` backend and a real `PARTICULATE` backend.
-- It provides a default heuristic backend for `door` and `drawer` so the pipeline, tests, and URDF export are executable now.
+## Start Here
 
-## What is implemented
+- Project overview: [docs/overview.md](docs/overview.md)
+- End-to-end model-to-joint-inference tutorial: [docs/end-to-end-articulation.md](docs/end-to-end-articulation.md)
+- MuJoCo recording and USD-to-MJCF conversion: [docs/mujoco-recording.md](docs/mujoco-recording.md)
+- RGB-D fusion, part segmentation, and viewer workflow: [docs/pointcloud.md](docs/pointcloud.md)
+- Remote 3D generation client/server setup: [docs/remote-generation.md](docs/remote-generation.md)
+- Research-stack replacement points: [docs/research-stack.md](docs/research-stack.md)
 
-- Episode schema for RGB-D sequences with camera poses and action logs
-- Generation-first reconstruction stage with cleanup of low-support hallucinated components
-- Single-DOF articulation initialization with `door -> revolute` and `drawer -> prismatic`
-- Sliding-window temporal refit with smoothed `q` and derived `qdot`
-- URDF export with visual meshes, collision box proxies, nominal inertial placeholders, and a MuJoCo MJCF stub
-- Example episodes for `door` and `drawer`
-- Unit tests for schema loading, temporal smoothing, and end-to-end door/drawer output
+## Installation
 
-## What is still a placeholder
+Clone the repository with the Hunyuan3D server submodule:
 
-- Real RGB-D fusion / generative 3D model inference
-- Real PARTICULATE invocation
-- Dense RGB-D alignment for joint refit
-- Real SAPIEN / MuJoCo runtime integration
+```bash
+git clone --recurse-submodules git@github.com:Bojack-BJ/articulated_dynamics_learning.git
+cd articulated_dynamics_learning
+```
 
-The code is structured so those backends can replace the current heuristics without changing the pipeline contracts.
+If you already cloned the repository without submodules:
 
-## Layout
+```bash
+git submodule update --init --recursive
+```
 
-- `src/rgbd_urdf_mvp/models.py`: public data contracts
-- `src/rgbd_urdf_mvp/reconstruction.py`: generation-first reconstruction scaffold
-- `src/rgbd_urdf_mvp/articulation.py`: articulation init adapter
-- `src/rgbd_urdf_mvp/refit.py`: temporal smoothing and `qdot` extraction
-- `src/rgbd_urdf_mvp/urdf.py`: URDF export
-- `src/rgbd_urdf_mvp/pipeline.py`: end-to-end orchestration
-- `examples/episodes/*`: sample door and drawer episodes
+Create a local Python environment for the RGB-D to URDF project:
 
-## Run
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[simulation,viz]"
+```
+
+Optional CoTracker support for track-based part trajectories:
+
+```bash
+python -m pip install -e ".[tracking]"
+```
+
+On Mac, the tracking command defaults to `--device auto`, which uses PyTorch
+MPS when available and CPU otherwise. CUDA is never selected unless
+`--device cuda` is passed explicitly. You can either let `torch.hub` download
+CoTracker on the first run, or use a local checkout:
+
+```bash
+git clone https://github.com/facebookresearch/co-tracker.git ../co-tracker
+
+PYTHONPATH=src python -m rgbd_urdf_mvp track-part-pixels \
+  outputs/recordings/microwave011/episode.json \
+  --cotracker-repo ../co-tracker \
+  --device auto
+```
+
+Run the smoke tests:
+
+```bash
+PYTHONPATH=src python -m unittest discover -s tests -v
+```
+
+The `Hunyuan3D-2/` directory is a submodule pointing to this project's fork of
+the Hunyuan3D sample server. On the remote GPU machine, install that server in
+its own environment:
+
+```bash
+cd Hunyuan3D-2
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+
+# Install PyTorch first using the wheel that matches your CUDA version.
+# See https://pytorch.org/get-started/locally/
+
+python -m pip install -r requirements.txt
+python -m pip install -e .
+```
+
+Texture generation may need the optional Hunyuan3D rasterizer extensions:
+
+```bash
+cd hy3dgen/texgen/custom_rasterizer
+python setup.py install
+cd ../../..
+cd hy3dgen/texgen/differentiable_renderer
+python setup.py install
+cd ../../..
+```
+
+For remote mesh generation, run the Hunyuan3D API server on the GPU machine and
+call it from the Mac client. The full setup is documented in
+[docs/remote-generation.md](docs/remote-generation.md).
+
+## Quick Start
 
 Validate an episode:
 
@@ -65,11 +128,125 @@ Validate an episode:
 PYTHONPATH=src python3 -m rgbd_urdf_mvp validate-episode examples/episodes/door/episode.json
 ```
 
-Run the pipeline:
+`validate-episode` is a lightweight schema check that catches obviously broken
+inputs before the pipeline starts. It currently checks:
+
+- whether `category` is in the supported list
+- whether the episode contains at least one frame
+- whether each frame `camera_pose` and `camera_poses_by_view` is `4x4`
+- whether `mask_path` / `part_mask_path` / `*_paths_by_view` have the expected types
+- whether `timestamp_s` is non-negative
+
+It does not validate geometric correctness, and it does not tell you whether
+depth, pointclouds, or poses are actually aligned. Its purpose is to catch
+manifest-structure errors early so fusion / pose / URDF stages fail less
+deeply and more clearly.
+
+Run the scaffold pipeline:
 
 ```bash
 PYTHONPATH=src python3 -m rgbd_urdf_mvp run examples/episodes/door/episode.json --output-dir outputs/door_demo
-PYTHONPATH=src python3 -m rgbd_urdf_mvp run examples/episodes/drawer/episode.json --output-dir outputs/drawer_demo
+```
+
+Pipeline path switch:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp run examples/episodes/door/episode.json --output-dir outputs/door_demo_ff --path feedforward
+```
+
+`run` currently supports two paths:
+
+- `feedforward`
+  - `reconstruction -> articulation init -> export`
+  - useful for a fast shape-to-URDF forward pass
+- `optimization`
+  - `reconstruction -> articulation init -> temporal refit -> export`
+  - the current default path and the more complete implementation in this repo
+
+At the moment, the scaffold is primarily centered on the
+`optimization-based path`, because it continues after articulation
+initialization into temporal refit and explicitly produces more stable `q`
+and `qdot`.
+
+## Pipeline Flow
+
+```text
+Episode Input
+  RGB-D + camera poses + actions
+        |
+        v
+Reconstruction
+  canonical mesh / primitives
+        |
+        v
+Articulation Init
+  parts + joints + limits
+        |
+        v
+Pipeline Path
+  |-- feedforward ---> URDF / MJCF Export
+  |
+  `-- optimization --> Temporal Refit
+                          smooth q, derive qdot
+                              |
+                              v
+                        URDF / MJCF Export
+                              |
+                              v
+Pipeline Result
+  articulation artifact + URDF package
+```
+
+Use a YAML config instead of long CLI flags:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp configs/run_optimization.yaml
+```
+
+Example config:
+
+```yaml
+command: run
+episode: examples/episodes/door/episode.json
+output-dir: outputs/door_demo_yaml
+path: optimization
+```
+
+The same mechanism also works for commands with many parameters, such as
+`record-mujoco`:
+
+```yaml
+command: record-mujoco
+args:
+  model: examples/mujoco_models/Refrigerator031.xml
+  category: refrigerator
+  object-id: refrigerator031_yaml
+  output-dir: outputs/recordings
+  duration-s: 4
+  fps: 20
+  camera-mode: triview
+  camera-triview-spacing-deg: 90
+  lookat: [0.0, 0.0, 0.0]
+  segmentation-masks: true
+  part-segmentation-masks: true
+```
+
+Then run it directly:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp configs/record_refrigerator.yaml
+```
+
+If you want to override one or two fields temporarily, you can still append
+normal CLI flags after the config file. Later CLI arguments override values
+coming from the config file.
+
+Fuse and inspect a recorded MuJoCo episode:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp fuse-pointcloud outputs/recordings/refrigerator031_door_only/episode.json --output-dir outputs/recordings/refrigerator031_door_only/pointcloud_4d --pixel-stride 8 --voxel-size-m 0.02 --no-shared-pose-fallback
+
+PYTHONPATH=src python3 -m rgbd_urdf_mvp visualize-pointcloud outputs/recordings/refrigerator031_door_only/pointcloud_4d_fixed3/fusion_manifest.json
 ```
 
 Run tests:
@@ -78,90 +255,45 @@ Run tests:
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-## MuJoCo recording for articulated objects
+## Package Layout
 
-Install simulation extras:
+`src/rgbd_urdf_mvp` is now split into a few subpackages by responsibility:
 
-```bash
-pip install -e '.[simulation]'
-```
+- `core`
+  - data models, category definitions, geometry helpers, serialization
+- `sim`
+  - MuJoCo recording, mask rerendering, USD/MJCF conversion
+- `perception`
+  - reconstruction, 4D pointcloud fusion, part segmentation, part pose, viewer
+- `kinematics`
+  - articulation init, temporal refit, joint inference, inferred articulation export
+- `export`
+  - URDF / MJCF export
 
-Record a `sim RGB-D + camera poses + action_log` episode from a MuJoCo model:
+The package root keeps a small number of top-level entry points:
 
-```bash
-PYTHONPATH=src python3 -m rgbd_urdf_mvp record-mujoco path/to/object.xml \
-  --category door \
-  --object-id door-mj-001 \
-  --output-dir outputs/recordings \
-  --frames 60 \
-  --perturbation-scale 0.4
-```
+- [cli.py](src/rgbd_urdf_mvp/cli.py): command-line entry point
+- [pipeline.py](src/rgbd_urdf_mvp/pipeline.py): scaffold end-to-end pipeline
+- [__init__.py](src/rgbd_urdf_mvp/__init__.py): stable public exports for `RGBDToURDFPipeline` and `load_episode`
 
-Control recording duration / frame rate:
+## What Is Implemented
 
-```bash
-PYTHONPATH=src python3 -m rgbd_urdf_mvp record-mujoco path/to/object.xml \
-  --category door \
-  --object-id door-mj-001 \
-  --output-dir outputs/recordings \
-  --duration-s 3.0 \
-  --fps 20
-```
+- Episode schema for RGB-D sequences with camera poses and action logs
+- Generation-first reconstruction scaffold
+- Single-DOF articulation init for `door` and `drawer`
+- Sliding-window refit with smoothed `q` and derived `qdot`
+- URDF export with collision proxies and MJCF stub
+- MuJoCo recording utilities
+- Multi-view 4D pointcloud fusion
+- MuJoCo-prior part masks and part-aware pointcloud visualization
+- Per-part 6D pose estimation from 4D pointclouds
+- Joint type/axis/pivot inference from pose tracks
+- Inferred-articulation export back into URDF/MJCF
+- YAML/JSON driven CLI config expansion for long commands
 
-To record PNGs instead of PPM/PGM:
+## What Is Still Placeholder
 
-```bash
-PYTHONPATH=src python3 -m rgbd_urdf_mvp record-mujoco path/to/object.xml \
-  --category door \
-  --object-id door-mj-001 \
-  --output-dir outputs/recordings \
-  --frames 60 \
-  --rgb-format png \
-  --depth-format png
-```
-
-Visualize an episode (exports per-frame `*_rgb.png` and `*_depth_vis.png`):
-
-```bash
-pip install -e '.[viz]'
-PYTHONPATH=src python3 -m rgbd_urdf_mvp visualize-episode outputs/recordings/door-mj-001/episode.json \
-  --output-dir outputs/viz \
-  --max-frames 24
-```
-
-To also write an mp4 video (RGB | depth_vis side-by-side):
-
-```bash
-PYTHONPATH=src python3 -m rgbd_urdf_mvp visualize-episode outputs/recordings/door-mj-001/episode.json \
-  --output-dir outputs/viz \
-  --max-frames 120 \
-  --video \
-  --video-fps 20
-```
-
-The recorder:
-
-- loads a MuJoCo articulated model (MJCF XML)
-- finds the first hinge/slide joint and applies tracking control with random perturbation
-- renders RGB (`.ppm`) and depth (`.pgm`, 16-bit, millimeters)
-- writes an episode at `outputs/recordings/<object-id>/episode.json`
-
-Then run the normal Stage-2 scaffold pipeline:
-
-```bash
-PYTHONPATH=src python3 -m rgbd_urdf_mvp run outputs/recordings/door-mj-001/episode.json --output-dir outputs/door_mj_run
-```
-
-## Replacement points for the real research stack
-
-- Replace `GenerationFirstReconstructor` with:
-  - multi-view RGB-D object extraction
-  - canonical mesh generation
-  - depth reprojection verification and cleanup
-- Replace `CategoryPriorParticulateAdapter` with:
-  - PARTICULATE execution on canonical mesh
-  - post-processing to legal kinematic tree
-- Replace `SlidingWindowRefitter` with:
-  - dense RGB-D / point cloud alignment
-  - joint axis/origin/limit optimization
-  - temporal window optimization over part poses and `q`
+- Real RGB-D generative reconstruction
+- Real PARTICULATE invocation
+- Dense joint-aware RGB-D alignment
+- Full dynamics identification and contact modeling
