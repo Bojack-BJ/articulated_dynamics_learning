@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -25,6 +26,31 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser = subparsers.add_parser("validate-episode", help="Validate an episode manifest")
     validate_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
 
+    probe_mps_parser = subparsers.add_parser(
+        "probe-torch-mps",
+        help="Print local PyTorch MPS capability diagnostics",
+    )
+    probe_mps_parser.add_argument(
+        "--no-tensor-test",
+        action="store_true",
+        help="Skip the real tensor allocation smoke test on the selected device",
+    )
+    probe_mps_parser.add_argument(
+        "--unsafe-force-mps",
+        action="store_true",
+        help="Attempt an actual MPS tensor even when torch.backends.mps.is_available() is false",
+    )
+
+    probe_mjx_parser = subparsers.add_parser(
+        "probe-mjx",
+        help="Print local JAX + MuJoCo MJX capability diagnostics",
+    )
+    probe_mjx_parser.add_argument(
+        "--no-rollout-test",
+        action="store_true",
+        help="Skip the tiny JIT + mjx.step smoke test",
+    )
+
     # End-to-end scaffold pipeline.
     run_parser = subparsers.add_parser("run", help="Run the end-to-end MVP pipeline")
     run_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
@@ -42,6 +68,118 @@ def build_parser() -> argparse.ArgumentParser:
             "Pipeline path. 'feedforward' stops after articulation init; "
             "'optimization' runs the temporal refinement stage before export."
         ),
+    )
+
+    batch_parser = subparsers.add_parser(
+        "run-articulation-batch",
+        help="Run the record -> fuse -> track -> pose -> joint -> viewer pipeline over a batch manifest",
+    )
+    batch_parser.add_argument(
+        "manifest",
+        type=Path,
+        help="Tab-separated manifest: category, model_path, object_id, joint_name",
+    )
+    batch_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip any stage whose expected output already exists",
+    )
+    batch_parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip a whole object when its final batch artifact already exists",
+    )
+    batch_parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Maximum number of objects to process concurrently",
+    )
+    batch_parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("outputs") / "recordings",
+        help="Root directory for per-object recording outputs",
+    )
+    batch_parser.add_argument(
+        "--batch-log-dir",
+        type=Path,
+        default=Path("outputs") / "recordings" / "_batch_logs",
+        help="Per-object batch logs when --jobs > 1",
+    )
+    batch_parser.add_argument(
+        "--torch-home",
+        type=Path,
+        default=Path(os.environ.get("TORCH_HOME", ".cache/torch")),
+        help="Torch cache directory propagated to subprocess stages",
+    )
+    batch_parser.add_argument(
+        "--record-config",
+        type=Path,
+        default=None,
+        help="Optional YAML/JSON record-mujoco template used for every object in the batch",
+    )
+    batch_parser.add_argument(
+        "--track-config",
+        type=Path,
+        default=None,
+        help="Optional YAML/JSON track-part-pixels template used for every object in the batch",
+    )
+    batch_parser.add_argument(
+        "--cotracker-repo",
+        type=Path,
+        default=None,
+        help="Optional override for the CoTracker repo path used by the tracking stage",
+    )
+    batch_parser.add_argument(
+        "--cotracker-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional override for the CoTracker checkpoint path used by the tracking stage",
+    )
+    batch_parser.add_argument(
+        "--track-device",
+        choices=["auto", "mps", "cpu", "cuda"],
+        default=None,
+        help="Optional override for the device used by track-part-pixels",
+    )
+    batch_parser.add_argument(
+        "--tracking-jobs",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of concurrent track-part-pixels stages. "
+            "Defaults to 1 for auto/mps/cuda and to --jobs for cpu."
+        ),
+    )
+    batch_parser.add_argument(
+        "--fuse-pixel-stride",
+        type=int,
+        default=8,
+        help="Depth sampling stride for fuse-pointcloud",
+    )
+    batch_parser.add_argument(
+        "--fuse-voxel-size-m",
+        type=float,
+        default=0.02,
+        help="Fusion voxel size for fuse-pointcloud",
+    )
+    batch_parser.add_argument(
+        "--min-tracks-per-part",
+        type=int,
+        default=4,
+        help="Minimum visible 3D tracks required for track-based part pose estimation",
+    )
+    batch_parser.add_argument(
+        "--mujoco-prior",
+        choices=["auto", "off", "required"],
+        default="off",
+        help="MJCF prior mode passed through to infer-joints",
+    )
+    batch_parser.add_argument(
+        "--no-generate-viewer",
+        action="store_true",
+        help="Skip the final visualize-pointcloud stage",
     )
 
     # 4D pointcloud fusion and inspection.
@@ -110,6 +248,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional part_poses.json override used for joint overlays",
     )
     viewer_parser.add_argument(
+        "--part-tracks-json",
+        type=Path,
+        default=None,
+        help="Optional part_tracks.json override used for CoTracker flow overlays",
+    )
+    viewer_parser.add_argument(
         "--joint-inference-json",
         type=Path,
         default=None,
@@ -152,10 +296,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="torch.hub CoTracker model entry point",
     )
     part_tracker_parser.add_argument(
+        "--unsafe-force-mps",
+        action="store_true",
+        help="When combined with --device mps, bypass the availability guard and try MPS anyway.",
+    )
+    part_tracker_parser.add_argument(
         "--reference-frame",
         type=int,
         default=0,
         help="Frame used for seed pixels and canonical 3D references; pass -1 to auto-pick per part",
+    )
+    part_tracker_parser.add_argument(
+        "--frame-stride",
+        type=int,
+        default=1,
+        help="Temporal subsampling stride for tracking. For a 60 Hz episode, 4 tracks at roughly 15 Hz.",
     )
     part_tracker_parser.add_argument("--seed-stride-px", type=int, default=16, help="Pixel stride for mask seed sampling")
     part_tracker_parser.add_argument(
@@ -179,6 +334,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-backward-tracking",
         action="store_true",
         help="Disable CoTracker backward tracking from the reference frame",
+    )
+    part_tracker_parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable stderr progress updates during CoTracker tracking",
     )
 
     part_pose_parser = subparsers.add_parser(
@@ -273,6 +433,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory for articulation and URDF outputs (defaults to <joint_inference_dir>/inferred_articulation)",
     )
 
+    dynamics_parser = subparsers.add_parser(
+        "identify-dynamics",
+        help="Fit part masses and joint damping/friction against the observed joint trajectory in MuJoCo",
+    )
+    dynamics_parser.add_argument("episode", type=Path, help="Path to episode.json")
+    dynamics_parser.add_argument("articulation_artifact", type=Path, help="Path to articulation_artifact.json")
+    dynamics_parser.add_argument("mjcf", type=Path, help="Path to the MJCF model to optimize")
+    dynamics_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for dynamics identification outputs (defaults to <mjcf_dir>/dynamics_identification)",
+    )
+    dynamics_parser.add_argument("--max-iterations", type=int, default=10, help="Maximum optimization iterations")
+    dynamics_parser.add_argument("--learning-rate", type=float, default=0.25, help="Finite-difference gradient step size")
+    dynamics_parser.add_argument("--q-weight", type=float, default=1.0, help="Weight for q(t) trajectory matching")
+    dynamics_parser.add_argument("--qdot-weight", type=float, default=0.05, help="Weight for qdot(t) trajectory matching")
+    dynamics_parser.add_argument("--prior-weight", type=float, default=0.02, help="Regularization weight toward the initial MJCF parameters")
+    dynamics_parser.add_argument(
+        "--optimize-static-parts",
+        action="store_true",
+        help="Also include static/root part masses in the optimization vector",
+    )
+    dynamics_parser.add_argument(
+        "--no-optimize-mass",
+        action="store_true",
+        help="Do not optimize body masses/inertias",
+    )
+    dynamics_parser.add_argument(
+        "--no-optimize-damping",
+        action="store_true",
+        help="Do not optimize joint damping",
+    )
+    dynamics_parser.add_argument(
+        "--no-optimize-friction",
+        action="store_true",
+        help="Do not optimize joint frictionloss",
+    )
+
     hunyuan_parser = subparsers.add_parser(
         "hunyuan3d-generate",
         help="Request a remote Hunyuan3D API server and save the generated 3D asset",
@@ -348,6 +547,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional output episode JSON path (defaults to in-place update)",
     )
 
+    compact_recording_parser = subparsers.add_parser(
+        "compact-mujoco-recording",
+        help="Rewrite a triview episode to views-only assets and optionally delete assets/concat",
+    )
+    compact_recording_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
+    compact_recording_parser.add_argument(
+        "--keep-concat-dir",
+        action="store_true",
+        help="Do not delete assets/concat after rewriting frame paths",
+    )
+    compact_recording_parser.add_argument(
+        "--remove-concat-video",
+        action="store_true",
+        help="Also delete episode_concat.mp4 when present",
+    )
+    compact_recording_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be compacted without modifying the episode or deleting files",
+    )
+
+    repack_recording_parser = subparsers.add_parser(
+        "repack-mujoco-recording",
+        help="Convert a recorded MuJoCo episode's referenced ppm/pgm assets to png and update episode.json",
+    )
+    repack_recording_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
+    repack_recording_parser.add_argument(
+        "--keep-originals",
+        action="store_true",
+        help="Keep the original ppm/pgm files after writing the png copies",
+    )
+    repack_recording_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be converted without modifying the episode or writing pngs",
+    )
+
     record_parser = subparsers.add_parser(
         "record-mujoco",
         help="Record a sim RGB-D episode from a MuJoCo articulated object",
@@ -399,6 +635,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["pgm", "png"],
         default="pgm",
         help="Depth output format (pgm is 16-bit PGM; png is 16-bit PNG)",
+    )
+    record_parser.add_argument(
+        "--write-concat-assets",
+        action="store_true",
+        help=(
+            "In triview mode, also write duplicated horizontally concatenated RGB/depth/mask assets "
+            "under assets/concat. Disabled by default to reduce disk usage."
+        ),
     )
     record_parser.add_argument(
         "--camera-distance",
@@ -605,6 +849,31 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Episode '{episode.object_instance_id}' is valid for category '{episode.category}'.")
         return 0
 
+    if args.command == "probe-torch-mps":
+        from .core.torch_probe import probe_torch_mps
+
+        print(
+            json.dumps(
+                probe_torch_mps(
+                    run_tensor_test=not bool(args.no_tensor_test),
+                    unsafe_force_mps=bool(args.unsafe_force_mps),
+                ),
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "probe-mjx":
+        from .core.mjx_probe import probe_mjx
+
+        print(
+            json.dumps(
+                probe_mjx(run_rollout_test=not bool(args.no_rollout_test)),
+                indent=2,
+            )
+        )
+        return 0
+
     if args.command == "run":
         episode = load_episode(args.episode)
         errors = validate_episode(episode)
@@ -618,6 +887,36 @@ def main(argv: list[str] | None = None) -> int:
             path_mode=str(args.path),
         )
         print(json.dumps({"path_mode": str(args.path), **result.to_dict()}, indent=2))
+        return 0
+
+    if args.command == "run-articulation-batch":
+        from .batch.articulation_pipeline import ArticulationBatchConfig, ArticulationBatchRunner
+
+        if args.jobs < 1:
+            parser.error("--jobs must be a positive integer")
+        result = ArticulationBatchRunner(
+            ArticulationBatchConfig(
+                manifest_path=args.manifest,
+                resume=bool(args.resume),
+                skip_existing=bool(args.skip_existing),
+                jobs=int(args.jobs),
+                output_root=args.output_root,
+                batch_log_dir=args.batch_log_dir,
+                torch_home=args.torch_home,
+                record_config=args.record_config,
+                track_config=args.track_config,
+                cotracker_repo=args.cotracker_repo,
+                cotracker_checkpoint=args.cotracker_checkpoint,
+                track_device=args.track_device,
+                tracking_jobs=args.tracking_jobs,
+                fuse_pixel_stride=max(1, int(args.fuse_pixel_stride)),
+                fuse_voxel_size_m=float(args.fuse_voxel_size_m),
+                min_tracks_per_part=max(3, int(args.min_tracks_per_part)),
+                mujoco_prior_mode=str(args.mujoco_prior),
+                generate_viewer=not bool(args.no_generate_viewer),
+            )
+        ).run()
+        print(json.dumps(result, indent=2))
         return 0
 
     if args.command == "fuse-pointcloud":
@@ -647,6 +946,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_points_per_frame=max(1, int(args.max_points_per_frame)),
                 point_radius_px=float(args.point_radius_px),
                 part_pose_path=args.part_poses_json,
+                part_track_path=args.part_tracks_json,
                 joint_inference_path=args.joint_inference_json,
             )
         ).build()
@@ -664,12 +964,15 @@ def main(argv: list[str] | None = None) -> int:
                 cotracker_repo=args.cotracker_repo,
                 cotracker_checkpoint=args.cotracker_checkpoint,
                 cotracker_model=str(args.cotracker_model),
+                unsafe_force_mps=bool(args.unsafe_force_mps),
                 reference_frame=int(args.reference_frame),
+                frame_stride=max(1, int(args.frame_stride)),
                 seed_stride_px=max(1, int(args.seed_stride_px)),
                 max_tracks_per_part_view=max(1, int(args.max_tracks_per_part_view)),
                 visibility_threshold=float(args.visibility_threshold),
                 require_part_mask_consistency=not bool(args.no_part_mask_consistency),
                 allow_backward_tracking=not bool(args.no_backward_tracking),
+                show_progress=not bool(args.no_progress),
             )
         ).track()
         print(json.dumps({"part_tracks_artifact": str(output_json.resolve())}, indent=2))
@@ -742,6 +1045,29 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result.to_dict(), indent=2))
         return 0
 
+    if args.command == "identify-dynamics":
+        from .dynamics.system_id import DynamicsIdentificationConfig, DynamicsIdentifier
+
+        artifact_path = DynamicsIdentifier().run(
+            DynamicsIdentificationConfig(
+                episode_path=args.episode,
+                articulation_artifact_path=args.articulation_artifact,
+                mjcf_path=args.mjcf,
+                output_dir=args.output_dir,
+                max_iterations=max(1, int(args.max_iterations)),
+                learning_rate=float(args.learning_rate),
+                q_weight=float(args.q_weight),
+                qdot_weight=float(args.qdot_weight),
+                prior_weight=float(args.prior_weight),
+                optimize_static_parts=bool(args.optimize_static_parts),
+                optimize_mass=not bool(args.no_optimize_mass),
+                optimize_damping=not bool(args.no_optimize_damping),
+                optimize_friction=not bool(args.no_optimize_friction),
+            )
+        )
+        print(json.dumps({"dynamics_identification_artifact": str(artifact_path.resolve())}, indent=2))
+        return 0
+
     if args.command == "hunyuan3d-generate":
         from .perception.hunyuan3d_client import Hunyuan3DClient, Hunyuan3DGenerationConfig
 
@@ -788,6 +1114,33 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"episode_path": str(episode_path.resolve())}, indent=2))
         return 0
 
+    if args.command == "compact-mujoco-recording":
+        from .sim.mujoco_recorder import MuJoCoEpisodeCompactConfig, MuJoCoEpisodeCompactor
+
+        result = MuJoCoEpisodeCompactor(
+            MuJoCoEpisodeCompactConfig(
+                episode_path=args.episode,
+                remove_concat_dir=not bool(args.keep_concat_dir),
+                remove_concat_video=bool(args.remove_concat_video),
+                dry_run=bool(args.dry_run),
+            )
+        ).compact()
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "repack-mujoco-recording":
+        from .sim.mujoco_recorder import MuJoCoEpisodeRepackConfig, MuJoCoEpisodeRepacker
+
+        result = MuJoCoEpisodeRepacker(
+            MuJoCoEpisodeRepackConfig(
+                episode_path=args.episode,
+                keep_originals=bool(args.keep_originals),
+                dry_run=bool(args.dry_run),
+            )
+        ).repack()
+        print(json.dumps(result, indent=2))
+        return 0
+
     if args.command == "record-mujoco":
         from .sim.mujoco_recorder import MuJoCoEpisodeRecorder, MuJoCoRecordConfig
 
@@ -827,6 +1180,7 @@ def main(argv: list[str] | None = None) -> int:
             height=args.height,
             rgb_format=args.rgb_format,
             depth_format=args.depth_format,
+            write_concat_assets=bool(args.write_concat_assets),
             camera_distance=args.camera_distance,
             camera_elevation_deg=args.camera_elevation_deg,
             camera_azimuth_start_deg=args.camera_azimuth_start_deg,

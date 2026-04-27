@@ -8,6 +8,10 @@ args:
   fps: 60
   control-mode: free
   joint-name: freezer_door_joint
+  rgb-format: png
+  depth-format: png
+  mask-format: png
+  # initial-qvel: 0.0
   auto-initial-qvel-from-limits: true
   auto-initial-qvel-direction-mode: away-from-qpos0
   auto-initial-qvel-min-abs: 0.5

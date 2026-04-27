@@ -118,6 +118,8 @@ class PointCloudVisualizationTests(unittest.TestCase):
             (root / "part_poses.json").write_text(
                 json.dumps(
                     {
+                        "estimator": "cotracker-depth-rigid-registration",
+                        "sampled_frame_indices": [0, 1],
                         "parts": [
                             {
                                 "part_id": 1,
@@ -138,6 +140,39 @@ class PointCloudVisualizationTests(unittest.TestCase):
                                 ],
                             }
                         ]
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "part_tracks.json").write_text(
+                json.dumps(
+                    {
+                        "estimator": "cotracker-depth-backprojection",
+                        "tracks": [
+                            {
+                                "track_id": 1,
+                                "part_id": 2,
+                                "part_name": "door",
+                                "samples": [
+                                    {
+                                        "frame_index": 0,
+                                        "source_frame_index": 0,
+                                        "visible": True,
+                                        "confidence": 1.0,
+                                        "xyz_world": [0.5, 0.0, 0.0],
+                                    },
+                                    {
+                                        "frame_index": 1,
+                                        "source_frame_index": 1,
+                                        "visible": True,
+                                        "confidence": 1.0,
+                                        "xyz_world": [0.6, 0.0, 0.0],
+                                    },
+                                ],
+                            }
+                        ],
                     },
                     indent=2,
                 )
@@ -175,8 +210,14 @@ class PointCloudVisualizationTests(unittest.TestCase):
             ).build()
             html = html_path.read_text(encoding="utf-8")
             self.assertIn("Show Joints", html)
+            self.assertIn("Show Poses", html)
+            self.assertIn("Show Flow", html)
             self.assertIn("door_joint", html)
+            self.assertIn("cotracker-depth-rigid-registration", html)
+            self.assertIn("cotracker-depth-backprojection", html)
             self.assertIn("\"has_joint_overlays\":true", html)
+            self.assertIn("\"has_part_pose_overlays\":true", html)
+            self.assertIn("\"has_track_flows\":true", html)
             self.assertIn("joint_overlay_count", html)
 
 

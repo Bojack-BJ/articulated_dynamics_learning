@@ -73,15 +73,22 @@ class PartTrackingTests(unittest.TestCase):
                 "co-tracker",
                 "--cotracker-checkpoint",
                 "co-tracker/ckpt/scaled_offline.pth",
+                "--unsafe-force-mps",
                 "--reference-frame",
                 "0",
+                "--frame-stride",
+                "4",
                 "--seed-stride-px",
                 "12",
+                "--no-progress",
             ]
         )
         self.assertEqual(args.command, "track-part-pixels")
         self.assertEqual(args.device, "mps")
+        self.assertTrue(args.unsafe_force_mps)
+        self.assertEqual(args.frame_stride, 4)
         self.assertEqual(args.seed_stride_px, 12)
+        self.assertTrue(args.no_progress)
         self.assertEqual(Path(args.cotracker_checkpoint), Path("co-tracker/ckpt/scaled_offline.pth"))
 
     def test_estimate_part_poses_parser_accepts_tracks_method(self) -> None:
@@ -99,6 +106,17 @@ class PartTrackingTests(unittest.TestCase):
         self.assertEqual(args.command, "estimate-part-poses")
         self.assertEqual(args.method, "tracks")
         self.assertEqual(args.min_tracks_per_part, 5)
+
+    def test_probe_torch_mps_parser_accepts_force_flag(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "probe-torch-mps",
+                "--unsafe-force-mps",
+            ]
+        )
+        self.assertEqual(args.command, "probe-torch-mps")
+        self.assertTrue(args.unsafe_force_mps)
 
     def test_track_based_pose_estimation_recovers_rigid_motion(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -126,6 +144,8 @@ class PartTrackingTests(unittest.TestCase):
                         "input_episode_path": str(root / "episode.json"),
                         "estimator": "cotracker-depth-backprojection",
                         "frame_count": 2,
+                        "source_frame_count": 8,
+                        "sampled_frame_indices": [0, 4],
                         "part_segmentation": {
                             "parts": [
                                 {"part_id": 1, "name": "base", "role": "base"},
@@ -150,9 +170,14 @@ class PartTrackingTests(unittest.TestCase):
             artifact = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(artifact["estimator"], "cotracker-depth-rigid-registration")
             self.assertEqual(artifact["anchor_part_id"], 1)
+            self.assertEqual(artifact["source_frame_count"], 8)
+            self.assertEqual(artifact["sampled_frame_indices"], [0, 4])
             tracks = {track["part_id"]: track for track in artifact["parts"]}
             door_frame1 = next(sample for sample in tracks[2]["samples"] if sample["frame_index"] == 1)
             self.assertTrue(door_frame1["valid"])
+            self.assertEqual(door_frame1["source_frame_index"], 4)
+            self.assertIn("centroid_world", door_frame1)
+            self.assertNotAlmostEqual(door_frame1["centroid_world"][0], 0.0, places=6)
             self.assertAlmostEqual(door_frame1["translation"][0], translation[0], places=6)
             self.assertAlmostEqual(door_frame1["translation"][1], translation[1], places=6)
             self.assertAlmostEqual(door_frame1["translation"][2], translation[2], places=6)

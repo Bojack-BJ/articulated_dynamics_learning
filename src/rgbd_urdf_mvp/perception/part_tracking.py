@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import math
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .part_pose import _pose_payload, _relative_pose, _rotation_angle_from_matrix
+from .part_pose import _centroid, _matvec3, _pose_payload, _relative_pose, _rotation_angle_from_matrix
 from .part_segmentation import part_name_lookup
 from .pointcloud_fusion import (
     _camera_to_world_point,
@@ -26,7 +28,9 @@ class PartPixelTrackingConfig:
     cotracker_repo: str | Path | None = None
     cotracker_checkpoint: str | Path | None = None
     cotracker_model: str = "cotracker3_offline"
+    unsafe_force_mps: bool = False
     reference_frame: int = 0
+    frame_stride: int = 1
     seed_stride_px: int = 16
     max_tracks_per_part_view: int = 128
     min_depth_m: float = 0.05
@@ -34,6 +38,7 @@ class PartPixelTrackingConfig:
     visibility_threshold: float = 0.5
     require_part_mask_consistency: bool = True
     allow_backward_tracking: bool = True
+    show_progress: bool = True
 
 
 @dataclass(slots=True)
@@ -68,6 +73,45 @@ def _resolve_device(torch_module: Any, device: str) -> str:
     raise ValueError(f"Unsupported tracking device: {device}")
 
 
+def _resolve_tracking_device(torch_module: Any, config: PartPixelTrackingConfig) -> str:
+    if config.device == "mps" and bool(config.unsafe_force_mps):
+        return "mps"
+    return _resolve_device(torch_module, config.device)
+
+
+class _ProgressPrinter:
+    def __init__(self, total_steps: int, enabled: bool) -> None:
+        self.total_steps = max(1, int(total_steps))
+        self.enabled = bool(enabled)
+        self.start_time = time.monotonic()
+        self.last_line_length = 0
+
+    def update(self, completed_steps: int, message: str) -> None:
+        if not self.enabled:
+            return
+        elapsed_s = max(1e-6, time.monotonic() - self.start_time)
+        completed = min(max(0, int(completed_steps)), self.total_steps)
+        rate = completed / elapsed_s if completed > 0 else 0.0
+        remaining = max(0, self.total_steps - completed)
+        eta_s = (remaining / rate) if rate > 0.0 else None
+        eta_text = f"{eta_s:5.1f}s" if eta_s is not None else "  n/a"
+        line = (
+            f"\r[track-part-pixels] {completed:>3}/{self.total_steps:<3} "
+            f"elapsed={elapsed_s:5.1f}s eta={eta_text} {message}"
+        )
+        padding = max(0, self.last_line_length - len(line))
+        sys.stderr.write(line + (" " * padding))
+        sys.stderr.flush()
+        self.last_line_length = len(line)
+
+    def finish(self, message: str) -> None:
+        if not self.enabled:
+            return
+        self.update(self.total_steps, message)
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+
+
 def _load_rgb_frame(path: Path) -> Any:
     try:
         import numpy as np
@@ -93,6 +137,27 @@ def _load_video_tensor(rgb_paths: list[Path], torch_module: Any, device: str) ->
     video_np = np.stack(frames, axis=0)
     video = torch_module.from_numpy(video_np).permute(0, 3, 1, 2)[None].float()
     return video.to(device)
+
+
+def _sampled_frame_indices(frame_count: int, frame_stride: int) -> list[int]:
+    stride = max(1, int(frame_stride))
+    if frame_count <= 0:
+        return []
+    return list(range(0, frame_count, stride))
+
+
+def _effective_fps(frames: list[Any]) -> float | None:
+    deltas = [
+        float(current.timestamp_s) - float(previous.timestamp_s)
+        for previous, current in zip(frames[:-1], frames[1:])
+        if float(current.timestamp_s) > float(previous.timestamp_s)
+    ]
+    if not deltas:
+        return None
+    mean_dt = sum(deltas) / float(len(deltas))
+    if mean_dt <= 0.0:
+        return None
+    return 1.0 / mean_dt
 
 
 def _load_cotracker_model(config: PartPixelTrackingConfig, torch_module: Any, device: str) -> Any:
@@ -287,6 +352,10 @@ class PartPixelTracker:
         episode = load_episode(episode_path)
         if not episode.frames:
             raise ValueError("Episode has no frames to track.")
+        sampled_frame_indices = _sampled_frame_indices(len(episode.frames), self.config.frame_stride)
+        sampled_frames = [episode.frames[frame_index] for frame_index in sampled_frame_indices]
+        if not sampled_frames:
+            raise ValueError("Temporal sampling removed every frame. Check --frame-stride.")
 
         output_json = (
             Path(self.config.output_json).resolve()
@@ -295,7 +364,7 @@ class PartPixelTracker:
         )
         output_json.parent.mkdir(parents=True, exist_ok=True)
 
-        device = _resolve_device(torch, self.config.device)
+        device = _resolve_tracking_device(torch, self.config)
         model = _load_cotracker_model(self.config, torch, device)
         depth_convention = _depth_convention(episode.metadata)
         part_segmentation = (
@@ -308,9 +377,9 @@ class PartPixelTracker:
         if not part_metadata:
             raise ValueError("Episode metadata does not contain part_segmentation. Re-record with part masks first.")
 
-        rgb_paths_by_frame_view = [_resolve_view_rgb_paths(frame, episode_root) for frame in episode.frames]
-        depth_paths_by_frame_view = [_resolve_view_depth_paths(frame, episode_root) for frame in episode.frames]
-        part_masks_by_frame_view = [_resolve_view_part_mask_paths(frame, episode_root) for frame in episode.frames]
+        rgb_paths_by_frame_view = [_resolve_view_rgb_paths(frame, episode_root) for frame in sampled_frames]
+        depth_paths_by_frame_view = [_resolve_view_depth_paths(frame, episode_root) for frame in sampled_frames]
+        part_masks_by_frame_view = [_resolve_view_part_mask_paths(frame, episode_root) for frame in sampled_frames]
         if not all(part_masks_by_frame_view):
             raise ValueError("Episode does not contain per-view part masks. Re-record with --part-segmentation-masks.")
 
@@ -320,7 +389,7 @@ class PartPixelTracker:
 
         camera_poses_by_frame_view: list[list[list[list[float]]]] = []
         pose_sources: set[str] = set()
-        for frame, depth_paths in zip(episode.frames, depth_paths_by_frame_view):
+        for frame, depth_paths in zip(sampled_frames, depth_paths_by_frame_view):
             camera_poses, pose_source = _resolve_view_camera_poses(frame, episode.metadata, len(depth_paths))
             camera_poses_by_frame_view.append(camera_poses)
             pose_sources.add(pose_source)
@@ -330,6 +399,10 @@ class PartPixelTracker:
             for part_id in sorted(part_metadata)
         }
         depth_cache: dict[Path, list[list[int]]] = {}
+        progress = _ProgressPrinter(
+            total_steps=view_count * max(1, len(part_metadata)),
+            enabled=bool(self.config.show_progress),
+        )
 
         def load_depth_cached(path: Path) -> list[list[int]]:
             if path not in depth_cache:
@@ -338,8 +411,13 @@ class PartPixelTracker:
 
         tracks: list[dict[str, Any]] = []
         track_id = 0
+        completed_steps = 0
         with torch.no_grad():
             for view_index in range(view_count):
+                progress.update(
+                    completed_steps,
+                    f"loading RGB video for view {view_index + 1}/{view_count}",
+                )
                 view_rgb_paths = [paths[view_index] for paths in rgb_paths_by_frame_view]
                 video = _load_video_tensor(view_rgb_paths, torch, device)
                 for part_id in sorted(part_metadata):
@@ -356,9 +434,22 @@ class PartPixelTracker:
                         stride_px=self.config.seed_stride_px,
                         max_points=max(1, self.config.max_tracks_per_part_view),
                     )
+                    part_name = part_names.get(part_id, f"part_{part_id}")
                     if not seed_pixels:
+                        completed_steps += 1
+                        progress.update(
+                            completed_steps,
+                            f"view {view_index + 1}/{view_count} {part_name}: no seed pixels",
+                        )
                         continue
 
+                    progress.update(
+                        completed_steps,
+                        (
+                            f"view {view_index + 1}/{view_count} {part_name}: "
+                            f"running CoTracker on {len(seed_pixels)} seeds x {len(sampled_frames)} frames"
+                        ),
+                    )
                     query_payload = [
                         [float(reference_frame), float(u_coord), float(v_coord)]
                         for u_coord, v_coord in seed_pixels
@@ -375,11 +466,12 @@ class PartPixelTracker:
                     for query_index, (seed_u, seed_v) in enumerate(seed_pixels):
                         samples: list[dict[str, Any]] = []
                         reference_xyz: list[float] | None = None
-                        for frame_index, frame in enumerate(episode.frames):
+                        for frame_index, frame in enumerate(sampled_frames):
                             if frame_index >= pred_tracks.shape[1]:
                                 continue
                             uv = pred_tracks[0, frame_index, query_index].tolist()
                             tracker_visibility = _visibility_value(pred_visibility[0, frame_index, query_index].item())
+                            source_frame_index = sampled_frame_indices[frame_index]
                             depth_path = depth_paths_by_frame_view[frame_index][view_index]
                             part_mask_path = (
                                 part_masks_by_frame_view[frame_index][view_index]
@@ -409,6 +501,7 @@ class PartPixelTracker:
                             samples.append(
                                 {
                                     "frame_index": frame_index,
+                                    "source_frame_index": source_frame_index,
                                     "timestamp_s": float(frame.timestamp_s),
                                     "uv": [float(uv[0]), float(uv[1])],
                                     "xyz_world": xyz,
@@ -429,12 +522,19 @@ class PartPixelTracker:
                                 "part_name": part_names.get(part_id, f"part_{part_id}"),
                                 "view_index": view_index,
                                 "query_frame_index": reference_frame,
+                                "query_source_frame_index": sampled_frame_indices[reference_frame],
                                 "query_uv": [float(seed_u), float(seed_v)],
                                 "reference_xyz_world": reference_xyz,
                                 "samples": samples,
                             }
                         )
                         track_id += 1
+                    completed_steps += 1
+                    progress.update(
+                        completed_steps,
+                        f"view {view_index + 1}/{view_count} {part_name}: emitted {len(seed_pixels)} tracks",
+                    )
+        progress.finish(f"done; emitted {len(tracks)} total tracks")
 
         track_counts: dict[int, int] = {}
         for track in tracks:
@@ -445,7 +545,10 @@ class PartPixelTracker:
             {
                 "input_episode_path": str(episode_path),
                 "estimator": "cotracker-depth-backprojection",
-                "frame_count": len(episode.frames),
+                "frame_count": len(sampled_frames),
+                "source_frame_count": len(episode.frames),
+                "sampled_frame_indices": sampled_frame_indices,
+                "effective_tracking_fps_hz": _effective_fps(sampled_frames),
                 "view_count": view_count,
                 "device": device,
                 "cotracker_model": self.config.cotracker_model,
@@ -457,6 +560,7 @@ class PartPixelTracker:
                 "part_reference_frames": {str(part_id): frame for part_id, frame in sorted(reference_frame_by_part.items())},
                 "config": {
                     "reference_frame": self.config.reference_frame,
+                    "frame_stride": self.config.frame_stride,
                     "seed_stride_px": self.config.seed_stride_px,
                     "max_tracks_per_part_view": self.config.max_tracks_per_part_view,
                     "min_depth_m": self.config.min_depth_m,
@@ -491,6 +595,10 @@ class TrackPartPoseEstimator:
             raise ValueError("No 3D tracks found. Run track-part-pixels first.")
 
         frame_count = int(artifact.get("frame_count", 0))
+        source_frame_count = int(artifact.get("source_frame_count", frame_count))
+        sampled_frame_indices = [int(frame_index) for frame_index in artifact.get("sampled_frame_indices", list(range(frame_count)))]
+        if len(sampled_frame_indices) != frame_count:
+            sampled_frame_indices = list(range(frame_count))
         part_segmentation = (
             dict(artifact.get("part_segmentation", {}))
             if isinstance(artifact.get("part_segmentation"), dict)
@@ -514,6 +622,7 @@ class TrackPartPoseEstimator:
         )
         part_tracks: dict[int, dict[str, Any]] = {}
         frame_times = self._frame_times(tracks)
+        source_frame_indices = self._source_frame_indices(tracks, sampled_frame_indices)
 
         for part_id, part_track_items in sorted(tracks_by_part.items()):
             valid_reference_points = [
@@ -523,6 +632,9 @@ class TrackPartPoseEstimator:
             ]
             if len(valid_reference_points) < max(3, self.config.min_tracks_per_part):
                 continue
+            reference_centroid_world = _centroid(
+                [[float(value) for value in point] for point in valid_reference_points]
+            )
 
             samples: list[dict[str, Any]] = []
             missing_frame_indices: list[int] = []
@@ -545,11 +657,13 @@ class TrackPartPoseEstimator:
                     weights.append(float(sample.get("confidence", 1.0)))
 
                 timestamp_s = frame_times.get(frame_index, 0.0)
+                source_frame_index = source_frame_indices.get(frame_index, sampled_frame_indices[frame_index] if frame_index < len(sampled_frame_indices) else frame_index)
                 if len(source_points) < max(3, self.config.min_tracks_per_part):
                     missing_frame_indices.append(frame_index)
                     samples.append(
                         {
                             "frame_index": frame_index,
+                            "source_frame_index": source_frame_index,
                             "timestamp_s": timestamp_s,
                             "valid": False,
                             "track_count": len(source_points),
@@ -559,6 +673,10 @@ class TrackPartPoseEstimator:
                     continue
 
                 rotation, translation, rms = _fit_rigid_transform(source_points, target_points, weights)
+                centroid_world = [
+                    rotated + shift
+                    for rotated, shift in zip(_matvec3(rotation, reference_centroid_world), translation)
+                ]
                 confidence = max(0.0, min(1.0, len(source_points) / max(1, len(part_track_items)))) * (
                     1.0 / (1.0 + 20.0 * rms)
                 )
@@ -566,11 +684,13 @@ class TrackPartPoseEstimator:
                 pose.update(
                     {
                         "frame_index": frame_index,
+                        "source_frame_index": source_frame_index,
                         "timestamp_s": timestamp_s,
                         "valid": True,
                         "track_count": len(source_points),
                         "confidence": float(confidence),
                         "registration_rms_m": float(rms),
+                        "centroid_world": [float(value) for value in centroid_world],
                     }
                 )
                 samples.append(pose)
@@ -580,8 +700,13 @@ class TrackPartPoseEstimator:
                 "name": part_names.get(part_id, f"part_{part_id}"),
                 "role": self._part_role(part_metadata, part_id, anchor_part_id),
                 "reference_frame_index": self._dominant_reference_frame(part_track_items),
+                "reference_source_frame_index": source_frame_indices.get(
+                    self._dominant_reference_frame(part_track_items),
+                    self._dominant_reference_frame(part_track_items),
+                ),
                 "reference_timestamp_s": frame_times.get(self._dominant_reference_frame(part_track_items), 0.0),
                 "reference_track_count": len(valid_reference_points),
+                "reference_centroid_world": [float(value) for value in reference_centroid_world],
                 "canonical_frame": _pose_payload(
                     [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                     [0.0, 0.0, 0.0],
@@ -639,6 +764,8 @@ class TrackPartPoseEstimator:
                 "pointcloud_path": None,
                 "estimator": "cotracker-depth-rigid-registration",
                 "frame_count": frame_count,
+                "source_frame_count": source_frame_count,
+                "sampled_frame_indices": sampled_frame_indices,
                 "anchor_part_id": anchor_part_id,
                 "anchor_part_name": part_tracks[anchor_part_id]["name"],
                 "parts": [part_tracks[part_id] for part_id in sorted(part_tracks)],
@@ -660,6 +787,16 @@ class TrackPartPoseEstimator:
                 if isinstance(sample, dict):
                     times[int(sample.get("frame_index", 0))] = float(sample.get("timestamp_s", 0.0))
         return times
+
+    def _source_frame_indices(self, tracks: list[dict[str, Any]], fallback: list[int]) -> dict[int, int]:
+        source_indices = {frame_index: frame_index for frame_index in range(len(fallback))}
+        for local_frame_index, source_frame_index in enumerate(fallback):
+            source_indices[local_frame_index] = int(source_frame_index)
+        for track in tracks:
+            for sample in track.get("samples", []):
+                if isinstance(sample, dict) and "source_frame_index" in sample:
+                    source_indices[int(sample.get("frame_index", 0))] = int(sample["source_frame_index"])
+        return source_indices
 
     def _dominant_reference_frame(self, tracks: list[dict[str, Any]]) -> int:
         counts: dict[int, int] = {}

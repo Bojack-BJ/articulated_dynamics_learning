@@ -5,4 +5,5 @@ outputs/
 .venv/
 Lightwheel/
 .cache/
+examples/mujoco_models
 MUJOCO_LOG.TXT

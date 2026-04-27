@@ -1,0 +1,11 @@
+command: identify-dynamics
+args:
+  episode: outputs/recordings/microwave011/episode.json
+  articulation_artifact: outputs/recordings/microwave011/pointcloud_4d_partseg/inferred_articulation/articulation_artifact.json
+  mjcf: outputs/recordings/microwave011/pointcloud_4d_partseg/inferred_articulation/urdf/microwave011.mjcf.xml
+  output-dir: outputs/recordings/microwave011/pointcloud_4d_partseg/dynamics_identification
+  max-iterations: 10
+  learning-rate: 0.25
+  q-weight: 1.0
+  qdot-weight: 0.05
+  prior-weight: 0.02

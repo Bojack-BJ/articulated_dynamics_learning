@@ -15,6 +15,8 @@ The current code is scaffold-first. It is meant to keep the full contract execut
 - End-to-end model-to-joint-inference tutorial: [docs/end-to-end-articulation.md](docs/end-to-end-articulation.md)
 - MuJoCo recording and USD-to-MJCF conversion: [docs/mujoco-recording.md](docs/mujoco-recording.md)
 - RGB-D fusion, part segmentation, and viewer workflow: [docs/pointcloud.md](docs/pointcloud.md)
+- Dynamics identification and Lagrangian-network handoff: [docs/dynamics-identification.md](docs/dynamics-identification.md)
+- MuJoCo MJX setup for differentiable rollouts: [docs/mjx-setup.md](docs/mjx-setup.md)
 - Remote 3D generation client/server setup: [docs/remote-generation.md](docs/remote-generation.md)
 - Research-stack replacement points: [docs/research-stack.md](docs/research-stack.md)
 
@@ -48,9 +50,24 @@ Optional CoTracker support for track-based part trajectories:
 python -m pip install -e ".[tracking]"
 ```
 
+Optional MuJoCo MJX support for differentiable JAX rollouts:
+
+```bash
+python -m pip install -e ".[mjx]"
+PYTHONPATH=src python -m rgbd_urdf_mvp probe-mjx
+```
+
 On Mac, the tracking command defaults to `--device auto`, which uses PyTorch
 MPS when available and CPU otherwise. CUDA is never selected unless
 `--device cuda` is passed explicitly.
+
+To inspect local PyTorch MPS detection and optionally try a real MPS tensor,
+use:
+
+```bash
+PYTHONPATH=src python -m rgbd_urdf_mvp probe-torch-mps
+PYTHONPATH=src python -m rgbd_urdf_mvp probe-torch-mps --unsafe-force-mps
+```
 
 If you do not want `torch.hub` to download weights automatically, place the
 checkpoint at `co-tracker/ckpt/scaled_offline.pth` and pass it explicitly:
@@ -60,13 +77,38 @@ TORCH_HOME="$PWD/.cache/torch" PYTHONPATH=src python -m rgbd_urdf_mvp track-part
   outputs/recordings/microwave011/episode.json \
   --cotracker-repo ./co-tracker \
   --cotracker-checkpoint ./co-tracker/ckpt/scaled_offline.pth \
+  --frame-stride 4 \
   --device auto
 ```
+
+If the episode was recorded at `60 Hz`, `--frame-stride 4` tracks every fourth
+frame and reduces the effective tracking rate to roughly `15 Hz` without
+re-recording the episode.
+
+`track-part-pixels` now prints progress to `stderr`. Pass `--no-progress` if
+you want completely quiet terminal output.
 
 Run the smoke tests:
 
 ```bash
 PYTHONPATH=src python -m unittest discover -s tests -v
+```
+
+For large MuJoCo triview recordings, the default YAML presets now use
+`png` assets and skip duplicated raw `assets/concat/` frames. To compact an
+older recording in place and drop `assets/concat/`, run:
+
+```bash
+PYTHONPATH=src python -m rgbd_urdf_mvp compact-mujoco-recording \
+  outputs/recordings/<object-id>/episode.json
+```
+
+To transcode an older recording from `ppm/pgm` assets to `png` and rewrite the
+episode manifest, run:
+
+```bash
+PYTHONPATH=src python -m rgbd_urdf_mvp repack-mujoco-recording \
+  outputs/recordings/<object-id>/episode.json
 ```
 
 The repository includes these submodules:
@@ -214,6 +256,36 @@ args:
   segmentation-masks: true
   part-segmentation-masks: true
 ```
+
+For batch articulation runs, the readable path is now the Python command:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch \
+  configs/batch_lightwheel_microwaves.tsv \
+  --resume \
+  --jobs 2
+```
+
+The shell wrapper still exists for convenience:
+
+```bash
+bash scripts/run_articulation_pipeline.sh --resume --jobs 2 configs/batch_lightwheel_microwaves.tsv
+```
+
+The batch runner reads stage templates from config files instead of hardcoded
+shell arrays:
+
+- `configs/record_microwave.yaml`
+- `configs/record_refrigerator.yaml`
+- `configs/record_hinge.yaml`
+- `configs/record_drawer.yaml`
+- `configs/track_default.yaml`
+
+On Apple Silicon, the CoTracker stage is usually throughput-limited by a single
+MPS device. The batch runner therefore defaults to `--tracking-jobs 1` for
+`auto`, `mps`, and `cuda`, even when `--jobs` is larger. Override it only if
+you have measured that multiple simultaneous tracking workers are actually
+faster on your machine.
 
 Then run it directly:
 

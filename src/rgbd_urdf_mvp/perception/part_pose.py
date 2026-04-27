@@ -478,6 +478,7 @@ class PartPoseEstimator:
                         "point_count": len(cloud),
                         "visibility_ratio": min(1.0, len(cloud) / max(1, len(reference_cloud))),
                         "confidence": confidence,
+                        "centroid_world": [float(value) for value in translation],
                     }
                 )
                 samples.append(pose)
@@ -489,6 +490,7 @@ class PartPoseEstimator:
                 "reference_frame_index": reference_frame_index,
                 "reference_timestamp_s": frame_times.get(reference_frame_index, 0.0),
                 "reference_point_count": len(reference_cloud),
+                "reference_centroid_world": [float(value) for value in reference_translation],
                 "reference_eigenvalues": [float(value) for value in reference_eigenvalues],
                 "canonical_frame": _pose_payload(reference_rotation, reference_translation),
                 "reference_local_bounds": _local_bounds(reference_cloud, reference_rotation, reference_translation),

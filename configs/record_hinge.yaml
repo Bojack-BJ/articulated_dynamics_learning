@@ -1,27 +1,23 @@
 command: record-mujoco
 args:
-  model: examples/mujoco_models/Microwave011.xml
-  category: microwave
-  object-id: microwave011
+  category: door
   output-dir: outputs/recordings
   duration-s: 4
   fps: 60
   control-mode: free
-  joint-name: microjoint
-  initial-qvel: -4.0
   rgb-format: png
   depth-format: png
   mask-format: png
-  # auto-initial-qvel-from-limits: true
-  # auto-initial-qvel-direction-mode: away-from-qpos0
-  # auto-initial-qvel-min-abs: 6.0
-  # auto-initial-qvel-max-abs: 8.0
+  auto-initial-qvel-from-limits: true
+  auto-initial-qvel-direction-mode: away-from-qpos0
+  auto-initial-qvel-min-abs: 0.8
+  auto-initial-qvel-max-abs: 1.6
   perturbation-scale: 0.0
   video: true
-  camera-distance: 1.2
+  camera-distance: 1.8
   camera-mode: triview
   camera-triview-spacing-deg: 90
-  lookat: [0.0, 0.0, 0.0]
+  lookat: [0.0, 0.0, 0.8]
   disable-target-mesh-collision: true
   segmentation-masks: true
   part-segmentation-masks: true

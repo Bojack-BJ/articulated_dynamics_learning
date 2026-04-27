@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from pathlib import Path
 
 from rgbd_urdf_mvp.cli import build_parser
+from rgbd_urdf_mvp.core.serialization import load_json
 from rgbd_urdf_mvp.sim.mujoco_recorder import (
+    MuJoCoEpisodeCompactConfig,
+    MuJoCoEpisodeCompactor,
     MuJoCoEpisodeRecorder,
+    MuJoCoEpisodeRepackConfig,
+    MuJoCoEpisodeRepacker,
     MuJoCoRecordConfig,
     _fovy_deg_from_intrinsics,
     orbit_camera_pose,
@@ -92,6 +98,21 @@ class MuJoCoRecorderTests(unittest.TestCase):
         self.assertTrue(args.segmentation_masks)
         self.assertEqual(args.mask_format, "png")
 
+    def test_record_mujoco_parser_accepts_write_concat_assets(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "record-mujoco",
+                "model.xml",
+                "--category",
+                "door",
+                "--object-id",
+                "door-unit-test-001",
+                "--write-concat-assets",
+            ]
+        )
+        self.assertTrue(args.write_concat_assets)
+
     def test_record_mujoco_parser_accepts_part_segmentation_mask_arguments(self) -> None:
         parser = build_parser()
         args = parser.parse_args(
@@ -164,6 +185,193 @@ class MuJoCoRecorderTests(unittest.TestCase):
             ]
         )
         self.assertTrue(args.part_segmentation_masks)
+
+    def test_compact_recording_parser_accepts_required_arguments(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "compact-mujoco-recording",
+                "episode.json",
+                "--remove-concat-video",
+            ]
+        )
+        self.assertEqual(args.command, "compact-mujoco-recording")
+        self.assertEqual(args.episode.as_posix(), "episode.json")
+        self.assertTrue(args.remove_concat_video)
+
+    def test_repack_recording_parser_accepts_required_arguments(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "repack-mujoco-recording",
+                "episode.json",
+                "--keep-originals",
+            ]
+        )
+        self.assertEqual(args.command, "repack-mujoco-recording")
+        self.assertEqual(args.episode.as_posix(), "episode.json")
+        self.assertTrue(args.keep_originals)
+
+    def test_episode_compactor_rewrites_triview_paths_and_removes_concat_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            episode_dir = root / "episode"
+            concat_dir = episode_dir / "assets" / "concat"
+            view_dirs = [episode_dir / "assets" / f"view_{index}" for index in range(3)]
+            concat_dir.mkdir(parents=True)
+            for view_dir in view_dirs:
+                view_dir.mkdir(parents=True)
+            (concat_dir / "frame_0000_rgb.png").write_bytes(b"concat-rgb")
+            (concat_dir / "frame_0000_depth.png").write_bytes(b"concat-depth")
+            (concat_dir / "frame_0000_mask.png").write_bytes(b"concat-mask")
+            (concat_dir / "frame_0000_part_mask.png").write_bytes(b"concat-part-mask")
+            (episode_dir / "episode_concat.mp4").write_bytes(b"video")
+            for view_dir in view_dirs:
+                for suffix in ("rgb.png", "depth.png", "mask.png", "part_mask.png"):
+                    (view_dir / f"frame_0000_{suffix}").write_bytes(b"view")
+
+            episode_path = episode_dir / "episode.json"
+            episode_path.write_text(
+                """{
+  "object_instance_id": "unit",
+  "category": "microwave",
+  "camera_intrinsics": {"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0},
+  "frames": [
+    {
+      "timestamp_s": 0.0,
+      "rgb_path": "assets/concat/frame_0000_rgb.png",
+      "depth_path": "assets/concat/frame_0000_depth.png",
+      "mask_path": "assets/concat/frame_0000_mask.png",
+      "part_mask_path": "assets/concat/frame_0000_part_mask.png",
+      "rgb_paths_by_view": [
+        "assets/view_0/frame_0000_rgb.png",
+        "assets/view_1/frame_0000_rgb.png",
+        "assets/view_2/frame_0000_rgb.png"
+      ],
+      "depth_paths_by_view": [
+        "assets/view_0/frame_0000_depth.png",
+        "assets/view_1/frame_0000_depth.png",
+        "assets/view_2/frame_0000_depth.png"
+      ],
+      "mask_paths_by_view": [
+        "assets/view_0/frame_0000_mask.png",
+        "assets/view_1/frame_0000_mask.png",
+        "assets/view_2/frame_0000_mask.png"
+      ],
+      "part_mask_paths_by_view": [
+        "assets/view_0/frame_0000_part_mask.png",
+        "assets/view_1/frame_0000_part_mask.png",
+        "assets/view_2/frame_0000_part_mask.png"
+      ],
+      "camera_pose": [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]],
+      "camera_poses_by_view": [],
+      "action_log": {}
+    }
+  ],
+  "metadata": {
+    "camera_mode": "triview",
+    "triview_asset_layout": "concat+views"
+  }
+}
+""",
+                encoding="utf-8",
+            )
+
+            result = MuJoCoEpisodeCompactor(
+                MuJoCoEpisodeCompactConfig(
+                    episode_path=episode_path,
+                    remove_concat_dir=True,
+                    remove_concat_video=False,
+                    dry_run=False,
+                )
+            ).compact()
+
+            payload = load_json(episode_path)
+            frame = payload["frames"][0]
+            self.assertEqual(frame["rgb_path"], "assets/view_1/frame_0000_rgb.png")
+            self.assertEqual(frame["depth_path"], "assets/view_1/frame_0000_depth.png")
+            self.assertEqual(frame["mask_path"], "assets/view_1/frame_0000_mask.png")
+            self.assertEqual(frame["part_mask_path"], "assets/view_1/frame_0000_part_mask.png")
+            self.assertEqual(payload["metadata"]["triview_asset_layout"], "views-only")
+            self.assertFalse(concat_dir.exists())
+            self.assertGreaterEqual(int(result["estimated_bytes_reclaimed"]), 1)
+
+    def test_episode_repacker_converts_ppm_and_pgm_to_png(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            episode_dir = root / "episode"
+            view_dir = episode_dir / "assets" / "view_0"
+            view_dir.mkdir(parents=True)
+            (view_dir / "frame_0000_rgb.ppm").write_bytes(
+                b"P6\n2 1\n255\n" + bytes([255, 0, 0, 0, 255, 0])
+            )
+            (view_dir / "frame_0000_depth.pgm").write_bytes(
+                b"P5\n2 1\n65535\n" + bytes([0x00, 0x01, 0x00, 0x02])
+            )
+            (view_dir / "frame_0000_mask.pgm").write_bytes(
+                b"P5\n2 1\n65535\n" + bytes([0x00, 0x00, 0xFF, 0xFF])
+            )
+            (view_dir / "frame_0000_part_mask.pgm").write_bytes(
+                b"P5\n2 1\n65535\n" + bytes([0x00, 0x03, 0x00, 0x04])
+            )
+
+            episode_path = episode_dir / "episode.json"
+            episode_path.write_text(
+                """{
+  "object_instance_id": "unit",
+  "category": "microwave",
+  "camera_intrinsics": {"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0},
+  "frames": [
+    {
+      "timestamp_s": 0.0,
+      "rgb_path": "assets/view_0/frame_0000_rgb.ppm",
+      "depth_path": "assets/view_0/frame_0000_depth.pgm",
+      "mask_path": "assets/view_0/frame_0000_mask.pgm",
+      "part_mask_path": "assets/view_0/frame_0000_part_mask.pgm",
+      "rgb_paths_by_view": ["assets/view_0/frame_0000_rgb.ppm"],
+      "depth_paths_by_view": ["assets/view_0/frame_0000_depth.pgm"],
+      "mask_paths_by_view": ["assets/view_0/frame_0000_mask.pgm"],
+      "part_mask_paths_by_view": ["assets/view_0/frame_0000_part_mask.pgm"],
+      "camera_pose": [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]],
+      "camera_poses_by_view": [],
+      "action_log": {}
+    }
+  ],
+  "metadata": {
+    "camera_mode": "triview",
+    "rgb_format": "ppm",
+    "depth_format": "pgm",
+    "mask_format": "pgm",
+    "segmentation_masks": true,
+    "part_segmentation_masks": true
+  }
+}
+""",
+                encoding="utf-8",
+            )
+
+            result = MuJoCoEpisodeRepacker(
+                MuJoCoEpisodeRepackConfig(
+                    episode_path=episode_path,
+                    keep_originals=False,
+                    dry_run=False,
+                )
+            ).repack()
+
+            payload = load_json(episode_path)
+            frame = payload["frames"][0]
+            self.assertEqual(frame["rgb_path"], "assets/view_0/frame_0000_rgb.png")
+            self.assertEqual(frame["depth_path"], "assets/view_0/frame_0000_depth.png")
+            self.assertEqual(frame["mask_path"], "assets/view_0/frame_0000_mask.png")
+            self.assertEqual(frame["part_mask_path"], "assets/view_0/frame_0000_part_mask.png")
+            self.assertEqual(payload["metadata"]["rgb_format"], "png")
+            self.assertEqual(payload["metadata"]["depth_format"], "png")
+            self.assertEqual(payload["metadata"]["mask_format"], "png")
+            self.assertTrue((view_dir / "frame_0000_rgb.png").exists())
+            self.assertTrue((view_dir / "frame_0000_depth.png").exists())
+            self.assertFalse((view_dir / "frame_0000_rgb.ppm").exists())
+            self.assertFalse((view_dir / "frame_0000_depth.pgm").exists())
+            self.assertGreaterEqual(int(result["converted_paths"]), 4)
 
     def test_microwave_defaults_to_door_joint_over_turntable(self) -> None:
         try:

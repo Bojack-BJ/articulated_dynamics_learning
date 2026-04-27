@@ -150,6 +150,7 @@ TORCH_HOME="$PWD/.cache/torch" PYTHONPATH=src python3 -m rgbd_urdf_mvp track-par
   --cotracker-checkpoint ./co-tracker/ckpt/scaled_offline.pth \
   --device auto \
   --reference-frame 0 \
+  --frame-stride 4 \
   --seed-stride-px 16
 
 PYTHONPATH=src python3 -m rgbd_urdf_mvp estimate-part-poses \
@@ -158,6 +159,9 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp estimate-part-poses \
   --output-json "outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/part_poses.json" \
   --min-tracks-per-part 4
 ```
+
+For `60 Hz` recordings, `--frame-stride 4` is the simplest way to run the
+track-based path at about `15 Hz`.
 
 This writes:
 
@@ -210,6 +214,8 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp visualize-pointcloud \
 
 The viewer auto-loads sibling pose and joint artifacts. Enable `Show Joints` to
 inspect the inferred axis and pivot on top of the current pointcloud frame.
+It also auto-loads sibling `part_tracks.json` and exposes `Show Poses`,
+`Show Flow`, and per-part visibility filters.
 
 ## 8. Export Inferred Articulation
 
@@ -232,6 +238,91 @@ outputs/recordings/<object-id>/pointcloud_4d_partseg/inferred_articulation/
   urdf/<object-id>.mjcf.xml
   urdf/articulation.json
 ```
+
+## 9. Identify Dynamics
+
+Once the kinematic structure is fixed, fit a first-pass dynamic model:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp identify-dynamics \
+  "outputs/recordings/$OBJECT_ID/episode.json" \
+  "outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/articulation_artifact.json" \
+  "outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/urdf/$OBJECT_ID.mjcf.xml"
+```
+
+This writes:
+
+```text
+outputs/recordings/<object-id>/pointcloud_4d_partseg/inferred_articulation/urdf/dynamics_identification/
+  dynamics_identification.json
+  <object-id>.mjcf.identified.xml
+```
+
+The current optimizer fits:
+
+- moving-part mass
+- joint damping
+- joint frictionloss
+
+against the observed joint trajectory from the articulation artifact.
+
+## 10. Batch Pipeline Runner
+
+For multiple simulated objects, use:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch configs/batch_objects_example.tsv
+PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch --resume configs/batch_objects_example.tsv
+PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch --skip-existing configs/batch_objects_example.tsv
+PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch --jobs 4 configs/batch_objects_example.tsv
+```
+
+The thin shell wrapper calls the same Python runner:
+
+```bash
+bash scripts/run_articulation_pipeline.sh --resume --jobs 4 configs/batch_objects_example.tsv
+```
+
+The manifest is tab-separated with four columns:
+
+```text
+category    model_path    object_id    joint_name
+```
+
+The runner executes:
+
+1. `record-mujoco`
+2. `fuse-pointcloud`
+3. `track-part-pixels`
+4. `estimate-part-poses --method tracks`
+5. `infer-joints`
+6. `visualize-pointcloud`
+
+The heavy stage parameters now come from YAML templates:
+
+- `microwave`
+- `refrigerator`
+- hinge-style `door` categories
+- `drawer`
+
+The corresponding templates live in:
+
+- `configs/record_microwave.yaml`
+- `configs/record_refrigerator.yaml`
+- `configs/record_hinge.yaml`
+- `configs/record_drawer.yaml`
+- `configs/track_default.yaml`
+
+Use `--record-config path/to/template.yaml` or `--track-config path/to/template.yaml`
+when you want one batch run to use a different preset without editing the
+defaults.
+
+Batch recovery flags:
+
+- `--resume`: skip stage outputs that already exist and continue from the first missing artifact
+- `--skip-existing`: skip the whole object when its terminal artifact already exists
+- `--jobs N`: run up to `N` objects concurrently; per-object logs are written to `outputs/recordings/_batch_logs/`
+- `--tracking-jobs N`: separate concurrency limit for `track-part-pixels`; defaults to `1` for `auto`/`mps`/`cuda` because multiple CoTracker GPU workers on one machine often reduce throughput instead of improving it
 
 ## Current Scope And Limitations
 

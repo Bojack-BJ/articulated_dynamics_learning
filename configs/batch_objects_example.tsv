@@ -1,0 +1,3 @@
+# category	model_path	object_id	joint_name
+microwave	examples/mujoco_models/Microwave011.xml	microwave011	microjoint
+refrigerator	examples/mujoco_models/Refrigerator031.xml	refrigerator031	freezer_door_joint

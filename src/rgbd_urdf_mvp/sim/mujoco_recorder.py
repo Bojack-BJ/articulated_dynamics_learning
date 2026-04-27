@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -92,6 +93,98 @@ def _write_png_depth_u16(path: Path, depth_u16: Any) -> None:
     image.save(path)
 
 
+def _read_ppm_rgb(path: Path):
+    import numpy as np
+
+    with path.open("rb") as handle:
+        magic = handle.readline().strip()
+        if magic != b"P6":
+            raise ValueError(f"Unsupported PPM magic for {path}: {magic!r}")
+
+        tokens: list[bytes] = []
+        while len(tokens) < 3:
+            line = handle.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line or line.startswith(b"#"):
+                continue
+            tokens.extend(line.split())
+        if len(tokens) < 3:
+            raise ValueError(f"Incomplete PPM header in {path}")
+
+        width = int(tokens[0])
+        height = int(tokens[1])
+        max_value = int(tokens[2])
+        if max_value != 255:
+            raise ValueError(f"Unsupported PPM max value in {path}: {max_value}")
+
+        raw = handle.read(width * height * 3)
+        if len(raw) != width * height * 3:
+            raise ValueError(f"Incomplete PPM payload in {path}")
+        return np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
+
+
+def _read_pgm_u16(path: Path):
+    import numpy as np
+
+    with path.open("rb") as handle:
+        magic = handle.readline().strip()
+        if magic != b"P5":
+            raise ValueError(f"Unsupported PGM magic for {path}: {magic!r}")
+
+        tokens: list[bytes] = []
+        while len(tokens) < 3:
+            line = handle.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line or line.startswith(b"#"):
+                continue
+            tokens.extend(line.split())
+        if len(tokens) < 3:
+            raise ValueError(f"Incomplete PGM header in {path}")
+
+        width = int(tokens[0])
+        height = int(tokens[1])
+        max_value = int(tokens[2])
+        if max_value > 65535:
+            raise ValueError(f"Unsupported PGM max value in {path}: {max_value}")
+
+        if max_value <= 255:
+            raw = handle.read(width * height)
+            if len(raw) != width * height:
+                raise ValueError(f"Incomplete 8-bit PGM payload in {path}")
+            return np.frombuffer(raw, dtype=np.uint8).astype(np.uint16).reshape((height, width))
+
+        raw = handle.read(width * height * 2)
+        if len(raw) != width * height * 2:
+            raise ValueError(f"Incomplete 16-bit PGM payload in {path}")
+        return np.frombuffer(raw, dtype=">u2").astype(np.uint16).reshape((height, width))
+
+
+def _read_png_rgb(path: Path):
+    try:
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("PNG RGB loading requires Pillow.") from exc
+
+    import numpy as np
+
+    return np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
+
+
+def _read_png_u16(path: Path):
+    try:
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("PNG depth loading requires Pillow.") from exc
+
+    import numpy as np
+
+    return np.asarray(Image.open(path), dtype=np.uint16)
+
+
 def _intrinsics_from_fovy(width: int, height: int, fovy_deg: float) -> dict[str, float]:
     fovy_rad = math.radians(fovy_deg)
     fy = 0.5 * float(height) / math.tan(0.5 * fovy_rad)
@@ -151,6 +244,7 @@ class MuJoCoRecordConfig:
     segmentation_masks: bool = False
     part_segmentation_masks: bool = False
     mask_format: str = "pgm"
+    write_concat_assets: bool = False
     disable_target_mesh_collision: bool = False
     hide_clear_meshes: bool = False
     joint_name: str | None = None
@@ -165,6 +259,31 @@ class MuJoCoMaskRenderConfig:
     mask_format: str = "pgm"
     part_segmentation_masks: bool = False
     output_episode_path: str | Path | None = None
+
+
+@dataclass(slots=True)
+class MuJoCoEpisodeCompactConfig:
+    episode_path: str | Path
+    remove_concat_dir: bool = True
+    remove_concat_video: bool = False
+    dry_run: bool = False
+
+
+@dataclass(slots=True)
+class MuJoCoEpisodeRepackConfig:
+    episode_path: str | Path
+    keep_originals: bool = False
+    dry_run: bool = False
+
+
+def _triview_writes_concat_assets(camera_mode: str, write_concat_assets: bool) -> bool:
+    return camera_mode != "triview" or bool(write_concat_assets)
+
+
+def _primary_view_path(paths: list[Path] | list[str], fallback: Path | str | None) -> Path | str | None:
+    if paths:
+        return paths[len(paths) // 2]
+    return fallback
 
 
 class MuJoCoEpisodeRecorder:
@@ -321,14 +440,19 @@ class MuJoCoEpisodeRecorder:
         assets_dir = output_dir / "assets"
         assets_dir.mkdir(parents=True, exist_ok=True)
 
+        write_concat_assets = _triview_writes_concat_assets(
+            self.config.camera_mode,
+            self.config.write_concat_assets,
+        )
         concat_assets_dir = assets_dir
         per_view_assets_dirs: list[Path] = []
         if self.config.camera_mode == "triview":
-            concat_assets_dir = assets_dir / "concat"
-            concat_assets_dir.mkdir(parents=True, exist_ok=True)
             per_view_assets_dirs = [assets_dir / f"view_{index}" for index in range(3)]
             for view_dir in per_view_assets_dirs:
                 view_dir.mkdir(parents=True, exist_ok=True)
+            if write_concat_assets:
+                concat_assets_dir = assets_dir / "concat"
+                concat_assets_dir.mkdir(parents=True, exist_ok=True)
 
         camera = mujoco.MjvCamera()
         mujoco.mjv_defaultCamera(camera)
@@ -471,17 +595,20 @@ class MuJoCoEpisodeRecorder:
                 depth_name = f"frame_{frame_index:04d}_depth.{depth_ext}"
                 mask_name = f"frame_{frame_index:04d}_mask.{mask_ext}"
 
-                rgb_path = concat_assets_dir / rgb_name
-                depth_path = concat_assets_dir / depth_name
-                if self.config.rgb_format == "ppm":
-                    _write_ppm(rgb_path, rgb)
-                else:
-                    _write_png_rgb(rgb_path, rgb)
+                rgb_path = None
+                depth_path = None
+                if write_concat_assets:
+                    rgb_path = concat_assets_dir / rgb_name
+                    depth_path = concat_assets_dir / depth_name
+                    if self.config.rgb_format == "ppm":
+                        _write_ppm(rgb_path, rgb)
+                    else:
+                        _write_png_rgb(rgb_path, rgb)
 
-                if self.config.depth_format == "pgm":
-                    _write_pgm_u16(depth_path, depth_u16)
-                else:
-                    _write_png_depth_u16(depth_path, depth_u16)
+                    if self.config.depth_format == "pgm":
+                        _write_pgm_u16(depth_path, depth_u16)
+                    else:
+                        _write_png_depth_u16(depth_path, depth_u16)
 
                 view_rgb_paths: list[Path] = []
                 view_depth_paths: list[Path] = []
@@ -540,22 +667,25 @@ class MuJoCoEpisodeRecorder:
                     else:
                         mask_u16 = np.concatenate(view_masks_u16, axis=1)
 
-                    mask_path = concat_assets_dir / mask_name
-                    if self.config.mask_format == "pgm":
-                        _write_pgm_u16(mask_path, mask_u16)
-                    else:
-                        _write_png_depth_u16(mask_path, mask_u16)
+                    mask_path = None
+                    if write_concat_assets:
+                        mask_path = concat_assets_dir / mask_name
+                        if self.config.mask_format == "pgm":
+                            _write_pgm_u16(mask_path, mask_u16)
+                        else:
+                            _write_png_depth_u16(mask_path, mask_u16)
 
                     if self.config.part_segmentation_masks and view_part_masks_u16:
                         if len(view_part_masks_u16) == 1:
                             part_mask_u16 = view_part_masks_u16[0]
                         else:
                             part_mask_u16 = np.concatenate(view_part_masks_u16, axis=1)
-                        part_mask_path = concat_assets_dir / part_mask_name
-                        if self.config.mask_format == "pgm":
-                            _write_pgm_u16(part_mask_path, part_mask_u16)
-                        else:
-                            _write_png_depth_u16(part_mask_path, part_mask_u16)
+                        if write_concat_assets:
+                            part_mask_path = concat_assets_dir / part_mask_name
+                            if self.config.mask_format == "pgm":
+                                _write_pgm_u16(part_mask_path, part_mask_u16)
+                            else:
+                                _write_png_depth_u16(part_mask_path, part_mask_u16)
 
                     if self.config.camera_mode == "triview":
                         for view_index, view_mask_u16 in enumerate(view_masks_u16):
@@ -579,6 +709,11 @@ class MuJoCoEpisodeRecorder:
                 if self.config.camera_mode != "triview" and self.config.part_segmentation_masks and part_mask_path is not None:
                     view_part_mask_paths = [part_mask_path]
 
+                primary_rgb_path = _primary_view_path(view_rgb_paths, rgb_path)
+                primary_depth_path = _primary_view_path(view_depth_paths, depth_path)
+                primary_mask_path = _primary_view_path(view_mask_paths, mask_path)
+                primary_part_mask_path = _primary_view_path(view_part_mask_paths, part_mask_path)
+
                 if concat_video_writer is not None:
                     concat_video_writer.append_data(rgb)
                 if view_video_writers:
@@ -588,34 +723,34 @@ class MuJoCoEpisodeRecorder:
                 frame_payload.append(
                     {
                         "timestamp_s": round(frame_index * self.config.frame_dt, 6),
-                        "rgb_path": str(rgb_path.relative_to(output_dir)),
-                        "depth_path": str(depth_path.relative_to(output_dir)),
+                        "rgb_path": str(Path(primary_rgb_path).relative_to(output_dir)),
+                        "depth_path": str(Path(primary_depth_path).relative_to(output_dir)),
                         "mask_path": (
-                            str(mask_path.relative_to(output_dir))
-                            if write_binary_masks and mask_path is not None
+                            str(Path(primary_mask_path).relative_to(output_dir))
+                            if write_binary_masks and primary_mask_path is not None
                             else None
                         ),
                         "part_mask_path": (
-                            str(part_mask_path.relative_to(output_dir))
-                            if self.config.part_segmentation_masks and part_mask_path is not None
+                            str(Path(primary_part_mask_path).relative_to(output_dir))
+                            if self.config.part_segmentation_masks and primary_part_mask_path is not None
                             else None
                         ),
                         "rgb_paths_by_view": (
                             [str(path.relative_to(output_dir)) for path in view_rgb_paths]
                             if view_rgb_paths
-                            else [str(rgb_path.relative_to(output_dir))]
+                            else [str(Path(primary_rgb_path).relative_to(output_dir))]
                         ),
                         "depth_paths_by_view": (
                             [str(path.relative_to(output_dir)) for path in view_depth_paths]
                             if view_depth_paths
-                            else [str(depth_path.relative_to(output_dir))]
+                            else [str(Path(primary_depth_path).relative_to(output_dir))]
                         ),
                         "mask_paths_by_view": (
                             [str(path.relative_to(output_dir)) for path in view_mask_paths]
                             if view_mask_paths
                             else (
-                                [str(mask_path.relative_to(output_dir))]
-                                if write_binary_masks and mask_path is not None
+                                [str(Path(primary_mask_path).relative_to(output_dir))]
+                                if write_binary_masks and primary_mask_path is not None
                                 else []
                             )
                         ),
@@ -623,8 +758,8 @@ class MuJoCoEpisodeRecorder:
                             [str(path.relative_to(output_dir)) for path in view_part_mask_paths]
                             if view_part_mask_paths
                             else (
-                                [str(part_mask_path.relative_to(output_dir))]
-                                if self.config.part_segmentation_masks and part_mask_path is not None
+                                [str(Path(primary_part_mask_path).relative_to(output_dir))]
+                                if self.config.part_segmentation_masks and primary_part_mask_path is not None
                                 else []
                             )
                         ),
@@ -715,6 +850,9 @@ class MuJoCoEpisodeRecorder:
                 "segmentation_masks": bool(self.config.segmentation_masks or self.config.part_segmentation_masks),
                 "part_segmentation_masks": bool(self.config.part_segmentation_masks),
                 "mask_format": self.config.mask_format,
+                "triview_asset_layout": (
+                    "concat+views" if write_concat_assets and self.config.camera_mode == "triview" else "views-only"
+                ),
                 "part_segmentation": part_segmentation,
                 "disable_target_mesh_collision": bool(self.config.disable_target_mesh_collision),
                 "hide_clear_meshes": bool(self.config.hide_clear_meshes),
@@ -1103,9 +1241,11 @@ class MuJoCoMaskRenderer:
         camera_azimuths_deg = [float(value) for value in camera_meta.get("camera_azimuths_deg", [])]
 
         assets_dir = output_dir / "assets"
+        write_concat_assets = camera_meta.get("triview_asset_layout", "concat+views") != "views-only"
         concat_assets_dir = assets_dir / "concat" if camera_mode == "triview" else assets_dir
         per_view_assets_dirs = [assets_dir / f"view_{index}" for index in range(3)] if camera_mode == "triview" else []
-        concat_assets_dir.mkdir(parents=True, exist_ok=True)
+        if camera_mode != "triview" or write_concat_assets:
+            concat_assets_dir.mkdir(parents=True, exist_ok=True)
         for view_dir in per_view_assets_dirs:
             view_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1156,13 +1296,14 @@ class MuJoCoMaskRenderer:
                 mask_u16 = view_masks_u16[0]
             else:
                 mask_u16 = np.concatenate(view_masks_u16, axis=1)
-            mask_path = concat_assets_dir / mask_name
-            if self.config.mask_format == "pgm":
-                _write_pgm_u16(mask_path, mask_u16)
-            else:
-                _write_png_depth_u16(mask_path, mask_u16)
+            mask_path = None
+            if camera_mode != "triview" or write_concat_assets:
+                mask_path = concat_assets_dir / mask_name
+                if self.config.mask_format == "pgm":
+                    _write_pgm_u16(mask_path, mask_u16)
+                else:
+                    _write_png_depth_u16(mask_path, mask_u16)
 
-            frame["mask_path"] = str(mask_path.relative_to(output_dir))
             frame["mask_paths_by_view"] = []
             frame["part_mask_path"] = None
             frame["part_mask_paths_by_view"] = []
@@ -1171,12 +1312,13 @@ class MuJoCoMaskRenderer:
                     part_mask_u16 = view_part_masks_u16[0]
                 else:
                     part_mask_u16 = np.concatenate(view_part_masks_u16, axis=1)
-                part_mask_path = concat_assets_dir / part_mask_name
-                if self.config.mask_format == "pgm":
-                    _write_pgm_u16(part_mask_path, part_mask_u16)
-                else:
-                    _write_png_depth_u16(part_mask_path, part_mask_u16)
-                frame["part_mask_path"] = str(part_mask_path.relative_to(output_dir))
+                if camera_mode != "triview" or write_concat_assets:
+                    part_mask_path = concat_assets_dir / part_mask_name
+                    if self.config.mask_format == "pgm":
+                        _write_pgm_u16(part_mask_path, part_mask_u16)
+                    else:
+                        _write_png_depth_u16(part_mask_path, part_mask_u16)
+                    frame["part_mask_path"] = str(part_mask_path.relative_to(output_dir))
             if camera_mode == "triview":
                 for view_index, view_mask_u16 in enumerate(view_masks_u16):
                     view_mask_path = per_view_assets_dirs[view_index] / mask_name
@@ -1193,7 +1335,13 @@ class MuJoCoMaskRenderer:
                         else:
                             _write_png_depth_u16(view_part_mask_path, view_part_mask_u16)
                         frame["part_mask_paths_by_view"].append(str(view_part_mask_path.relative_to(output_dir)))
+                frame["mask_path"] = str(Path(_primary_view_path(frame["mask_paths_by_view"], mask_path)).as_posix())
+                if frame["part_mask_paths_by_view"]:
+                    frame["part_mask_path"] = str(
+                        Path(_primary_view_path(frame["part_mask_paths_by_view"], frame["part_mask_path"])).as_posix()
+                    )
             else:
+                frame["mask_path"] = str(mask_path.relative_to(output_dir))
                 frame["mask_paths_by_view"] = [str(mask_path.relative_to(output_dir))]
                 if frame["part_mask_path"] is not None:
                     frame["part_mask_paths_by_view"] = [str(frame["part_mask_path"])]
@@ -1202,6 +1350,9 @@ class MuJoCoMaskRenderer:
         episode_payload["metadata"]["segmentation_masks"] = True
         episode_payload["metadata"]["part_segmentation_masks"] = bool(write_part_masks)
         episode_payload["metadata"]["mask_format"] = self.config.mask_format
+        episode_payload["metadata"]["triview_asset_layout"] = (
+            "concat+views" if write_concat_assets and camera_mode == "triview" else "views-only"
+        )
         episode_payload["metadata"]["depth_convention"] = "z-depth"
         if camera_fovy_deg is not None:
             episode_payload["metadata"]["camera_fovy_deg"] = float(camera_fovy_deg)
@@ -1282,3 +1433,170 @@ class MuJoCoMaskRenderer:
         image = Image.open(path)
         width, height = image.size
         return height, width
+
+
+class MuJoCoEpisodeCompactor:
+    def __init__(self, config: MuJoCoEpisodeCompactConfig) -> None:
+        self.config = config
+
+    def compact(self) -> dict[str, Any]:
+        episode_path = Path(self.config.episode_path).resolve()
+        payload = load_json(episode_path)
+        metadata = dict(payload.get("metadata", {}))
+        frames = list(payload.get("frames", []))
+        if metadata.get("camera_mode") != "triview":
+            raise ValueError("compact-mujoco-recording currently only supports triview episodes")
+
+        output_dir = episode_path.parent
+        concat_dir = output_dir / "assets" / "concat"
+        concat_video = output_dir / "episode_concat.mp4"
+        removable_bytes = 0
+        if self.config.remove_concat_dir:
+            removable_bytes += _path_size_bytes(concat_dir)
+        if self.config.remove_concat_video:
+            removable_bytes += _path_size_bytes(concat_video)
+
+        frame_updates = 0
+        for frame in frames:
+            rgb_paths = list(frame.get("rgb_paths_by_view", []))
+            depth_paths = list(frame.get("depth_paths_by_view", []))
+            mask_paths = list(frame.get("mask_paths_by_view", []))
+            part_mask_paths = list(frame.get("part_mask_paths_by_view", []))
+            if rgb_paths:
+                frame["rgb_path"] = str(_primary_view_path(rgb_paths, frame.get("rgb_path")))
+            if depth_paths:
+                frame["depth_path"] = str(_primary_view_path(depth_paths, frame.get("depth_path")))
+            if mask_paths:
+                frame["mask_path"] = str(_primary_view_path(mask_paths, frame.get("mask_path")))
+            if part_mask_paths:
+                frame["part_mask_path"] = str(_primary_view_path(part_mask_paths, frame.get("part_mask_path")))
+            frame_updates += 1
+
+        metadata["triview_asset_layout"] = "views-only"
+        payload["metadata"] = metadata
+        payload["frames"] = frames
+
+        if not self.config.dry_run:
+            save_json(payload, episode_path)
+            if self.config.remove_concat_dir and concat_dir.is_dir():
+                shutil.rmtree(concat_dir)
+            if self.config.remove_concat_video and concat_video.is_file():
+                concat_video.unlink()
+
+        return {
+            "episode_path": str(episode_path),
+            "frame_updates": frame_updates,
+            "concat_dir": str(concat_dir),
+            "concat_dir_exists": concat_dir.exists(),
+            "concat_video": str(concat_video),
+            "concat_video_exists": concat_video.exists(),
+            "dry_run": bool(self.config.dry_run),
+            "estimated_bytes_reclaimed": int(removable_bytes),
+        }
+
+
+class MuJoCoEpisodeRepacker:
+    def __init__(self, config: MuJoCoEpisodeRepackConfig) -> None:
+        self.config = config
+
+    def repack(self) -> dict[str, Any]:
+        episode_path = Path(self.config.episode_path).resolve()
+        payload = load_json(episode_path)
+        frames = list(payload.get("frames", []))
+        metadata = dict(payload.get("metadata", {}))
+        output_dir = episode_path.parent
+
+        converted_count = 0
+        bytes_before = 0
+        bytes_after = 0
+        bytes_reclaimed = 0
+        converted_map: dict[str, str] = {}
+
+        def repack_rel_path(relative_path: str | None, kind: str) -> str | None:
+            nonlocal converted_count, bytes_before, bytes_after, bytes_reclaimed
+            if not relative_path:
+                return relative_path
+            if relative_path in converted_map:
+                return converted_map[relative_path]
+
+            source = output_dir / relative_path
+            suffix = source.suffix.lower()
+            if suffix == ".png":
+                converted_map[relative_path] = relative_path
+                return relative_path
+
+            if suffix not in {".ppm", ".pgm"}:
+                converted_map[relative_path] = relative_path
+                return relative_path
+
+            target = source.with_suffix(".png")
+            if kind == "rgb":
+                image = _read_ppm_rgb(source) if suffix == ".ppm" else _read_png_rgb(source)
+                encoded_before = int(source.stat().st_size)
+                if not self.config.dry_run:
+                    _write_png_rgb(target, image)
+            else:
+                image = _read_pgm_u16(source) if suffix == ".pgm" else _read_png_u16(source)
+                encoded_before = int(source.stat().st_size)
+                if not self.config.dry_run:
+                    _write_png_depth_u16(target, image)
+
+            encoded_after = int(target.stat().st_size) if target.exists() else 0
+            bytes_before += encoded_before
+            bytes_after += encoded_after
+            if not self.config.dry_run and not self.config.keep_originals and source.exists():
+                source.unlink()
+                bytes_reclaimed += max(0, encoded_before - encoded_after)
+
+            new_relative = str(target.relative_to(output_dir))
+            converted_map[relative_path] = new_relative
+            converted_count += 1
+            return new_relative
+
+        for frame in frames:
+            frame["rgb_path"] = repack_rel_path(frame.get("rgb_path"), "rgb")
+            frame["depth_path"] = repack_rel_path(frame.get("depth_path"), "depth")
+            frame["mask_path"] = repack_rel_path(frame.get("mask_path"), "mask")
+            frame["part_mask_path"] = repack_rel_path(frame.get("part_mask_path"), "part-mask")
+            frame["rgb_paths_by_view"] = [repack_rel_path(path, "rgb") for path in frame.get("rgb_paths_by_view", [])]
+            frame["depth_paths_by_view"] = [
+                repack_rel_path(path, "depth") for path in frame.get("depth_paths_by_view", [])
+            ]
+            frame["mask_paths_by_view"] = [
+                repack_rel_path(path, "mask") for path in frame.get("mask_paths_by_view", [])
+            ]
+            frame["part_mask_paths_by_view"] = [
+                repack_rel_path(path, "part-mask") for path in frame.get("part_mask_paths_by_view", [])
+            ]
+
+        metadata["rgb_format"] = "png"
+        metadata["depth_format"] = "png"
+        if metadata.get("segmentation_masks") or metadata.get("part_segmentation_masks"):
+            metadata["mask_format"] = "png"
+        payload["metadata"] = metadata
+        payload["frames"] = frames
+
+        if not self.config.dry_run:
+            save_json(payload, episode_path)
+
+        return {
+            "episode_path": str(episode_path),
+            "converted_paths": int(converted_count),
+            "dry_run": bool(self.config.dry_run),
+            "keep_originals": bool(self.config.keep_originals),
+            "input_bytes": int(bytes_before),
+            "output_bytes": int(bytes_after),
+            "estimated_bytes_reclaimed": int(bytes_before if self.config.dry_run and not self.config.keep_originals else bytes_reclaimed),
+        }
+
+
+def _path_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_file():
+        return int(path.stat().st_size)
+    total = 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            total += int(child.stat().st_size)
+    return total

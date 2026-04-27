@@ -29,6 +29,11 @@ tracking = [
 	"numpy>=1.26",
 ]
 
+mjx = [
+	"jax>=0.4.30",
+	"mujoco-mjx>=3.3.0",
+]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

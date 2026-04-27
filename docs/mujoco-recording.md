@@ -123,6 +123,21 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp record-mujoco path/to/object.xml \
   --video
 ```
 
+Disk-light tri-view capture:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp record-mujoco path/to/object.xml \
+  --category door \
+  --object-id door-mj-001 \
+  --output-dir outputs/recordings \
+  --duration-s 3.0 \
+  --fps 20 \
+  --camera-mode triview \
+  --rgb-format png \
+  --depth-format png \
+  --mask-format png
+```
+
 Override MP4 playback FPS:
 
 ```bash
@@ -146,11 +161,11 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp record-mujoco path/to/object.xml \
 - `--auto-initial-qvel-max-abs`: upper bound for inferred initial speed
 - `--auto-initial-qvel-direction-mode`: `away-from-qpos0`, `toward-lower`, or `toward-upper`
 - `--camera-mode orbit`: single sweeping camera
-- `--camera-mode triview`: three fixed cameras plus stitched outputs
+- `--camera-mode triview`: three fixed cameras
+- `--write-concat-assets`: opt back into duplicated stitched raw RGB/depth/mask assets under `assets/concat`
 
-Tri-view writes:
+Tri-view writes by default:
 
-- `assets/concat/`
 - `assets/view_0/`
 - `assets/view_1/`
 - `assets/view_2/`
@@ -158,6 +173,26 @@ Tri-view writes:
 - `episode_view_0.mp4`
 - `episode_view_1.mp4`
 - `episode_view_2.mp4`
+
+If you pass `--write-concat-assets`, tri-view additionally writes:
+
+- `assets/concat/`
+
+To compact an older triview episode that still has duplicated `assets/concat/` raw
+frames, run:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp compact-mujoco-recording \
+  outputs/recordings/<object-id>/episode.json
+```
+
+To transcode an older episode from `ppm/pgm` assets to `png` in place and
+update `episode.json`, run:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp repack-mujoco-recording \
+  outputs/recordings/<object-id>/episode.json
+```
 
 ## Useful Flags For Real Assets
 

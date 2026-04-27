@@ -15,6 +15,7 @@ class PointCloudVisualizationConfig:
     max_points_per_frame: int = 4000
     point_radius_px: float = 2.0
     part_pose_path: str | Path | None = None
+    part_track_path: str | Path | None = None
     joint_inference_path: str | Path | None = None
     canvas_width: int = 1200
     canvas_height: int = 860
@@ -207,6 +208,20 @@ def _resolve_optional_artifact_path(
     return candidate if candidate.exists() else None
 
 
+def _uniform_sample_items(items: list[dict[str, object]], max_items: int) -> list[dict[str, object]]:
+    if max_items <= 0 or len(items) <= max_items:
+        return items
+    stride = max(1, math.ceil(len(items) / max_items))
+    sampled = items[::stride]
+    if len(sampled) > max_items:
+        sampled = sampled[:max_items]
+    return sampled
+
+
+def _overlay_frame_index(sample: dict[str, object]) -> int:
+    return int(sample.get("source_frame_index", sample.get("frame_index", 0)))
+
+
 def _matvec3(matrix: list[list[float]], vec: list[float]) -> list[float]:
     return [sum(matrix[row][col] * vec[col] for col in range(3)) for row in range(3)]
 
@@ -224,6 +239,148 @@ def _normalize3(vec: list[float], fallback: list[float] | None = None) -> list[f
     if length < 1e-9:
         return list(fallback) if fallback is not None else [0.0, 0.0, 1.0]
     return [value / length for value in vec]
+
+
+def _load_part_pose_overlay_payload(
+    input_path: Path,
+    frames: list[dict[str, object]],
+    bounds: dict[str, list[float]],
+    part_pose_path: str | Path | None,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    resolved_part_pose_path = _resolve_optional_artifact_path(input_path, part_pose_path, "part_poses.json")
+    if resolved_part_pose_path is None:
+        return [], {
+            "has_part_pose_overlays": False,
+            "part_pose_overlay_count": 0,
+            "part_pose_path": None,
+            "part_pose_estimator": None,
+        }
+
+    part_pose_artifact = load_json(resolved_part_pose_path)
+    max_extent = max(
+        1e-3,
+        *(bounds["upper"][axis] - bounds["lower"][axis] for axis in range(3)),
+    )
+    axis_length_m = 0.12 * max_extent
+    frame_lookup = {int(frame["frame_index"]): [] for frame in frames}
+    overlay_count = 0
+    part_ids_present: set[int] = set()
+
+    for part in part_pose_artifact.get("parts", []):
+        if not isinstance(part, dict):
+            continue
+        part_id = int(part.get("part_id", 0))
+        if part_id <= 0:
+            continue
+        part_name = str(part.get("name", f"part_{part_id}"))
+        for sample in part.get("samples", []):
+            if not isinstance(sample, dict) or not bool(sample.get("valid", False)):
+                continue
+            if "rotation_matrix" not in sample or "translation" not in sample:
+                continue
+            frame_index = _overlay_frame_index(sample)
+            if frame_index not in frame_lookup:
+                continue
+            frame_lookup[frame_index].append(
+                {
+                    "part_id": part_id,
+                    "part_name": part_name,
+                    "translation": [float(value) for value in sample["translation"]],
+                    "centroid_world": [float(value) for value in sample.get("centroid_world", sample["translation"])],
+                    "rotation_matrix": [[float(value) for value in row] for row in sample["rotation_matrix"]],
+                    "confidence": float(sample.get("confidence", 0.0)),
+                    "source_frame_index": frame_index,
+                    "line_length_m": axis_length_m,
+                }
+            )
+            overlay_count += 1
+            part_ids_present.add(part_id)
+
+    return [
+        {
+            "frame_index": int(frame["frame_index"]),
+            "items": frame_lookup.get(int(frame["frame_index"]), []),
+        }
+        for frame in frames
+    ], {
+        "has_part_pose_overlays": overlay_count > 0,
+        "part_pose_overlay_count": overlay_count,
+        "part_pose_path": str(resolved_part_pose_path),
+        "part_pose_estimator": str(part_pose_artifact.get("estimator", "unknown")),
+        "part_pose_axis_length_m": axis_length_m,
+        "part_pose_part_ids": sorted(part_ids_present),
+    }
+
+
+def _load_track_flow_payload(
+    input_path: Path,
+    frames: list[dict[str, object]],
+    part_track_path: str | Path | None,
+    max_segments_per_frame: int = 240,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    resolved_part_track_path = _resolve_optional_artifact_path(input_path, part_track_path, "part_tracks.json")
+    if resolved_part_track_path is None:
+        return [], {
+            "has_track_flows": False,
+            "track_flow_segment_count": 0,
+            "part_track_path": None,
+            "part_track_estimator": None,
+        }
+
+    part_track_artifact = load_json(resolved_part_track_path)
+    frame_lookup: dict[int, list[dict[str, object]]] = {int(frame["frame_index"]): [] for frame in frames}
+    track_flow_count = 0
+    part_ids_present: set[int] = set()
+
+    for track in part_track_artifact.get("tracks", []):
+        if not isinstance(track, dict):
+            continue
+        part_id = int(track.get("part_id", 0))
+        if part_id <= 0:
+            continue
+        part_name = str(track.get("part_name", f"part_{part_id}"))
+        samples = [sample for sample in track.get("samples", []) if isinstance(sample, dict)]
+        previous_sample: dict[str, object] | None = None
+        for sample in samples:
+            if not bool(sample.get("visible", False)):
+                previous_sample = None
+                continue
+            xyz_world = sample.get("xyz_world")
+            if not isinstance(xyz_world, list):
+                previous_sample = None
+                continue
+            if previous_sample is not None:
+                previous_xyz = previous_sample.get("xyz_world")
+                if isinstance(previous_xyz, list):
+                    frame_index = _overlay_frame_index(sample)
+                    if frame_index in frame_lookup:
+                        frame_lookup[frame_index].append(
+                            {
+                                "part_id": part_id,
+                                "part_name": part_name,
+                                "track_id": int(track.get("track_id", 0)),
+                                "start": [float(value) for value in previous_xyz],
+                                "end": [float(value) for value in xyz_world],
+                                "confidence": float(sample.get("confidence", 0.0)),
+                            }
+                        )
+                        track_flow_count += 1
+                        part_ids_present.add(part_id)
+            previous_sample = sample
+
+    return [
+        {
+            "frame_index": int(frame["frame_index"]),
+            "items": _uniform_sample_items(frame_lookup.get(int(frame["frame_index"]), []), max_segments_per_frame),
+        }
+        for frame in frames
+    ], {
+        "has_track_flows": track_flow_count > 0,
+        "track_flow_segment_count": track_flow_count,
+        "part_track_path": str(resolved_part_track_path),
+        "part_track_estimator": str(part_track_artifact.get("estimator", "unknown")),
+        "track_flow_part_ids": sorted(part_ids_present),
+    }
 
 
 def _load_joint_overlay_payload(
@@ -245,6 +402,8 @@ def _load_joint_overlay_payload(
 
     part_pose_artifact = load_json(resolved_part_pose_path)
     joint_artifact = load_json(resolved_joint_path)
+    sampled_frame_indices = [int(item) for item in part_pose_artifact.get("sampled_frame_indices", [])]
+    q_frame_map: dict[int, int] = {index: source_index for index, source_index in enumerate(sampled_frame_indices)}
     part_samples_by_id: dict[int, dict[int, dict[str, object]]] = {}
     for part in part_pose_artifact.get("parts", []):
         if not isinstance(part, dict):
@@ -256,7 +415,7 @@ def _load_joint_overlay_payload(
                 continue
             if "rotation_matrix" not in sample or "translation" not in sample:
                 continue
-            frame_samples[int(sample.get("frame_index", 0))] = {
+            frame_samples[_overlay_frame_index(sample)] = {
                 "rotation_matrix": [[float(value) for value in row] for row in sample["rotation_matrix"]],
                 "translation": [float(value) for value in sample["translation"]],
             }
@@ -288,7 +447,7 @@ def _load_joint_overlay_payload(
         axis_parent = [float(value) for value in joint.get("axis", [0.0, 0.0, 1.0])]
         pivot_parent = [float(value) for value in joint.get("pivot", [0.0, 0.0, 0.0])]
         q_by_frame = {
-            int(sample.get("frame_index", 0)): float(sample.get("q", 0.0))
+            q_frame_map.get(int(sample.get("frame_index", 0)), int(sample.get("frame_index", 0))): float(sample.get("q", 0.0))
             for sample in joint.get("q_samples", [])
             if isinstance(sample, dict)
         }
@@ -340,6 +499,7 @@ def _load_visualization_payload(
     path: Path,
     max_points_per_frame: int,
     part_pose_path: str | Path | None = None,
+    part_track_path: str | Path | None = None,
     joint_inference_path: str | Path | None = None,
 ) -> tuple[dict[str, object], Path]:
     if path.suffix.lower() == ".json":
@@ -394,6 +554,17 @@ def _load_visualization_payload(
         bounds=meta["bounds"],
         voxel_size=voxel_size,
     )
+    part_pose_frames, part_pose_meta = _load_part_pose_overlay_payload(
+        path,
+        prepared_frames,
+        bounds=meta["bounds"],
+        part_pose_path=part_pose_path,
+    )
+    track_flow_frames, track_flow_meta = _load_track_flow_payload(
+        path,
+        prepared_frames,
+        part_track_path=part_track_path,
+    )
     joint_frames, joint_meta = _load_joint_overlay_payload(
         path,
         prepared_frames,
@@ -403,14 +574,26 @@ def _load_visualization_payload(
     )
     meta["render_point_count"] = sum(len(frame["points"]) for frame in prepared_frames)
     meta["max_points_per_frame"] = max_points_per_frame
-    meta["has_part_labels"] = bool(meta.get("part_ids_present"))
     meta.update(static_meta)
+    meta.update(part_pose_meta)
+    meta.update(track_flow_meta)
     meta.update(joint_meta)
+    merged_part_ids = sorted(
+        {
+            *(int(part_id) for part_id in meta.get("part_ids_present", [])),
+            *(int(part_id) for part_id in meta.get("part_pose_part_ids", [])),
+            *(int(part_id) for part_id in meta.get("track_flow_part_ids", [])),
+        }
+    )
+    meta["part_ids_present"] = merged_part_ids
+    meta["has_part_labels"] = bool(merged_part_ids)
     return {
         "meta": meta,
         "frames": prepared_frames,
         "static_points": static_points,
         "dynamic_frames": dynamic_frames,
+        "part_pose_frames": part_pose_frames,
+        "track_flow_frames": track_flow_frames,
         "joint_frames": joint_frames,
     }, output_html
 
@@ -636,6 +819,10 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
         <input id="ghostSlider" type="range" min="0" max="8" step="1" value="0" />
         <div class="value" id="ghostValue"></div>
       </div>
+      <div class="control-group">
+        <label>Visible Parts</label>
+        <div id="partFilterPanel" class="legend"></div>
+      </div>
     </aside>
     <main class="main">
       <div class="toolbar">
@@ -657,6 +844,8 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
       <div class="subtoolbar">
         <button id="colorHeight">Color: Height</button>
         <button id="colorPart">Color: Part</button>
+        <button id="togglePoses">Show Poses</button>
+        <button id="toggleFlow">Show Flow</button>
         <button id="toggleJoints">Show Joints</button>
       </div>
       <canvas id="viewer" width="{config.canvas_width}" height="{config.canvas_height}"></canvas>
@@ -695,6 +884,7 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
   const radiusValue = document.getElementById("radiusValue");
   const ghostSlider = document.getElementById("ghostSlider");
   const ghostValue = document.getElementById("ghostValue");
+  const partFilterPanel = document.getElementById("partFilterPanel");
   const playButton = document.getElementById("playButton");
   const resetViewButton = document.getElementById("resetViewButton");
   const presetPerspective = document.getElementById("presetPerspective");
@@ -707,6 +897,8 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
   const modeDynamic = document.getElementById("modeDynamic");
   const colorHeight = document.getElementById("colorHeight");
   const colorPart = document.getElementById("colorPart");
+  const togglePoses = document.getElementById("togglePoses");
+  const toggleFlow = document.getElementById("toggleFlow");
   const toggleJoints = document.getElementById("toggleJoints");
   const statusEl = document.getElementById("status");
   const canvas = document.getElementById("viewer");
@@ -720,9 +912,13 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
   const frames = DATA.frames;
   const dynamicFrames = DATA.dynamic_frames || frames;
   const staticPoints = DATA.static_points || [];
+  const partPoseFrames = DATA.part_pose_frames || [];
+  const trackFlowFrames = DATA.track_flow_frames || [];
   const jointFrames = DATA.joint_frames || [];
   const meta = DATA.meta;
   const hasPartLabels = Boolean(meta.has_part_labels);
+  const hasPartPoseOverlays = Boolean(meta.has_part_pose_overlays);
+  const hasTrackFlows = Boolean(meta.has_track_flows);
   const hasJointOverlays = Boolean(meta.has_joint_overlays);
   const bounds = meta.bounds || {{ lower: [0,0,0], upper: [1,1,1] }};
   const center = bounds.lower.map((value, index) => (value + bounds.upper[index]) / 2);
@@ -733,7 +929,10 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
   let lastTick = 0;
   let viewMode = "current_static";
   let colorMode = hasPartLabels ? "part" : "height";
+  let showPoses = hasPartPoseOverlays;
+  let showFlow = hasTrackFlows;
   let showJoints = hasJointOverlays;
+  const selectedPartIds = new Set((meta.part_ids_present || []).map((partId) => Number(partId)));
 
   function formatNumber(value) {{
     return Number(value).toFixed(3);
@@ -768,12 +967,57 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
       <div class="meta-line"><span>Input</span><strong><code>${{meta.input_path}}</code></strong></div>
       <div class="meta-line"><span>Point cloud</span><strong><code>${{meta.pointcloud_path}}</code></strong></div>
       <div class="meta-line"><span>Pose source</span><strong>${{(meta.pose_sources_used || []).join(", ") || "n/a"}}</strong></div>
+      <div class="meta-line"><span>Part pose estimator</span><strong>${{meta.part_pose_estimator || "n/a"}}</strong></div>
+      <div class="meta-line"><span>Track flow estimator</span><strong>${{meta.part_track_estimator || "n/a"}}</strong></div>
       <div class="meta-line"><span>Part ids</span><strong>${{(meta.part_ids_present || []).join(", ") || "none"}}</strong></div>
+      <div class="meta-line"><span>Pose overlays</span><strong>${{meta.part_pose_overlay_count || 0}}</strong></div>
+      <div class="meta-line"><span>Flow segments</span><strong>${{meta.track_flow_segment_count || 0}}</strong></div>
       <div class="meta-line"><span>Joint overlays</span><strong>${{meta.joint_overlay_count || 0}}</strong></div>
       <div class="meta-line"><span>Part poses</span><strong><code>${{meta.part_pose_path || "n/a"}}</code></strong></div>
+      <div class="meta-line"><span>Part tracks</span><strong><code>${{meta.part_track_path || "n/a"}}</code></strong></div>
       <div class="meta-line"><span>Joint inference</span><strong><code>${{meta.joint_inference_path || "n/a"}}</code></strong></div>
       ${{legendHtml}}
     `;
+  }}
+
+  function isPartVisible(partId) {{
+    const numericPartId = Number(partId || 0);
+    if (!numericPartId) return true;
+    if (!selectedPartIds.size) return true;
+    return selectedPartIds.has(numericPartId);
+  }}
+
+  function rebuildPartFilters() {{
+    const pointCountMap = meta.part_point_counts || {{}};
+    const partIds = (meta.part_ids_present || []).map((partId) => Number(partId));
+    if (!partIds.length) {{
+      partFilterPanel.innerHTML = `<div class="value">No part labels</div>`;
+      return;
+    }}
+    partFilterPanel.innerHTML = partIds.map((partId) => {{
+      const part = pointCountMap[String(partId)] || {{}};
+      const count = part.count ?? "-";
+      const name = part.name || `part_${{partId}}`;
+      return `
+      <label class="legend-row" style="grid-template-columns: 18px 14px 1fr auto; cursor:pointer;">
+        <input type="checkbox" data-part-id="${{partId}}" ${{isPartVisible(partId) ? "checked" : ""}} />
+        <span class="legend-swatch" style="background:${{partColor(partId, 0.95)}}"></span>
+        <span>${{name}}</span>
+        <strong>${{count}}</strong>
+      </label>
+    `;
+    }}).join("");
+    partFilterPanel.querySelectorAll("input[type=checkbox]").forEach((el) => {{
+      el.addEventListener("change", () => {{
+        const partId = Number(el.dataset.partId || "0");
+        if (el.checked) {{
+          selectedPartIds.add(partId);
+        }} else {{
+          selectedPartIds.delete(partId);
+        }}
+        render();
+      }});
+    }});
   }}
 
   function syncControls() {{
@@ -855,6 +1099,90 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
     }};
   }}
 
+  function poseAxes(item) {{
+    const origin = item.centroid_world || item.translation || [0, 0, 0];
+    const rotation = item.rotation_matrix || [[1,0,0],[0,1,0],[0,0,1]];
+    const scale = Number(item.line_length_m || meta.part_pose_axis_length_m || 0.1);
+    return [
+      {{
+        axis: "x",
+        color: "rgba(255,110,110,0.95)",
+        start: origin,
+        end: [
+          origin[0] + rotation[0][0] * scale,
+          origin[1] + rotation[1][0] * scale,
+          origin[2] + rotation[2][0] * scale,
+        ],
+      }},
+      {{
+        axis: "y",
+        color: "rgba(110,255,170,0.95)",
+        start: origin,
+        end: [
+          origin[0] + rotation[0][1] * scale,
+          origin[1] + rotation[1][1] * scale,
+          origin[2] + rotation[2][1] * scale,
+        ],
+      }},
+      {{
+        axis: "z",
+        color: "rgba(110,170,255,0.95)",
+        start: origin,
+        end: [
+          origin[0] + rotation[0][2] * scale,
+          origin[1] + rotation[1][2] * scale,
+          origin[2] + rotation[2][2] * scale,
+        ],
+      }},
+    ];
+  }}
+
+  function drawPartPosesMain(overlays, yaw, pitch, scale, radiusBase) {{
+    if (!showPoses || !hasPartPoseOverlays) return;
+    ctx.save();
+    ctx.lineWidth = 1.35;
+    for (const item of overlays) {{
+      if (!isPartVisible(item.part_id)) continue;
+      const origin = projectPointForMain(item.translation || [0,0,0], yaw, pitch, scale);
+      for (const axis of poseAxes(item)) {{
+        const start = projectPointForMain(axis.start, yaw, pitch, scale);
+        const end = projectPointForMain(axis.end, yaw, pitch, scale);
+        ctx.strokeStyle = axis.color;
+        ctx.beginPath();
+        ctx.moveTo(start.sx, start.sy);
+        ctx.lineTo(end.sx, end.sy);
+        ctx.stroke();
+      }}
+      ctx.fillStyle = partColor(item.part_id, 0.95);
+      ctx.beginPath();
+      ctx.arc(origin.sx, origin.sy, Math.max(1.8, radiusBase * 1.2), 0, Math.PI * 2);
+      ctx.fill();
+    }}
+    ctx.restore();
+  }}
+
+  function drawTrackFlowsMain(flows, yaw, pitch, scale, radiusBase) {{
+    if (!showFlow || !hasTrackFlows) return;
+    ctx.save();
+    for (const item of flows) {{
+      if (!isPartVisible(item.part_id)) continue;
+      const start = projectPointForMain(item.start, yaw, pitch, scale);
+      const end = projectPointForMain(item.end, yaw, pitch, scale);
+      const alpha = Math.max(0.15, Math.min(0.95, Number(item.confidence || 0.0)));
+      ctx.strokeStyle = partColor(item.part_id, alpha);
+      ctx.lineWidth = Math.max(0.8, radiusBase * 0.5);
+      ctx.beginPath();
+      ctx.moveTo(start.sx, start.sy);
+      ctx.lineTo(end.sx, end.sy);
+      ctx.stroke();
+      ctx.fillStyle = partColor(item.part_id, alpha);
+      ctx.beginPath();
+      ctx.arc(end.sx, end.sy, Math.max(0.8, radiusBase * 0.75), 0, Math.PI * 2);
+      ctx.fill();
+    }}
+    ctx.restore();
+  }}
+
   function drawJointOverlaysMain(overlays, yaw, pitch, scale, radiusBase) {{
     if (!showJoints || !hasJointOverlays) return;
     ctx.save();
@@ -908,6 +1236,50 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
     }}
   }}
 
+  function drawProjectionPartPoses(pctx, axisA, axisB, pad, overlays) {{
+    if (!showPoses || !hasPartPoseOverlays) return;
+    const aMin = bounds.lower[axisA];
+    const aSpan = Math.max(1e-6, bounds.upper[axisA] - bounds.lower[axisA]);
+    const bMin = bounds.lower[axisB];
+    const bSpan = Math.max(1e-6, bounds.upper[axisB] - bounds.lower[axisB]);
+    for (const item of overlays) {{
+      if (!isPartVisible(item.part_id)) continue;
+      for (const axis of poseAxes(item)) {{
+        const sx0 = pad + ((axis.start[axisA] - aMin) / aSpan) * (pctx.canvas.width - 2 * pad);
+        const sy0 = pctx.canvas.height - pad - ((axis.start[axisB] - bMin) / bSpan) * (pctx.canvas.height - 2 * pad);
+        const sx1 = pad + ((axis.end[axisA] - aMin) / aSpan) * (pctx.canvas.width - 2 * pad);
+        const sy1 = pctx.canvas.height - pad - ((axis.end[axisB] - bMin) / bSpan) * (pctx.canvas.height - 2 * pad);
+        pctx.strokeStyle = axis.color;
+        pctx.lineWidth = 1.25;
+        pctx.beginPath();
+        pctx.moveTo(sx0, sy0);
+        pctx.lineTo(sx1, sy1);
+        pctx.stroke();
+      }}
+    }}
+  }}
+
+  function drawProjectionTrackFlows(pctx, axisA, axisB, pad, flows) {{
+    if (!showFlow || !hasTrackFlows) return;
+    const aMin = bounds.lower[axisA];
+    const aSpan = Math.max(1e-6, bounds.upper[axisA] - bounds.lower[axisA]);
+    const bMin = bounds.lower[axisB];
+    const bSpan = Math.max(1e-6, bounds.upper[axisB] - bounds.lower[axisB]);
+    for (const item of flows) {{
+      if (!isPartVisible(item.part_id)) continue;
+      const sx0 = pad + ((item.start[axisA] - aMin) / aSpan) * (pctx.canvas.width - 2 * pad);
+      const sy0 = pctx.canvas.height - pad - ((item.start[axisB] - bMin) / bSpan) * (pctx.canvas.height - 2 * pad);
+      const sx1 = pad + ((item.end[axisA] - aMin) / aSpan) * (pctx.canvas.width - 2 * pad);
+      const sy1 = pctx.canvas.height - pad - ((item.end[axisB] - bMin) / bSpan) * (pctx.canvas.height - 2 * pad);
+      pctx.strokeStyle = partColor(item.part_id, Math.max(0.15, Math.min(0.95, Number(item.confidence || 0.0))));
+      pctx.lineWidth = 1.0;
+      pctx.beginPath();
+      pctx.moveTo(sx0, sy0);
+      pctx.lineTo(sx1, sy1);
+      pctx.stroke();
+    }}
+  }}
+
   function drawProjection(canvasEl, axisA, axisB, title) {{
     const pctx = canvasEl.getContext("2d");
     pctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
@@ -929,6 +1301,7 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
 
     function drawProjectionPoints(points, alpha, warm=false) {{
       for (const point of points) {{
+        if (!isPartVisible(point[3])) continue;
         const u = (point[axisA] - aMin) / aSpan;
         const v = (point[axisB] - bMin) / bSpan;
         const x = pad + u * (canvasEl.width - 2 * pad);
@@ -953,7 +1326,11 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
       const frame = dynamicFrames[frameIndex] || {{points: []}};
       drawProjectionPoints(frame.points, 0.95, true);
     }}
+    const partPoseFrame = partPoseFrames[frameIndex] || {{items: []}};
+    const trackFlowFrame = trackFlowFrames[frameIndex] || {{items: []}};
     const jointFrame = jointFrames[frameIndex] || {{items: []}};
+    drawProjectionTrackFlows(pctx, axisA, axisB, pad, trackFlowFrame.items || []);
+    drawProjectionPartPoses(pctx, axisA, axisB, pad, partPoseFrame.items || []);
     drawProjectionJointOverlays(pctx, axisA, axisB, pad, jointFrame.items || []);
   }}
 
@@ -972,6 +1349,7 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
 
     if (viewMode === "static" || viewMode === "current_static") {{
       for (const point of staticPoints) {{
+        if (!isPartVisible(point[3])) continue;
         const rotated = rotate(point, yaw, pitch);
         const [sx, sy, perspective] = project(rotated, scale);
         ctx.fillStyle = pointFill(point, 0.18);
@@ -988,6 +1366,7 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
         const frame = frames[current];
         const ghostAlpha = offset === 0 ? 0.95 : 0.14 + 0.08 * (ghostFrames - offset);
         for (const point of frame.points) {{
+          if (!isPartVisible(point[3])) continue;
           const rotated = rotate(point, yaw, pitch);
           const [sx, sy, perspective] = project(rotated, scale);
           ctx.fillStyle = pointFill(point, ghostAlpha);
@@ -999,6 +1378,7 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
     }} else if (viewMode === "dynamic") {{
       const frame = dynamicFrames[frameIndex] || {{points: []}};
       for (const point of frame.points) {{
+        if (!isPartVisible(point[3])) continue;
         const rotated = rotate(point, yaw, pitch);
         const [sx, sy, perspective] = project(rotated, scale);
         ctx.fillStyle = pointFill(point, 0.95, true);
@@ -1010,9 +1390,13 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
 
     const frame = frames[frameIndex] || {{ time_s: 0, points: [] }};
     const dynamicFrame = dynamicFrames[frameIndex] || {{points: []}};
+    const partPoseFrame = partPoseFrames[frameIndex] || {{items: []}};
+    const trackFlowFrame = trackFlowFrames[frameIndex] || {{items: []}};
     const jointFrame = jointFrames[frameIndex] || {{items: []}};
+    drawTrackFlowsMain(trackFlowFrame.items || [], yaw, pitch, scale, radiusBase);
+    drawPartPosesMain(partPoseFrame.items || [], yaw, pitch, scale, radiusBase);
     drawJointOverlaysMain(jointFrame.items || [], yaw, pitch, scale, radiusBase);
-    statusEl.textContent = `time=${{formatNumber(frame.time_s)}} s | frame=${{frameIndex}} | points=${{frame.points.length}} | dynamic=${{dynamicFrame.points.length}} | joints=${{(jointFrame.items || []).length}} | mode=${{viewMode}} | color=${{colorMode}}`;
+    statusEl.textContent = `time=${{formatNumber(frame.time_s)}} s | frame=${{frameIndex}} | points=${{frame.points.length}} | dynamic=${{dynamicFrame.points.length}} | flow=${{(trackFlowFrame.items || []).length}} | poses=${{(partPoseFrame.items || []).length}} | joints=${{(jointFrame.items || []).length}} | pose_src=${{meta.part_pose_estimator || "n/a"}} | mode=${{viewMode}} | color=${{colorMode}}`;
     drawProjection(projectionCanvases.front, 0, 2, "X vs Z");
     drawProjection(projectionCanvases.side, 1, 2, "Y vs Z");
     drawProjection(projectionCanvases.top, 0, 1, "X vs Y");
@@ -1095,6 +1479,18 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
   modeDynamic.addEventListener("click", () => setMode("dynamic"));
   colorHeight.addEventListener("click", () => setColorMode("height"));
   colorPart.addEventListener("click", () => setColorMode("part"));
+  togglePoses.addEventListener("click", () => {{
+    if (!hasPartPoseOverlays) return;
+    showPoses = !showPoses;
+    togglePoses.classList.toggle("primary", showPoses);
+    render();
+  }});
+  toggleFlow.addEventListener("click", () => {{
+    if (!hasTrackFlows) return;
+    showFlow = !showFlow;
+    toggleFlow.classList.toggle("primary", showFlow);
+    render();
+  }});
   toggleJoints.addEventListener("click", () => {{
     if (!hasJointOverlays) return;
     showJoints = !showJoints;
@@ -1106,6 +1502,20 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
     colorPart.disabled = true;
     colorPart.style.opacity = "0.45";
     colorPart.style.cursor = "default";
+  }}
+  if (!hasPartPoseOverlays) {{
+    togglePoses.disabled = true;
+    togglePoses.style.opacity = "0.45";
+    togglePoses.style.cursor = "default";
+  }} else {{
+    togglePoses.classList.toggle("primary", showPoses);
+  }}
+  if (!hasTrackFlows) {{
+    toggleFlow.disabled = true;
+    toggleFlow.style.opacity = "0.45";
+    toggleFlow.style.cursor = "default";
+  }} else {{
+    toggleFlow.classList.toggle("primary", showFlow);
   }}
   if (!hasJointOverlays) {{
     toggleJoints.disabled = true;
@@ -1144,6 +1554,7 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
   }}, {{ passive: false }});
 
   updateMeta();
+  rebuildPartFilters();
   syncControls();
   applyPreset("perspective");
   setMode("current_static");
@@ -1165,6 +1576,7 @@ class PointCloudViewerBuilder:
             input_path,
             max_points_per_frame=max(1, int(self.config.max_points_per_frame)),
             part_pose_path=self.config.part_pose_path,
+            part_track_path=self.config.part_track_path,
             joint_inference_path=self.config.joint_inference_path,
         )
         output_html = (

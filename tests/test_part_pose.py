@@ -135,6 +135,7 @@ class PartPoseTests(unittest.TestCase):
             self.assertEqual(door_track["name"], "door")
             frame1 = next(sample for sample in door_track["samples"] if sample["frame_index"] == 1)
             self.assertTrue(frame1["valid"])
+            self.assertIn("centroid_world", frame1)
             self.assertAlmostEqual(frame1["translation"][0], 0.4, places=1)
             self.assertAlmostEqual(frame1["translation"][1], 0.45, places=1)
             self.assertIsNotNone(frame1["relative_to_anchor"])

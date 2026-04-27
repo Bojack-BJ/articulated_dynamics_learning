@@ -119,9 +119,13 @@ TORCH_HOME="$PWD/.cache/torch" PYTHONPATH=src python3 -m rgbd_urdf_mvp track-par
   --cotracker-checkpoint ./co-tracker/ckpt/scaled_offline.pth \
   --device auto \
   --reference-frame 0 \
+  --frame-stride 4 \
   --seed-stride-px 16 \
   --max-tracks-per-part-view 128
 ```
+
+For a `60 Hz` recording, `--frame-stride 4` reduces CoTracker to roughly
+`15 Hz` while keeping the original episode files unchanged.
 
 Then fit per-part SE(3) trajectories from those 3D correspondences:
 
@@ -152,6 +156,15 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp infer-joints \
 ```
 
 This writes `joint_inference.json` next to `part_poses.json` by default.
+
+When `part_tracks.json`, `part_poses.json`, and `joint_inference.json` are in
+the same directory as the input manifest, `visualize-pointcloud` now loads them
+automatically and exposes:
+
+- per-part pose overlays with the pose estimator source
+- per-part visibility filters
+- CoTracker point-flow overlays
+- joint overlays
 
 Optional thresholds:
 
