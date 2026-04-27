@@ -74,7 +74,7 @@ PYTHONPATH=src python -m rgbd_urdf_mvp probe-mjx --no-rollout-test
 
 ## Intended Next Step
 
-After the probe is green, the next implementation target should be a parallel
+After the probe is green, the repository now includes a parallel
 `identify-dynamics-mjx` path:
 
 ```text
@@ -84,5 +84,24 @@ articulation_artifact + MJCF + q(t)
   -> optimize mass / damping / friction with JAX grad
 ```
 
-That path should live alongside the current MuJoCo finite-difference optimizer
-until feature parity and numerical behavior are good enough to replace it.
+Run it with:
+
+```bash
+PYTHONPATH=src python -m rgbd_urdf_mvp identify-dynamics-mjx \
+  outputs/recordings/$OBJECT_ID/episode.json \
+  outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/articulation_artifact.json \
+  outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/urdf/$OBJECT_ID.mjcf.xml
+```
+
+The current implementation uses:
+
+- `mjx.put_model` / `mjx.put_data`
+- differentiable rollout through `mjx.step`
+- JAX `value_and_grad`
+- Adam-style first-order updates on mass / damping / friction parameters
+
+It still lives alongside the MuJoCo finite-difference optimizer because:
+
+- C MuJoCo is still the easier baseline for single-scene debugging
+- the MJX path currently assumes a shared timestamp schedule
+- contact-rich replay and control replay are not implemented yet

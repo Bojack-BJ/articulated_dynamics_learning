@@ -57,6 +57,15 @@ python -m pip install -e ".[mjx]"
 PYTHONPATH=src python -m rgbd_urdf_mvp probe-mjx
 ```
 
+After the MJX probe is green, the parallel autodiff optimizer is:
+
+```bash
+PYTHONPATH=src python -m rgbd_urdf_mvp identify-dynamics-mjx \
+  outputs/recordings/$OBJECT_ID/episode.json \
+  outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/articulation_artifact.json \
+  outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/urdf/$OBJECT_ID.mjcf.xml
+```
+
 On Mac, the tracking command defaults to `--device auto`, which uses PyTorch
 MPS when available and CPU otherwise. CUDA is never selected unless
 `--device cuda` is passed explicitly.

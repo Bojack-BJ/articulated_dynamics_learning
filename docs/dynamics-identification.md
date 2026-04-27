@@ -7,6 +7,7 @@ episode.json
   + articulation_artifact.json
   + inferred MJCF
   -> identify-dynamics
+  -> identify-dynamics-mjx
   -> optimized mass / damping / frictionloss
   -> optimized MJCF + dynamics_identification.json
 ```
@@ -25,6 +26,10 @@ The current implementation is an optimization-first MVP:
 It currently uses finite-difference gradient descent around MuJoCo rollouts.
 It is not exact end-to-end autodiff through MuJoCo.
 
+The parallel `identify-dynamics-mjx` path uses JAX autodiff through MuJoCo MJX
+rollouts. It keeps the same input/output contract so you can compare the two
+optimizers on the same object.
+
 ## Run It
 
 If you already exported inferred articulation:
@@ -42,10 +47,31 @@ Or use the YAML example:
 PYTHONPATH=src python3 -m rgbd_urdf_mvp configs/identify_dynamics_microwave.yaml
 ```
 
+MJX autodiff path:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp identify-dynamics-mjx \
+  outputs/recordings/$OBJECT_ID/episode.json \
+  outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/articulation_artifact.json \
+  outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/urdf/$OBJECT_ID.mjcf.xml
+```
+
+Or use the MJX YAML example:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp configs/identify_dynamics_microwave_mjx.yaml
+```
+
 Outputs:
 
 ```text
 outputs/recordings/<object-id>/pointcloud_4d_partseg/dynamics_identification/
+  dynamics_identification.json
+  <object-id>.mjcf.identified.xml
+```
+
+```text
+outputs/recordings/<object-id>/pointcloud_4d_partseg/dynamics_identification_mjx/
   dynamics_identification.json
   <object-id>.mjcf.identified.xml
 ```
@@ -66,6 +92,7 @@ The JSON artifact includes:
 - Absolute mass can be weakly identifiable from passive single-DOF motion.
   In practice, damping and friction are often better constrained than mass.
 - Contact-rich identification is not implemented yet.
+- The current MJX path assumes all observed joints share the same timestamp schedule.
 
 ## How This Connects To A Lagrangian Network
 

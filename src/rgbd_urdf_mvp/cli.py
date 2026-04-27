@@ -472,6 +472,50 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not optimize joint frictionloss",
     )
 
+    dynamics_mjx_parser = subparsers.add_parser(
+        "identify-dynamics-mjx",
+        help="Fit part masses and joint damping/friction with JAX autodiff through MuJoCo MJX rollouts",
+    )
+    dynamics_mjx_parser.add_argument("episode", type=Path, help="Path to episode.json")
+    dynamics_mjx_parser.add_argument("articulation_artifact", type=Path, help="Path to articulation_artifact.json")
+    dynamics_mjx_parser.add_argument("mjcf", type=Path, help="Path to the MJCF model to optimize")
+    dynamics_mjx_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for MJX dynamics identification outputs (defaults to <mjcf_dir>/dynamics_identification_mjx)",
+    )
+    dynamics_mjx_parser.add_argument("--max-iterations", type=int, default=25, help="Maximum optimization iterations")
+    dynamics_mjx_parser.add_argument("--learning-rate", type=float, default=0.05, help="Adam learning rate")
+    dynamics_mjx_parser.add_argument("--q-weight", type=float, default=1.0, help="Weight for q(t) trajectory matching")
+    dynamics_mjx_parser.add_argument("--qdot-weight", type=float, default=0.05, help="Weight for qdot(t) trajectory matching")
+    dynamics_mjx_parser.add_argument("--prior-weight", type=float, default=0.02, help="Regularization weight toward the initial MJCF parameters")
+    dynamics_mjx_parser.add_argument(
+        "--optimize-static-parts",
+        action="store_true",
+        help="Also include static/root part masses in the optimization vector",
+    )
+    dynamics_mjx_parser.add_argument(
+        "--no-optimize-mass",
+        action="store_true",
+        help="Do not optimize body masses/inertias",
+    )
+    dynamics_mjx_parser.add_argument(
+        "--no-optimize-damping",
+        action="store_true",
+        help="Do not optimize joint damping",
+    )
+    dynamics_mjx_parser.add_argument(
+        "--no-optimize-friction",
+        action="store_true",
+        help="Do not optimize joint frictionloss",
+    )
+    dynamics_mjx_parser.add_argument(
+        "--no-jit",
+        action="store_true",
+        help="Disable JAX JIT compilation for easier debugging",
+    )
+
     hunyuan_parser = subparsers.add_parser(
         "hunyuan3d-generate",
         help="Request a remote Hunyuan3D API server and save the generated 3D asset",
@@ -1063,6 +1107,30 @@ def main(argv: list[str] | None = None) -> int:
                 optimize_mass=not bool(args.no_optimize_mass),
                 optimize_damping=not bool(args.no_optimize_damping),
                 optimize_friction=not bool(args.no_optimize_friction),
+            )
+        )
+        print(json.dumps({"dynamics_identification_artifact": str(artifact_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "identify-dynamics-mjx":
+        from .dynamics.system_id_mjx import MJXDynamicsIdentificationConfig, MJXDynamicsIdentifier
+
+        artifact_path = MJXDynamicsIdentifier().run(
+            MJXDynamicsIdentificationConfig(
+                episode_path=args.episode,
+                articulation_artifact_path=args.articulation_artifact,
+                mjcf_path=args.mjcf,
+                output_dir=args.output_dir,
+                max_iterations=max(1, int(args.max_iterations)),
+                learning_rate=float(args.learning_rate),
+                q_weight=float(args.q_weight),
+                qdot_weight=float(args.qdot_weight),
+                prior_weight=float(args.prior_weight),
+                optimize_static_parts=bool(args.optimize_static_parts),
+                optimize_mass=not bool(args.no_optimize_mass),
+                optimize_damping=not bool(args.no_optimize_damping),
+                optimize_friction=not bool(args.no_optimize_friction),
+                jit=not bool(args.no_jit),
             )
         )
         print(json.dumps({"dynamics_identification_artifact": str(artifact_path.resolve())}, indent=2))
