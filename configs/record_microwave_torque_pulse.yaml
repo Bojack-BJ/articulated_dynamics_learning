@@ -1,0 +1,27 @@
+command: record-mujoco
+args:
+  model: examples/mujoco_models/Microwave011.xml
+  category: microwave
+  object-id: microwave011_torque_pulse
+  output-dir: outputs/recordings
+  duration-s: 4
+  fps: 60
+  control-mode: free
+  joint-name: microjoint
+  initial-qvel: 0.0
+  excitation-mode: pulse
+  excitation-force: -2.0
+  excitation-start-s: 0.1
+  excitation-duration-s: 0.25
+  rgb-format: png
+  depth-format: png
+  mask-format: png
+  perturbation-scale: 0.0
+  video: true
+  camera-distance: 1.2
+  camera-mode: triview
+  camera-triview-spacing-deg: 90
+  lookat: [0.0, 0.0, 0.0]
+  disable-target-mesh-collision: true
+  segmentation-masks: true
+  part-segmentation-masks: true

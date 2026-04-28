@@ -239,6 +239,13 @@ class MuJoCoRecordConfig:
     kick_force: float = 0.0
     kick_start_s: float = 0.0
     kick_duration_s: float = 0.0
+    excitation_mode: str = "none"
+    excitation_force: float = 0.0
+    excitation_start_s: float = 0.0
+    excitation_duration_s: float = 0.0
+    excitation_period_s: float = 0.25
+    excitation_frequency_hz: float = 1.0
+    write_dynamics_log: bool = True
     make_video: bool = False
     video_fps: float | None = None
     segmentation_masks: bool = False
@@ -311,6 +318,18 @@ class MuJoCoEpisodeRecorder:
             raise ValueError("kick_duration_s must be >= 0")
         if self.config.kick_start_s < 0.0:
             raise ValueError("kick_start_s must be >= 0")
+        if self.config.excitation_mode not in {"none", "pulse", "prbs", "sine"}:
+            raise ValueError("excitation_mode must be one of: none, pulse, prbs, sine")
+        if self.config.excitation_start_s < 0.0:
+            raise ValueError("excitation_start_s must be >= 0")
+        if self.config.excitation_duration_s < 0.0:
+            raise ValueError("excitation_duration_s must be >= 0")
+        if self.config.excitation_mode != "none" and self.config.excitation_duration_s <= 0.0:
+            raise ValueError("excitation_duration_s must be > 0 when excitation_mode is not 'none'")
+        if self.config.excitation_period_s <= 0.0:
+            raise ValueError("excitation_period_s must be positive")
+        if self.config.excitation_frequency_hz <= 0.0:
+            raise ValueError("excitation_frequency_hz must be positive")
         if self.config.auto_initial_qvel_direction_mode not in {
             "away-from-qpos0",
             "toward-lower",
@@ -372,64 +391,17 @@ class MuJoCoEpisodeRecorder:
         record_duration_s = max(self.config.frame_count * self.config.frame_dt, self.config.frame_dt)
 
         for index, (joint_id, qpos_adr, dof_adr) in enumerate(controlled):
-            lower, upper = self._joint_limits(model, joint_id)
-            if self.config.control_mode == "free" and math.isfinite(lower) and math.isfinite(upper) and upper > lower:
-                span = upper - lower
-
-                # Keep the authored assembly pose to avoid visual pop/disconnection,
-                # but move a tiny margin away from hard limits to allow free motion.
-                limit_margin = 0.02 * span
-                rest_q = float(data.qpos[qpos_adr])
-                min_q = lower + limit_margin
-                max_q = upper - limit_margin
-                if min_q < max_q:
-                    default_q = float(model.qpos0[qpos_adr])
-                    clamped_default_q = min(max(default_q, min_q), max_q)
-                    if self.config.random_initial_qpos:
-                        if self.config.auto_initial_qvel_from_limits and joint_id == primary_joint_id:
-                            # Keep primary joint near closed/reference pose for a clearer opening motion.
-                            data.qpos[qpos_adr] = clamped_default_q
-                        else:
-                            data.qpos[qpos_adr] = rng.uniform(min_q, max_q)
-                    else:
-                        data.qpos[qpos_adr] = min(max(rest_q, min_q), max_q)
-
-                # In free mode, the intent is an initial impulse, not a slow motion profile.
-                # Use a conservative fraction of one joint-span per recorded frame interval so
-                # the user-provided floor can still meaningfully change the motion regime.
-                desired_speed = 0.25 * span / self.config.frame_dt
-                if self.config.auto_initial_qvel_from_limits:
-                    q0 = float(data.qpos[qpos_adr])
-                    qref = float(model.qpos0[qpos_adr])
-                    ref_room_upper = max(0.0, upper - qref)
-                    ref_room_lower = max(0.0, qref - lower)
-
-                    if self.config.auto_initial_qvel_direction_mode == "toward-upper":
-                        direction = 1.0
-                    elif self.config.auto_initial_qvel_direction_mode == "toward-lower":
-                        direction = -1.0
-                    else:
-                        # Treat default pose as a closed/reference state and move away from it.
-                        direction = 1.0 if ref_room_upper > ref_room_lower else -1.0
-                    room = max(0.0, (upper - q0) if direction > 0.0 else (q0 - lower))
-
-                    effective_min_abs = min(
-                        float(self.config.auto_initial_qvel_min_abs),
-                        float(self.config.auto_initial_qvel_max_abs),
-                    )
-                    base_speed = max(desired_speed, effective_min_abs)
-                    # Reduce impulse when initialized close to a limit; increase near mid-range.
-                    room_ratio = room / span if span > 1e-9 else 0.0
-                    speed = base_speed * (0.25 + 0.75 * room_ratio)
-                    speed = min(speed, float(self.config.auto_initial_qvel_max_abs))
-                    data.qvel[dof_adr] = direction * speed
-                elif self.config.initial_joint_qvel != 0.0:
-                    # Respect user-provided sign and magnitude for impulse-like free dynamics.
-                    data.qvel[dof_adr] = float(self.config.initial_joint_qvel)
-                else:
-                    # Auto-init fallback: alternate directions to excite multi-joint motion.
-                    direction = 1.0 if (index % 2 == 0) else -1.0
-                    data.qvel[dof_adr] = direction * desired_speed
+            if self.config.control_mode == "free":
+                self._initialize_free_joint_state(
+                    model,
+                    data,
+                    joint_id,
+                    qpos_adr,
+                    dof_adr,
+                    primary_joint_id,
+                    index,
+                    rng,
+                )
             else:
                 data.qvel[dof_adr] = float(self.config.initial_joint_qvel)
 
@@ -467,6 +439,7 @@ class MuJoCoEpisodeRecorder:
         ]
 
         frame_payload: list[dict[str, Any]] = []
+        dynamics_log_rows: list[dict[str, Any]] = []
         concat_video_writer = None
         view_video_writers: list[Any] = []
         if self.config.make_video:
@@ -502,19 +475,23 @@ class MuJoCoEpisodeRecorder:
                 target_q = joint_limits[0] + target_fraction * (joint_limits[1] - joint_limits[0])
 
                 force_history: list[float] = []
+                excitation_force_history: list[float] = []
                 for _ in range(steps_per_frame):
+                    step_time_s = float(data.time)
                     step_forces: list[float] = []
+                    step_excitation_forces: list[float] = []
                     data.qfrc_applied[:] = 0.0
 
                     kick_force = 0.0
                     if self.config.control_mode != "free" and self.config.kick_duration_s > 0.0:
-                        t = float(data.time)
-                        if self.config.kick_start_s <= t < (self.config.kick_start_s + self.config.kick_duration_s):
+                        if self.config.kick_start_s <= step_time_s < (self.config.kick_start_s + self.config.kick_duration_s):
                             kick_force = float(self.config.kick_force)
 
-                    for joint_id, qpos_adr, dof_adr in controlled:
+                    joint_step_logs: dict[str, dict[str, float]] = {}
+                    for joint_index, (joint_id, qpos_adr, dof_adr) in enumerate(controlled):
                         q = float(data.qpos[qpos_adr])
                         qdot = float(data.qvel[dof_adr])
+                        joint_name = self._joint_name(mujoco, model, joint_id)
 
                         tracking_force = 0.0
                         if self.config.control_mode == "track" and joint_id == primary_joint_id:
@@ -536,11 +513,34 @@ class MuJoCoEpisodeRecorder:
                             if self.config.control_mode != "free"
                             else 0.0
                         )
-                        total_force = tracking_force + perturb_force + kick_force
+                        excitation_force = self._excitation_force(step_time_s, joint_index)
+                        total_force = tracking_force + perturb_force + kick_force + excitation_force
                         data.qfrc_applied[dof_adr] = total_force
                         step_forces.append(total_force)
+                        step_excitation_forces.append(excitation_force)
+                        joint_step_logs[joint_name] = {
+                            "qpos": q,
+                            "qvel": qdot,
+                            "tracking_force": tracking_force,
+                            "perturbation_force": perturb_force,
+                            "kick_force": kick_force,
+                            "excitation_force": excitation_force,
+                            "applied_generalized_force": total_force,
+                        }
 
                     force_history.append(float(sum(step_forces) / len(step_forces)) if step_forces else 0.0)
+                    excitation_force_history.append(
+                        float(sum(step_excitation_forces) / len(step_excitation_forces))
+                        if step_excitation_forces
+                        else 0.0
+                    )
+                    if self.config.write_dynamics_log:
+                        dynamics_log_rows.append(
+                            {
+                                "timestamp_s": round(step_time_s, 9),
+                                "joints": joint_step_logs,
+                            }
+                        )
                     mujoco.mj_step(model, data)
 
                     if self.config.control_mode == "free":
@@ -772,6 +772,12 @@ class MuJoCoEpisodeRecorder:
                             "applied_force_mean": (
                                 float(sum(force_history) / len(force_history)) if force_history else 0.0
                             ),
+                            "excitation_force_mean": (
+                                float(sum(excitation_force_history) / len(excitation_force_history))
+                                if excitation_force_history
+                                else 0.0
+                            ),
+                            "excitation_mode": self.config.excitation_mode,
                             "joint_positions": {
                                 name: float(data.qpos[qpos_adr])
                                 for name, (_, qpos_adr, _) in zip(joint_names, controlled)
@@ -809,6 +815,9 @@ class MuJoCoEpisodeRecorder:
                 "seed": int(self.config.seed),
                 "perturbation_scale": float(self.config.perturbation_scale),
                 "control_mode": self.config.control_mode,
+                "recording_variant": (
+                    "forced-excitation" if self.config.excitation_mode != "none" else self.config.control_mode
+                ),
                 "random_initial_qpos": bool(self.config.random_initial_qpos),
                 "auto_initial_qvel_from_limits": bool(self.config.auto_initial_qvel_from_limits),
                 "auto_initial_qvel_direction_mode": self.config.auto_initial_qvel_direction_mode,
@@ -819,6 +828,16 @@ class MuJoCoEpisodeRecorder:
                     "force": float(self.config.kick_force),
                     "start_s": float(self.config.kick_start_s),
                     "duration_s": float(self.config.kick_duration_s),
+                },
+                "excitation": {
+                    "mode": self.config.excitation_mode,
+                    "force": float(self.config.excitation_force),
+                    "start_s": float(self.config.excitation_start_s),
+                    "duration_s": float(self.config.excitation_duration_s),
+                    "period_s": float(self.config.excitation_period_s),
+                    "frequency_hz": float(self.config.excitation_frequency_hz),
+                    "target": "all_joints" if self.config.all_joints else "selected_joint",
+                    "dynamics_log_path": "dynamics_log.jsonl" if self.config.write_dynamics_log else None,
                 },
                 "rgb_format": self.config.rgb_format,
                 "depth_format": self.config.depth_format,
@@ -870,8 +889,111 @@ class MuJoCoEpisodeRecorder:
         }
 
         episode_path = output_dir / "episode.json"
+        if self.config.write_dynamics_log:
+            dynamics_log_path = output_dir / "dynamics_log.jsonl"
+            dynamics_log_path.write_text(
+                "".join(f"{self._json_dumps(row)}\n" for row in dynamics_log_rows),
+                encoding="utf-8",
+            )
         save_json(episode_payload, episode_path)
         return episode_path
+
+    def _json_dumps(self, value: Any) -> str:
+        import json
+
+        return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+    def _excitation_force(self, timestamp_s: float, joint_index: int) -> float:
+        mode = self.config.excitation_mode
+        if mode == "none":
+            return 0.0
+        start_s = float(self.config.excitation_start_s)
+        duration_s = float(self.config.excitation_duration_s)
+        if timestamp_s < start_s or timestamp_s >= start_s + duration_s:
+            return 0.0
+
+        amplitude = float(self.config.excitation_force)
+        elapsed_s = timestamp_s - start_s
+        if mode == "pulse":
+            return amplitude
+        if mode == "sine":
+            return amplitude * math.sin(2.0 * math.pi * float(self.config.excitation_frequency_hz) * elapsed_s)
+        if mode == "prbs":
+            segment_index = int(math.floor(elapsed_s / float(self.config.excitation_period_s)))
+            rng = random.Random(int(self.config.seed) + 1000003 * int(joint_index) + 9176 * segment_index)
+            return amplitude if rng.random() >= 0.5 else -amplitude
+        return 0.0
+
+    def _initialize_free_joint_state(
+        self,
+        model: Any,
+        data: Any,
+        joint_id: int,
+        qpos_adr: int,
+        dof_adr: int,
+        primary_joint_id: int,
+        joint_index: int,
+        rng: random.Random,
+    ) -> None:
+        lower, upper = self._joint_limits(model, joint_id)
+        if not (math.isfinite(lower) and math.isfinite(upper) and upper > lower):
+            data.qvel[dof_adr] = float(self.config.initial_joint_qvel)
+            return
+
+        span = upper - lower
+        forced_response = self.config.excitation_mode != "none"
+
+        # Free-decay recordings move slightly away from hard limits to avoid
+        # immediate clipping. Forced-response recordings keep the authored
+        # initial state unless random initialization is explicitly requested.
+        limit_margin = 0.02 * span
+        rest_q = float(data.qpos[qpos_adr])
+        min_q = lower + limit_margin
+        max_q = upper - limit_margin
+        if min_q < max_q:
+            default_q = float(model.qpos0[qpos_adr])
+            clamped_default_q = min(max(default_q, min_q), max_q)
+            if self.config.random_initial_qpos:
+                if self.config.auto_initial_qvel_from_limits and joint_id == primary_joint_id:
+                    data.qpos[qpos_adr] = clamped_default_q
+                else:
+                    data.qpos[qpos_adr] = rng.uniform(min_q, max_q)
+            elif forced_response:
+                data.qpos[qpos_adr] = min(max(rest_q, lower), upper)
+            else:
+                data.qpos[qpos_adr] = min(max(rest_q, min_q), max_q)
+
+        desired_speed = 0.25 * span / self.config.frame_dt
+        if forced_response:
+            data.qvel[dof_adr] = float(self.config.initial_joint_qvel)
+        elif self.config.auto_initial_qvel_from_limits:
+            q0 = float(data.qpos[qpos_adr])
+            qref = float(model.qpos0[qpos_adr])
+            ref_room_upper = max(0.0, upper - qref)
+            ref_room_lower = max(0.0, qref - lower)
+
+            if self.config.auto_initial_qvel_direction_mode == "toward-upper":
+                direction = 1.0
+            elif self.config.auto_initial_qvel_direction_mode == "toward-lower":
+                direction = -1.0
+            else:
+                direction = 1.0 if ref_room_upper > ref_room_lower else -1.0
+            room = max(0.0, (upper - q0) if direction > 0.0 else (q0 - lower))
+
+            effective_min_abs = min(
+                float(self.config.auto_initial_qvel_min_abs),
+                float(self.config.auto_initial_qvel_max_abs),
+            )
+            base_speed = max(desired_speed, effective_min_abs)
+            room_ratio = room / span if span > 1e-9 else 0.0
+            speed = base_speed * (0.25 + 0.75 * room_ratio)
+            speed = min(speed, float(self.config.auto_initial_qvel_max_abs))
+            data.qvel[dof_adr] = direction * speed
+        elif self.config.initial_joint_qvel != 0.0:
+            data.qvel[dof_adr] = float(self.config.initial_joint_qvel)
+        else:
+            direction = 1.0 if (joint_index % 2 == 0) else -1.0
+            data.qvel[dof_adr] = direction * desired_speed
 
     def _open_video_writer(self, output_dir: Path, fps: float, filename: str):
         try:

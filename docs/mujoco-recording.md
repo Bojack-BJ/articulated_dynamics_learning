@@ -155,6 +155,7 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp record-mujoco path/to/object.xml \
 
 - `track` mode: finds the target hinge/slide joint and applies tracking control with optional perturbation
 - `free` mode: sets initial state and runs without external control
+- `free` mode with `--excitation-mode`: runs without PD tracking but injects a known generalized force through `qfrc_applied`
 - `--random-initial-qpos`: randomizes controlled joint positions within limits
 - `--auto-initial-qvel-from-limits`: infers an initial velocity from joint limits and reset pose
 - `--auto-initial-qvel-min-abs`: lower bound for inferred initial speed
@@ -163,6 +164,50 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp record-mujoco path/to/object.xml \
 - `--camera-mode orbit`: single sweeping camera
 - `--camera-mode triview`: three fixed cameras
 - `--write-concat-assets`: opt back into duplicated stitched raw RGB/depth/mask assets under `assets/concat`
+
+## Forced-Response Episodes For Dynamics ID
+
+Free-decay episodes are useful, but they mostly constrain damping/inertia
+ratios. To make inertia and damping more identifiable, record a separate
+forced-response episode with a known applied generalized force. Do not overwrite
+the free episode; use a distinct `object-id`.
+
+Example torque-pulse microwave episode:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp configs/record_microwave_torque_pulse.yaml
+```
+
+The preset writes:
+
+```text
+outputs/recordings/microwave011_torque_pulse/
+  episode.json
+  dynamics_log.jsonl
+  episode_view_*.mp4
+  assets/view_*/
+```
+
+The original free episode remains at:
+
+```text
+outputs/recordings/microwave011/
+```
+
+The forced-response episode keeps `control_mode: free`, because there is still
+no PD tracking. The distinction is stored under:
+
+- `metadata.recording_variant = "forced-excitation"`
+- `metadata.excitation`
+- per-frame `action_log.excitation_mode`
+- per-frame `action_log.excitation_force_mean`
+- sim-rate `dynamics_log.jsonl`
+
+Supported excitation profiles:
+
+- `pulse`: constant force over the excitation window
+- `prbs`: pseudo-random binary sequence with piecewise-constant sign
+- `sine`: sinusoidal excitation
 
 Tri-view writes by default:
 
