@@ -247,7 +247,8 @@ Once the kinematic structure is fixed, fit a first-pass dynamic model:
 PYTHONPATH=src python3 -m rgbd_urdf_mvp identify-dynamics \
   "outputs/recordings/$OBJECT_ID/episode.json" \
   "outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/articulation_artifact.json" \
-  "outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/urdf/$OBJECT_ID.mjcf.xml"
+  "outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/urdf/$OBJECT_ID.mjcf.xml" \
+  --render-gl-backend cgl
 ```
 
 This writes:
@@ -256,6 +257,8 @@ This writes:
 outputs/recordings/<object-id>/pointcloud_4d_partseg/inferred_articulation/urdf/dynamics_identification/
   dynamics_identification.json
   <object-id>.mjcf.identified.xml
+  simulated_view_<view-index>.mp4
+  comparison_view_<view-index>.mp4
 ```
 
 The current optimizer fits:
@@ -266,6 +269,23 @@ The current optimizer fits:
 
 against the observed joint trajectory from the articulation artifact.
 
+The exported MJCF gets its initial inertial values from the same collision
+proxies used for the URDF. In the current pointcloud path those proxies are
+sized from each part's reference-frame fused pointcloud, not from a fixed
+placeholder cube. Check `urdf/articulation.json` and look for
+`metadata.source = "pointcloud-reference-bounds"` to confirm this path was used.
+
+Dynamics rollout contacts are disabled by default because these inferred
+proxy boxes are coarse and may overlap around the joint. The identified MJCF
+therefore writes `contype="0"` and `conaffinity="0"` on geoms. Add
+`--enable-contact` only after the proxies are accurate enough for contact-rich
+system identification.
+
+Use `--render-gl-backend cgl` on macOS to save rollout videos from a normal
+local GUI terminal. Use `--render-gl-backend glfw` if CGL fails, and
+`--render-gl-backend none` for batch/headless runs. The comparison video places
+the original RGB view on the left and the optimized MuJoCo rollout on the right.
+
 ## 10. Batch Pipeline Runner
 
 For multiple simulated objects, use:
@@ -275,6 +295,7 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch configs/batch_obj
 PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch --resume configs/batch_objects_example.tsv
 PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch --skip-existing configs/batch_objects_example.tsv
 PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch --jobs 4 configs/batch_objects_example.tsv
+PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch --resume --jobs 2 --dynamics-backend mjx --dynamics-jax-platform metal --dynamics-enable-pjrt-compatibility configs/batch_objects_example.tsv
 ```
 
 The thin shell wrapper calls the same Python runner:
@@ -297,6 +318,8 @@ The runner executes:
 4. `estimate-part-poses --method tracks`
 5. `infer-joints`
 6. `visualize-pointcloud`
+7. optional `export-inferred-articulation`
+8. optional `identify-dynamics` or `identify-dynamics-mjx`
 
 The heavy stage parameters now come from YAML templates:
 
@@ -312,10 +335,16 @@ The corresponding templates live in:
 - `configs/record_hinge.yaml`
 - `configs/record_drawer.yaml`
 - `configs/track_default.yaml`
+- `configs/identify_dynamics_default.yaml`
+- `configs/identify_dynamics_mjx_default.yaml`
 
 Use `--record-config path/to/template.yaml` or `--track-config path/to/template.yaml`
 when you want one batch run to use a different preset without editing the
 defaults.
+
+Use `--dynamics-backend mujoco` or `--dynamics-backend mjx` to enable the
+optional Stage 4 dynamics fit. Override its preset with
+`--dynamics-config path/to/template.yaml` when needed.
 
 Batch recovery flags:
 

@@ -57,13 +57,26 @@ python -m pip install -e ".[mjx]"
 PYTHONPATH=src python -m rgbd_urdf_mvp probe-mjx
 ```
 
+Optional Apple Metal backend for MJX on macOS:
+
+```bash
+python -m pip install jax-metal
+PYTHONPATH=src python -m rgbd_urdf_mvp probe-mjx --jax-platform metal --enable-pjrt-compatibility --no-rollout-test
+```
+
+The project keeps `probe-mjx` and `identify-dynamics-mjx` on `cpu` by default
+even when `jax-metal` is installed. Request Metal explicitly with
+`--jax-platform metal`.
+
 After the MJX probe is green, the parallel autodiff optimizer is:
 
 ```bash
 PYTHONPATH=src python -m rgbd_urdf_mvp identify-dynamics-mjx \
   outputs/recordings/$OBJECT_ID/episode.json \
   outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/articulation_artifact.json \
-  outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/urdf/$OBJECT_ID.mjcf.xml
+  outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/urdf/$OBJECT_ID.mjcf.xml \
+  --jax-platform metal \
+  --enable-pjrt-compatibility
 ```
 
 On Mac, the tracking command defaults to `--device auto`, which uses PyTorch
@@ -289,6 +302,20 @@ shell arrays:
 - `configs/record_hinge.yaml`
 - `configs/record_drawer.yaml`
 - `configs/track_default.yaml`
+- `configs/identify_dynamics_default.yaml`
+- `configs/identify_dynamics_mjx_default.yaml`
+
+To append optional Stage 4 dynamics identification to the batch pipeline:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch \
+  configs/batch_lightwheel_microwaves.tsv \
+  --resume \
+  --jobs 2 \
+  --dynamics-backend mjx \
+  --dynamics-jax-platform metal \
+  --dynamics-enable-pjrt-compatibility
+```
 
 On Apple Silicon, the CoTracker stage is usually throughput-limited by a single
 MPS device. The batch runner therefore defaults to `--tracking-jobs 1` for
@@ -354,6 +381,10 @@ The package root keeps a small number of top-level entry points:
 - Per-part 6D pose estimation from 4D pointclouds
 - Joint type/axis/pivot inference from pose tracks
 - Inferred-articulation export back into URDF/MJCF
+- First-pass dynamics identification with pointcloud-sized inertial
+  initialization, trajectory error metrics, and optional rollout comparison
+  videos
+- MJX autodiff dynamics-identification scaffold on CPU
 - YAML/JSON driven CLI config expansion for long commands
 
 ## What Is Still Placeholder
@@ -361,4 +392,4 @@ The package root keeps a small number of top-level entry points:
 - Real RGB-D generative reconstruction
 - Real PARTICULATE invocation
 - Dense joint-aware RGB-D alignment
-- Full dynamics identification and contact modeling
+- Contact-rich dynamics identification

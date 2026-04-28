@@ -46,6 +46,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print local JAX + MuJoCo MJX capability diagnostics",
     )
     probe_mjx_parser.add_argument(
+        "--jax-platform",
+        choices=["cpu", "metal", "auto"],
+        default="cpu",
+        help="JAX backend selection before import. Default stays on CPU for predictable local/CI behavior.",
+    )
+    probe_mjx_parser.add_argument(
+        "--enable-pjrt-compatibility",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Set ENABLE_PJRT_COMPATIBILITY=1 before importing JAX. Defaults to on when --jax-platform metal.",
+    )
+    probe_mjx_parser.add_argument(
         "--no-rollout-test",
         action="store_true",
         help="Skip the tiny JIT + mjx.step smoke test",
@@ -180,6 +192,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-generate-viewer",
         action="store_true",
         help="Skip the final visualize-pointcloud stage",
+    )
+    batch_parser.add_argument(
+        "--dynamics-backend",
+        choices=["off", "mujoco", "mjx"],
+        default="off",
+        help="Optional Stage 4 dynamics identification backend run after joint inference",
+    )
+    batch_parser.add_argument(
+        "--dynamics-config",
+        type=Path,
+        default=None,
+        help="Optional YAML/JSON identify-dynamics template used when --dynamics-backend is enabled",
+    )
+    batch_parser.add_argument(
+        "--dynamics-jobs",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of concurrent dynamics stages. "
+            "Defaults to 1 for mjx and to --jobs for mujoco."
+        ),
+    )
+    batch_parser.add_argument(
+        "--dynamics-jax-platform",
+        choices=["cpu", "metal", "auto"],
+        default=None,
+        help="Optional override passed to identify-dynamics-mjx",
+    )
+    batch_parser.add_argument(
+        "--dynamics-enable-pjrt-compatibility",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Optional override passed to identify-dynamics-mjx",
     )
 
     # 4D pointcloud fusion and inspection.
@@ -471,6 +516,29 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not optimize joint frictionloss",
     )
+    dynamics_parser.add_argument(
+        "--enable-contact",
+        action="store_true",
+        help=(
+            "Enable MJCF geom contacts during dynamics rollout. "
+            "By default contacts are disabled because inferred part proxies can overlap."
+        ),
+    )
+    dynamics_parser.add_argument(
+        "--render-gl-backend",
+        choices=["auto", "cgl", "glfw", "osmesa", "egl", "none"],
+        default="auto",
+        help="MuJoCo GL backend for rollout comparison rendering. Use 'none' to disable video rendering.",
+    )
+    dynamics_parser.add_argument(
+        "--gravity-mode",
+        choices=["model", "zero"],
+        default="model",
+        help=(
+            "Gravity used during dynamics rollout. Use 'zero' to isolate joint inertia/damping "
+            "when inferred geometry produces spurious gravity torque."
+        ),
+    )
 
     dynamics_mjx_parser = subparsers.add_parser(
         "identify-dynamics-mjx",
@@ -479,6 +547,18 @@ def build_parser() -> argparse.ArgumentParser:
     dynamics_mjx_parser.add_argument("episode", type=Path, help="Path to episode.json")
     dynamics_mjx_parser.add_argument("articulation_artifact", type=Path, help="Path to articulation_artifact.json")
     dynamics_mjx_parser.add_argument("mjcf", type=Path, help="Path to the MJCF model to optimize")
+    dynamics_mjx_parser.add_argument(
+        "--jax-platform",
+        choices=["cpu", "metal", "auto"],
+        default="cpu",
+        help="JAX backend selection before importing JAX. Use 'metal' to request Apple GPU execution.",
+    )
+    dynamics_mjx_parser.add_argument(
+        "--enable-pjrt-compatibility",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Set ENABLE_PJRT_COMPATIBILITY=1 before importing JAX. Defaults to on when --jax-platform metal.",
+    )
     dynamics_mjx_parser.add_argument(
         "--output-dir",
         type=Path,
@@ -511,10 +591,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not optimize joint frictionloss",
     )
     dynamics_mjx_parser.add_argument(
+        "--enable-contact",
+        action="store_true",
+        help=(
+            "Enable MJCF geom contacts during MJX rollout. "
+            "By default contacts are disabled because inferred part proxies can overlap."
+        ),
+    )
+    dynamics_mjx_parser.add_argument(
         "--no-jit",
         action="store_true",
         help="Disable JAX JIT compilation for easier debugging",
     )
+    dynamics_mjx_parser.add_argument(
+        "--render-gl-backend",
+        choices=["auto", "cgl", "glfw", "osmesa", "egl", "none"],
+        default="auto",
+        help="MuJoCo GL backend for rollout comparison rendering. Use 'none' to disable video rendering.",
+    )
+
+    dynamics_plot_parser = subparsers.add_parser(
+        "plot-dynamics-identification",
+        help="Plot loss and parameter history from a dynamics_identification.json artifact",
+    )
+    dynamics_plot_parser.add_argument("input", type=Path, help="Path to dynamics_identification.json")
+    dynamics_plot_parser.add_argument(
+        "--output-svg",
+        type=Path,
+        default=None,
+        help="Where to write the SVG plot (defaults to optimization_history.svg next to the input)",
+    )
+    dynamics_plot_parser.add_argument(
+        "--linear-loss",
+        action="store_true",
+        help="Use a linear y-axis for the loss panel instead of log10 scale",
+    )
+    dynamics_plot_parser.add_argument("--width", type=int, default=1280, help="SVG width in pixels")
+    dynamics_plot_parser.add_argument("--height", type=int, default=760, help="SVG height in pixels")
 
     hunyuan_parser = subparsers.add_parser(
         "hunyuan3d-generate",
@@ -805,6 +918,50 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="Kick window duration in seconds (0 disables kick)",
     )
+    record_parser.add_argument(
+        "--excitation-mode",
+        choices=["none", "pulse", "prbs", "sine"],
+        default="none",
+        help=(
+            "Known generalized-force excitation for dynamics ID. "
+            "Use with --control-mode free to record a forced-response episode."
+        ),
+    )
+    record_parser.add_argument(
+        "--excitation-force",
+        type=float,
+        default=0.0,
+        help="Excitation generalized force amplitude, torque for hinge joints and force for slide joints",
+    )
+    record_parser.add_argument(
+        "--excitation-start-s",
+        type=float,
+        default=0.0,
+        help="Excitation window start time in seconds",
+    )
+    record_parser.add_argument(
+        "--excitation-duration-s",
+        type=float,
+        default=0.0,
+        help="Excitation window duration in seconds",
+    )
+    record_parser.add_argument(
+        "--excitation-period-s",
+        type=float,
+        default=0.25,
+        help="PRBS segment duration in seconds",
+    )
+    record_parser.add_argument(
+        "--excitation-frequency-hz",
+        type=float,
+        default=1.0,
+        help="Sine excitation frequency in Hz",
+    )
+    record_parser.add_argument(
+        "--no-dynamics-log",
+        action="store_true",
+        help="Do not write sim-rate dynamics_log.jsonl with q, qvel, and applied generalized force",
+    )
     record_parser.add_argument("--control-kp", type=float, default=30.0, help="Joint tracking P gain")
     record_parser.add_argument("--control-kd", type=float, default=3.0, help="Joint tracking D gain")
     record_parser.add_argument("--seed", type=int, default=0, help="Random seed")
@@ -912,7 +1069,11 @@ def main(argv: list[str] | None = None) -> int:
 
         print(
             json.dumps(
-                probe_mjx(run_rollout_test=not bool(args.no_rollout_test)),
+                probe_mjx(
+                    run_rollout_test=not bool(args.no_rollout_test),
+                    jax_platform=str(args.jax_platform),
+                    enable_pjrt_compatibility=args.enable_pjrt_compatibility,
+                ),
                 indent=2,
             )
         )
@@ -958,6 +1119,11 @@ def main(argv: list[str] | None = None) -> int:
                 min_tracks_per_part=max(3, int(args.min_tracks_per_part)),
                 mujoco_prior_mode=str(args.mujoco_prior),
                 generate_viewer=not bool(args.no_generate_viewer),
+                dynamics_backend=str(args.dynamics_backend),
+                dynamics_config=args.dynamics_config,
+                dynamics_jobs=args.dynamics_jobs,
+                dynamics_jax_platform=args.dynamics_jax_platform,
+                dynamics_enable_pjrt_compatibility=args.dynamics_enable_pjrt_compatibility,
             )
         ).run()
         print(json.dumps(result, indent=2))
@@ -1090,6 +1256,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "identify-dynamics":
+        if args.render_gl_backend not in {"auto", "none"}:
+            import os
+
+            os.environ["MUJOCO_GL"] = str(args.render_gl_backend)
         from .dynamics.system_id import DynamicsIdentificationConfig, DynamicsIdentifier
 
         artifact_path = DynamicsIdentifier().run(
@@ -1107,14 +1277,26 @@ def main(argv: list[str] | None = None) -> int:
                 optimize_mass=not bool(args.no_optimize_mass),
                 optimize_damping=not bool(args.no_optimize_damping),
                 optimize_friction=not bool(args.no_optimize_friction),
+                enable_contact=bool(args.enable_contact),
+                render_gl_backend=str(args.render_gl_backend),
+                gravity_mode=str(args.gravity_mode),
             )
         )
         print(json.dumps({"dynamics_identification_artifact": str(artifact_path.resolve())}, indent=2))
         return 0
 
     if args.command == "identify-dynamics-mjx":
+        if args.render_gl_backend not in {"auto", "none"}:
+            import os
+
+            os.environ["MUJOCO_GL"] = str(args.render_gl_backend)
+        from .core.jax_runtime import configure_jax_runtime
         from .dynamics.system_id_mjx import MJXDynamicsIdentificationConfig, MJXDynamicsIdentifier
 
+        configure_jax_runtime(
+            platform=str(args.jax_platform),
+            enable_pjrt_compatibility=args.enable_pjrt_compatibility,
+        )
         artifact_path = MJXDynamicsIdentifier().run(
             MJXDynamicsIdentificationConfig(
                 episode_path=args.episode,
@@ -1130,10 +1312,29 @@ def main(argv: list[str] | None = None) -> int:
                 optimize_mass=not bool(args.no_optimize_mass),
                 optimize_damping=not bool(args.no_optimize_damping),
                 optimize_friction=not bool(args.no_optimize_friction),
+                enable_contact=bool(args.enable_contact),
                 jit=not bool(args.no_jit),
+                jax_platform=str(args.jax_platform),
+                enable_pjrt_compatibility=args.enable_pjrt_compatibility,
+                render_gl_backend=str(args.render_gl_backend),
             )
         )
         print(json.dumps({"dynamics_identification_artifact": str(artifact_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "plot-dynamics-identification":
+        from .dynamics.plotting import DynamicsOptimizationPlotConfig, DynamicsOptimizationPlotter
+
+        output_svg = DynamicsOptimizationPlotter().plot(
+            DynamicsOptimizationPlotConfig(
+                input_path=args.input,
+                output_svg=args.output_svg,
+                log_loss=not bool(args.linear_loss),
+                width=max(720, int(args.width)),
+                height=max(480, int(args.height)),
+            )
+        )
+        print(json.dumps({"optimization_history_svg": str(output_svg.resolve())}, indent=2))
         return 0
 
     if args.command == "hunyuan3d-generate":
@@ -1230,6 +1431,16 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--kick-duration-s must be >= 0")
         if args.kick_duration_s == 0.0 and args.kick_force != 0.0:
             parser.error("--kick-force requires --kick-duration-s > 0")
+        if args.excitation_start_s < 0.0:
+            parser.error("--excitation-start-s must be >= 0")
+        if args.excitation_duration_s < 0.0:
+            parser.error("--excitation-duration-s must be >= 0")
+        if args.excitation_mode != "none" and args.excitation_duration_s <= 0.0:
+            parser.error("--excitation-duration-s must be > 0 when --excitation-mode is not none")
+        if args.excitation_period_s <= 0.0:
+            parser.error("--excitation-period-s must be positive")
+        if args.excitation_frequency_hz <= 0.0:
+            parser.error("--excitation-frequency-hz must be positive")
 
         if args.all_joints and (args.joint_name is not None or args.joint_id is not None):
             parser.error("--all-joints cannot be combined with --joint-name/--joint-id")
@@ -1271,6 +1482,13 @@ def main(argv: list[str] | None = None) -> int:
             kick_force=args.kick_force,
             kick_start_s=args.kick_start_s,
             kick_duration_s=args.kick_duration_s,
+            excitation_mode=args.excitation_mode,
+            excitation_force=float(args.excitation_force),
+            excitation_start_s=float(args.excitation_start_s),
+            excitation_duration_s=float(args.excitation_duration_s),
+            excitation_period_s=float(args.excitation_period_s),
+            excitation_frequency_hz=float(args.excitation_frequency_hz),
+            write_dynamics_log=not bool(args.no_dynamics_log),
             make_video=bool(args.video),
             video_fps=args.video_fps,
             segmentation_masks=bool(args.segmentation_masks),

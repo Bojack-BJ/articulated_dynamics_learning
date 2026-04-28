@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from rgbd_urdf_mvp.cli import build_parser
 from rgbd_urdf_mvp.batch.articulation_pipeline import (
     build_cli_argv_from_template,
     infer_joint_name,
@@ -91,6 +92,25 @@ class ArticulationBatchTests(unittest.TestCase):
             self.assertIn("4", argv)
             device_index = argv.index("--device")
             self.assertEqual(argv[device_index + 1], "mps")
+
+    def test_run_articulation_batch_parser_accepts_dynamics_arguments(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "run-articulation-batch",
+                "configs/batch_objects_example.tsv",
+                "--dynamics-backend",
+                "mjx",
+                "--dynamics-jax-platform",
+                "metal",
+                "--dynamics-enable-pjrt-compatibility",
+            ]
+        )
+
+        self.assertEqual(args.command, "run-articulation-batch")
+        self.assertEqual(args.dynamics_backend, "mjx")
+        self.assertEqual(args.dynamics_jax_platform, "metal")
+        self.assertTrue(args.dynamics_enable_pjrt_compatibility)
 
 
 if __name__ == "__main__":

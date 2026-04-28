@@ -29,6 +29,10 @@ DEFAULT_RECORD_CONFIG_BY_CATEGORY = {
     "drawer": PROJECT_ROOT / "configs" / "record_drawer.yaml",
 }
 DEFAULT_TRACK_CONFIG = PROJECT_ROOT / "configs" / "track_default.yaml"
+DEFAULT_DYNAMICS_CONFIG_BY_BACKEND = {
+    "mujoco": PROJECT_ROOT / "configs" / "identify_dynamics_default.yaml",
+    "mjx": PROJECT_ROOT / "configs" / "identify_dynamics_mjx_default.yaml",
+}
 
 PREFERRED_JOINT_TOKENS = {
     "microwave": ("micro", "door", "hinge"),
@@ -56,11 +60,18 @@ class BatchObjectArtifacts:
     poses_json: Path
     joints_json: Path
     viewer_html: Path
+    inferred_articulation_dir: Path
+    articulation_artifact_json: Path
+    mjcf_xml: Path
+    dynamics_json: Path
+    dynamics_mjx_json: Path
 
     @classmethod
     def for_object(cls, output_root: Path, object_id: str) -> "BatchObjectArtifacts":
         episode_dir = output_root / object_id
         pointcloud_dir = episode_dir / "pointcloud_4d_partseg"
+        inferred_articulation_dir = pointcloud_dir / "inferred_articulation"
+        urdf_dir = inferred_articulation_dir / "urdf"
         return cls(
             episode_dir=episode_dir,
             episode_json=episode_dir / "episode.json",
@@ -70,6 +81,11 @@ class BatchObjectArtifacts:
             poses_json=pointcloud_dir / "part_poses.json",
             joints_json=pointcloud_dir / "joint_inference.json",
             viewer_html=pointcloud_dir / "viewer_pose_flow.html",
+            inferred_articulation_dir=inferred_articulation_dir,
+            articulation_artifact_json=inferred_articulation_dir / "articulation_artifact.json",
+            mjcf_xml=urdf_dir / f"{object_id}.mjcf.xml",
+            dynamics_json=urdf_dir / "dynamics_identification" / "dynamics_identification.json",
+            dynamics_mjx_json=urdf_dir / "dynamics_identification_mjx" / "dynamics_identification.json",
         )
 
 
@@ -93,6 +109,11 @@ class ArticulationBatchConfig:
     min_tracks_per_part: int = 4
     mujoco_prior_mode: str = "off"
     generate_viewer: bool = True
+    dynamics_backend: str = "off"
+    dynamics_config: Path | None = None
+    dynamics_jobs: int | None = None
+    dynamics_jax_platform: str | None = None
+    dynamics_enable_pjrt_compatibility: bool | None = None
 
 
 class ArticulationBatchRunner:
@@ -107,6 +128,10 @@ class ArticulationBatchRunner:
         default_tracking_jobs = 1 if effective_track_device in {"auto", "mps", "cuda"} else max(1, config.jobs)
         self._tracking_jobs = max(1, int(config.tracking_jobs or default_tracking_jobs))
         self._tracking_semaphore = threading.Semaphore(self._tracking_jobs)
+        dynamics_backend = str(config.dynamics_backend or "off").lower()
+        default_dynamics_jobs = 1 if dynamics_backend == "mjx" else max(1, config.jobs)
+        self._dynamics_jobs = max(1, int(config.dynamics_jobs or default_dynamics_jobs))
+        self._dynamics_semaphore = threading.Semaphore(self._dynamics_jobs)
 
     def run(self) -> dict[str, Any]:
         specs = parse_batch_manifest(self._manifest_path)
@@ -114,11 +139,13 @@ class ArticulationBatchRunner:
         failures: list[str] = []
         completed = 0
         skipped = 0
+        terminal_stage = self._terminal_stage_name()
 
         if self.config.jobs <= 1:
             self._console(
                 f"Queued {total} objects from {self._manifest_path} "
-                f"(jobs=1, tracking_jobs={self._tracking_jobs}, output_root={self._output_root})"
+                f"(jobs=1, tracking_jobs={self._tracking_jobs}, dynamics_jobs={self._dynamics_jobs}, "
+                f"terminal_stage={terminal_stage}, output_root={self._output_root})"
             )
             for index, spec in enumerate(specs, start=1):
                 result = self._process_object(spec, index=index, total=total, stream=sys.stdout)
@@ -138,7 +165,8 @@ class ArticulationBatchRunner:
         self._batch_log_dir.mkdir(parents=True, exist_ok=True)
         self._console(
             f"Queued {total} objects from {self._manifest_path} "
-            f"(jobs={self.config.jobs}, tracking_jobs={self._tracking_jobs}, logs={self._batch_log_dir})"
+            f"(jobs={self.config.jobs}, tracking_jobs={self._tracking_jobs}, dynamics_jobs={self._dynamics_jobs}, "
+            f"terminal_stage={terminal_stage}, logs={self._batch_log_dir})"
         )
         with ThreadPoolExecutor(max_workers=self.config.jobs) as executor:
             future_map = {}
@@ -187,7 +215,7 @@ class ArticulationBatchRunner:
 
     def _process_object(self, spec: BatchObjectSpec, index: int, total: int, stream: TextIO) -> str:
         artifacts = BatchObjectArtifacts.for_object(self._output_root, spec.object_id)
-        terminal_artifact = artifacts.viewer_html if self.config.generate_viewer else artifacts.joints_json
+        terminal_artifact = self._terminal_artifact(artifacts)
         if self.config.skip_existing and terminal_artifact.exists():
             self._announce(
                 spec.object_id,
@@ -337,6 +365,67 @@ class ArticulationBatchRunner:
                 stream,
             )
 
+        if self.config.dynamics_backend != "off":
+            export_ready = artifacts.articulation_artifact_json.exists() and artifacts.mjcf_xml.exists()
+            if self.config.resume and export_ready:
+                self._announce(
+                    spec.object_id,
+                    index,
+                    total,
+                    f"resume: skip export-inferred-articulation; found {artifacts.articulation_artifact_json}",
+                    stream,
+                )
+            else:
+                self._announce(spec.object_id, index, total, "export-inferred-articulation", stream)
+                self._run_cli(
+                    [
+                        "export-inferred-articulation",
+                        str(artifacts.episode_json),
+                        str(artifacts.poses_json),
+                        str(artifacts.joints_json),
+                        "--output-dir",
+                        str(artifacts.inferred_articulation_dir),
+                    ],
+                    stream,
+                )
+
+            dynamics_artifact = self._dynamics_artifact(artifacts)
+            if self._should_skip(dynamics_artifact):
+                self._announce(
+                    spec.object_id,
+                    index,
+                    total,
+                    f"resume: skip identify-dynamics-{self.config.dynamics_backend}; found {dynamics_artifact}",
+                    stream,
+                )
+            else:
+                self._validate_dynamics_inputs()
+                self._announce(
+                    spec.object_id,
+                    index,
+                    total,
+                    f"waiting for dynamics slot ({self._dynamics_jobs} max)",
+                    stream,
+                )
+                with self._dynamics_semaphore:
+                    self._announce(spec.object_id, index, total, f"identify-dynamics-{self.config.dynamics_backend}", stream)
+                    dynamics_overrides: dict[str, Any] = {
+                        "episode": artifacts.episode_json,
+                        "articulation_artifact": artifacts.articulation_artifact_json,
+                        "mjcf": artifacts.mjcf_xml,
+                        "output-dir": dynamics_artifact.parent,
+                    }
+                    if self.config.dynamics_backend == "mjx":
+                        if self.config.dynamics_jax_platform is not None:
+                            dynamics_overrides["jax-platform"] = self.config.dynamics_jax_platform
+                        if self.config.dynamics_enable_pjrt_compatibility is not None:
+                            dynamics_overrides["enable-pjrt-compatibility"] = self.config.dynamics_enable_pjrt_compatibility
+                    dynamics_argv = build_cli_argv_from_template(
+                        self._resolve_dynamics_config_path(),
+                        dynamics_overrides,
+                    )
+                    self._run_cli(dynamics_argv, stream)
+
         if self.config.generate_viewer:
             if self._should_skip(artifacts.viewer_html):
                 self._announce(
@@ -368,6 +457,19 @@ class ArticulationBatchRunner:
     def _should_skip(self, output_path: Path) -> bool:
         return bool(self.config.resume and output_path.exists())
 
+    def _terminal_stage_name(self) -> str:
+        if self.config.dynamics_backend != "off":
+            return f"identify-dynamics-{self.config.dynamics_backend}"
+        return "visualize-pointcloud" if self.config.generate_viewer else "infer-joints"
+
+    def _terminal_artifact(self, artifacts: BatchObjectArtifacts) -> Path:
+        if self.config.dynamics_backend != "off":
+            return self._dynamics_artifact(artifacts)
+        return artifacts.viewer_html if self.config.generate_viewer else artifacts.joints_json
+
+    def _dynamics_artifact(self, artifacts: BatchObjectArtifacts) -> Path:
+        return artifacts.dynamics_mjx_json if self.config.dynamics_backend == "mjx" else artifacts.dynamics_json
+
     def _resolve_record_config_path(self, category: str) -> Path:
         if self.config.record_config is not None:
             return resolve_project_path(self.config.record_config)
@@ -383,6 +485,19 @@ class ArticulationBatchRunner:
         if self.config.track_config is not None:
             return resolve_project_path(self.config.track_config)
         return DEFAULT_TRACK_CONFIG
+
+    def _resolve_dynamics_config_path(self) -> Path:
+        if self.config.dynamics_backend == "off":
+            raise ValueError("No dynamics config is needed when dynamics_backend='off'.")
+        if self.config.dynamics_config is not None:
+            return resolve_project_path(self.config.dynamics_config)
+        config_path = DEFAULT_DYNAMICS_CONFIG_BY_BACKEND.get(self.config.dynamics_backend)
+        if config_path is None:
+            raise ValueError(
+                f"No dynamics preset for backend '{self.config.dynamics_backend}'. "
+                "Add a YAML preset under configs/ and map it in DEFAULT_DYNAMICS_CONFIG_BY_BACKEND."
+            )
+        return config_path
 
     def _template_track_device(self) -> str | None:
         config_path = self._resolve_track_config_path()
@@ -428,6 +543,13 @@ class ArticulationBatchRunner:
             raise FileNotFoundError(f"CoTracker repo does not exist: {self.config.cotracker_repo}")
         if self.config.cotracker_checkpoint is not None and not resolve_project_path(self.config.cotracker_checkpoint).is_file():
             raise FileNotFoundError(f"CoTracker checkpoint does not exist: {self.config.cotracker_checkpoint}")
+
+    def _validate_dynamics_inputs(self) -> None:
+        if self.config.dynamics_backend == "off":
+            return
+        dynamics_config_path = self._resolve_dynamics_config_path()
+        if not dynamics_config_path.exists():
+            raise FileNotFoundError(f"Dynamics config does not exist: {dynamics_config_path}")
 
     def _run_cli(self, argv: list[str], stream: TextIO) -> None:
         command = [sys.executable, "-m", "rgbd_urdf_mvp", *argv]
