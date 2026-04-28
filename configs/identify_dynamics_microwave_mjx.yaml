@@ -9,3 +9,6 @@ args:
   q-weight: 1.0
   qdot-weight: 0.05
   prior-weight: 0.02
+  jax-platform: metal
+  enable-pjrt-compatibility: true
+  render-gl-backend: cgl

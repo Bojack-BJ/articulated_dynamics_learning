@@ -5,6 +5,8 @@ import subprocess
 import sys
 from typing import Any
 
+from .jax_runtime import configure_jax_runtime, detect_jax_metal
+
 
 def _sw_vers() -> dict[str, str] | None:
     if platform.system() != "Darwin":
@@ -27,7 +29,12 @@ def _sw_vers() -> dict[str, str] | None:
     return parsed or None
 
 
-def probe_mjx(run_rollout_test: bool = True) -> dict[str, Any]:
+def probe_mjx(
+    run_rollout_test: bool = True,
+    *,
+    jax_platform: str = "cpu",
+    enable_pjrt_compatibility: bool | None = None,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "ok": False,
         "system": {
@@ -36,6 +43,11 @@ def probe_mjx(run_rollout_test: bool = True) -> dict[str, Any]:
             "python": sys.version,
             "sw_vers": _sw_vers(),
         },
+        "runtime": configure_jax_runtime(
+            platform=jax_platform,
+            enable_pjrt_compatibility=enable_pjrt_compatibility,
+        ),
+        "jax_metal": detect_jax_metal(),
     }
     try:
         import jax
@@ -92,8 +104,11 @@ def probe_mjx(run_rollout_test: bool = True) -> dict[str, Any]:
         mj_model = mujoco.MjModel.from_xml_string(xml)
         mj_data = mujoco.MjData(mj_model)
         mj_data.qvel[0] = 1.0
-        mx = mjx.put_model(mj_model)
-        dx = mjx.put_data(mj_model, mj_data)
+        jax_device = jax.devices()[0]
+        # MuJoCo MJX currently does not auto-resolve Apple's METAL backend, but
+        # its JAX implementation works once the device/impl pair is explicit.
+        mx = mjx.put_model(mj_model, impl="jax", device=jax_device)
+        dx = mjx.put_data(mj_model, mj_data, impl="jax", device=jax_device)
         stepped = jax.jit(mjx.step)(mx, dx)
         payload["rollout_test"] = {
             "ok": True,
@@ -107,4 +122,14 @@ def probe_mjx(run_rollout_test: bool = True) -> dict[str, Any]:
             "error_type": type(exc).__name__,
             "error": str(exc),
         }
+        if (
+            str(payload.get("runtime", {}).get("requested_platform", "")).lower() == "metal"
+            and "default_memory_space" in str(exc)
+        ):
+            payload["rollout_test"]["hint"] = (
+                "Metal backend initialized, but MJX rollout failed during JAX device placement. "
+                "This usually indicates a jax-metal/jax compatibility issue. "
+                "Use --jax-platform cpu as the safe fallback, or try a dedicated Metal environment "
+                "with a known-good pinned jax/jaxlib/jax-metal stack."
+            )
     return payload

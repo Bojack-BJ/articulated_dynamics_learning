@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,6 +66,10 @@ class MJXDynamicsIdentificationTests(unittest.TestCase):
                 "6",
                 "--learning-rate",
                 "0.1",
+                "--jax-platform",
+                "metal",
+                "--enable-pjrt-compatibility",
+                "--enable-contact",
                 "--no-jit",
             ]
         )
@@ -74,10 +79,14 @@ class MJXDynamicsIdentificationTests(unittest.TestCase):
         self.assertEqual(args.mjcf, Path("model.mjcf.xml"))
         self.assertEqual(args.max_iterations, 6)
         self.assertAlmostEqual(args.learning_rate, 0.1)
+        self.assertEqual(args.jax_platform, "metal")
+        self.assertTrue(args.enable_pjrt_compatibility)
+        self.assertTrue(args.enable_contact)
         self.assertTrue(args.no_jit)
 
     def test_identify_dynamics_mjx_writes_outputs_when_jax_is_available(self) -> None:
         try:
+            os.environ["JAX_PLATFORMS"] = "cpu"
             import jax  # noqa: F401
             from mujoco import mjx  # noqa: F401
         except Exception:
@@ -117,6 +126,7 @@ class MJXDynamicsIdentificationTests(unittest.TestCase):
                             "control_mode": "free",
                             "sim_dt": 0.01,
                             "frame_dt": 0.02,
+                            "model_path": str(model_path),
                         },
                     },
                     indent=2,
@@ -172,6 +182,7 @@ class MJXDynamicsIdentificationTests(unittest.TestCase):
                     articulation_artifact_path=articulation_path,
                     mjcf_path=model_path,
                     output_dir=root / "dynamics_identification_mjx",
+                    jax_platform="cpu",
                     max_iterations=3,
                     learning_rate=0.05,
                     jit=False,
@@ -185,6 +196,16 @@ class MJXDynamicsIdentificationTests(unittest.TestCase):
             self.assertGreaterEqual(len(history), 1)
             self.assertEqual(artifact["source"], "mjx-autodiff-system-id")
             self.assertEqual(artifact["optimizer"]["method"], "jax-adam-autodiff-forward-mode")
+            self.assertFalse(artifact["simulation_options"]["enable_contact"])
+            optimized_text = Path(artifact["mjcf_optimized_path"]).read_text(encoding="utf-8")
+            self.assertIn('contype="0"', optimized_text)
+            self.assertIn('conaffinity="0"', optimized_text)
+            self.assertIn("trajectory_error", artifact["fit_metrics"])
+            self.assertIn("ground_truth_comparison", artifact)
+            self.assertIn("render_artifacts", artifact)
+            self.assertTrue(artifact["ground_truth_comparison"]["available"])
+            self.assertIn("overflow_penalty", artifact["fit_metrics"]["loss_breakdown"])
+            self.assertIn("invalid_sample_count", artifact["fit_metrics"]["loss_breakdown"])
 
 
 if __name__ == "__main__":

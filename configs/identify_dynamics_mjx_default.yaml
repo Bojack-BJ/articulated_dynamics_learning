@@ -1,0 +1,9 @@
+command: identify-dynamics-mjx
+args:
+  max-iterations: 10
+  learning-rate: 0.05
+  q-weight: 1.0
+  qdot-weight: 0.05
+  prior-weight: 0.02
+  jax-platform: cpu
+  render-gl-backend: none

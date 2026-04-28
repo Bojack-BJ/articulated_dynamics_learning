@@ -50,6 +50,16 @@ pip install --upgrade jax
 
 If you specifically want Apple GPU execution, follow the current official JAX
 installation page rather than hardcoding an outdated plugin recipe here.
+In this project, the practical path is:
+
+```bash
+python -m pip install jax-metal
+PYTHONPATH=src python -m rgbd_urdf_mvp probe-mjx --jax-platform metal --enable-pjrt-compatibility --no-rollout-test
+```
+
+The repository defaults MJX commands to `--jax-platform cpu` even when
+`jax-metal` is installed. This avoids accidental crashes in headless or
+sandboxed environments where the Apple GPU is not visible.
 
 ## Probe
 
@@ -70,6 +80,7 @@ If you only want import/backend information:
 
 ```bash
 PYTHONPATH=src python -m rgbd_urdf_mvp probe-mjx --no-rollout-test
+PYTHONPATH=src python -m rgbd_urdf_mvp probe-mjx --jax-platform metal --enable-pjrt-compatibility --no-rollout-test
 ```
 
 ## Intended Next Step
@@ -90,18 +101,28 @@ Run it with:
 PYTHONPATH=src python -m rgbd_urdf_mvp identify-dynamics-mjx \
   outputs/recordings/$OBJECT_ID/episode.json \
   outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/articulation_artifact.json \
-  outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/urdf/$OBJECT_ID.mjcf.xml
+  outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/urdf/$OBJECT_ID.mjcf.xml \
+  --jax-platform metal \
+  --enable-pjrt-compatibility
 ```
 
 The current implementation uses:
 
 - `mjx.put_model` / `mjx.put_data`
 - differentiable rollout through `mjx.step`
-- JAX `value_and_grad`
+- JAX forward-mode autodiff via `jacfwd`
 - Adam-style first-order updates on mass / damping / friction parameters
+
+On Metal, the project passes `impl="jax"` and the active JAX device explicitly
+into `mjx.put_model` / `mjx.put_data`. This works around MuJoCo MJX's current
+auto-device resolver, which does not yet recognize the `METAL` backend.
 
 It still lives alongside the MuJoCo finite-difference optimizer because:
 
 - C MuJoCo is still the easier baseline for single-scene debugging
 - the MJX path currently assumes a shared timestamp schedule
 - contact-rich replay and control replay are not implemented yet
+- some `jax-metal` / `jax` combinations still fail during device upload with
+  `default_memory_space is not supported`; when that happens, fall back to
+  `--jax-platform cpu` or use a dedicated Metal environment with a known-good
+  pinned stack
