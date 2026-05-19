@@ -6,8 +6,11 @@ from pathlib import Path
 
 from rgbd_urdf_mvp.cli import build_parser
 from rgbd_urdf_mvp.batch.articulation_pipeline import (
+    UsdMjcfBatchConfig,
+    UsdMjcfBatchConverter,
     build_cli_argv_from_template,
     infer_joint_name,
+    mjcf_output_prefix_for_usd,
     parse_batch_manifest,
 )
 
@@ -104,6 +107,9 @@ class ArticulationBatchTests(unittest.TestCase):
                 "--dynamics-jax-platform",
                 "metal",
                 "--dynamics-enable-pjrt-compatibility",
+                "--dynamics-render-gl-backend",
+                "cgl",
+                "--plot-dynamics",
             ]
         )
 
@@ -111,6 +117,59 @@ class ArticulationBatchTests(unittest.TestCase):
         self.assertEqual(args.dynamics_backend, "mjx")
         self.assertEqual(args.dynamics_jax_platform, "metal")
         self.assertTrue(args.dynamics_enable_pjrt_compatibility)
+        self.assertEqual(args.dynamics_render_gl_backend, "cgl")
+        self.assertTrue(args.plot_dynamics)
+
+    def test_convert_usd_mjcf_batch_parser_accepts_arguments(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "convert-usd-mjcf-batch",
+                "configs/batch_objects_example.tsv",
+                "--output-dir",
+                "outputs/converted_mjcf",
+                "--converted-manifest",
+                "configs/batch_converted.tsv",
+                "--jobs",
+                "2",
+                "--force",
+            ]
+        )
+
+        self.assertEqual(args.command, "convert-usd-mjcf-batch")
+        self.assertEqual(str(args.output_dir), "outputs/converted_mjcf")
+        self.assertEqual(str(args.converted_manifest), "configs/batch_converted.tsv")
+        self.assertEqual(args.jobs, 2)
+        self.assertTrue(args.force)
+
+    def test_usd_batch_converter_skips_existing_and_writes_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            usd_path = temp_path / "Cabinet001.usd"
+            usd_path.write_text("#usda 1.0\n", encoding="utf-8")
+            output_dir = temp_path / "mjcf"
+            output_dir.mkdir()
+            existing_xml = mjcf_output_prefix_for_usd(usd_path, output_dir).with_suffix(".xml")
+            existing_xml.write_text("<mujoco/>\n", encoding="utf-8")
+            manifest_path = temp_path / "batch.tsv"
+            manifest_path.write_text(
+                f"drawer\t{usd_path}\tcabinet001\tauto\n",
+                encoding="utf-8",
+            )
+            converted_manifest = temp_path / "converted.tsv"
+
+            result = UsdMjcfBatchConverter(
+                UsdMjcfBatchConfig(
+                    manifest_path=manifest_path,
+                    output_dir=output_dir,
+                    converted_manifest=converted_manifest,
+                )
+            ).run()
+
+            self.assertEqual(result["converted"], 0)
+            self.assertEqual(result["skipped_existing"], 1)
+            self.assertTrue(converted_manifest.exists())
+            self.assertIn(str(existing_xml), converted_manifest.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

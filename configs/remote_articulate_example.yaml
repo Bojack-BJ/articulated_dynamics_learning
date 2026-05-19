@@ -1,0 +1,15 @@
+command: remote-articulate-generate
+args:
+  server-url: https://your-remote-articulation-endpoint.example.com
+  image:
+    - path/to/front.png
+    - path/to/left.png
+    - path/to/right.png
+  image-views:
+    - front
+    - left
+    - right
+  output-dir: outputs/remote_articulation/object
+  num-inference-steps: 50
+  octree-resolution: 380
+  particulate-num-points: 102400

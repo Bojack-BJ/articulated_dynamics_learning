@@ -226,6 +226,50 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional override passed to identify-dynamics-mjx",
     )
+    batch_parser.add_argument(
+        "--dynamics-render-gl-backend",
+        choices=["auto", "cgl", "glfw", "osmesa", "egl", "none"],
+        default=None,
+        help="Optional render backend override passed to the dynamics stage",
+    )
+    batch_parser.add_argument(
+        "--plot-dynamics",
+        action="store_true",
+        help="Write optimization_history.svg after each completed dynamics identification artifact",
+    )
+
+    convert_batch_parser = subparsers.add_parser(
+        "convert-usd-mjcf-batch",
+        help="Convert USD assets in a batch manifest to MJCF XML before running articulation stages",
+    )
+    convert_batch_parser.add_argument(
+        "manifest",
+        type=Path,
+        help="Tab-separated manifest: category, model_path, object_id, joint_name",
+    )
+    convert_batch_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("examples") / "mujoco_models",
+        help="Directory for generated MJCF XML and OBJ folders",
+    )
+    convert_batch_parser.add_argument(
+        "--converted-manifest",
+        type=Path,
+        default=None,
+        help="Optional TSV to write with USD paths replaced by generated MJCF XML paths",
+    )
+    convert_batch_parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Maximum number of USD assets to convert concurrently",
+    )
+    convert_batch_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run conversion even when the target MJCF XML already exists",
+    )
 
     # 4D pointcloud fusion and inspection.
     fuse_parser = subparsers.add_parser(
@@ -672,6 +716,126 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Optional bearer token for a reverse proxy, tunnel, or API gateway",
+    )
+
+    particulate_parser = subparsers.add_parser(
+        "particulate-infer",
+        help="Run the Particulate submodule on a generated/reconstructed mesh and save a result manifest",
+    )
+    particulate_input = particulate_parser.add_mutually_exclusive_group(required=True)
+    particulate_input.add_argument("--mesh", type=Path, help="Input mesh path (.glb, .obj, or .ply)")
+    particulate_input.add_argument(
+        "--reconstruction-artifact",
+        type=Path,
+        help="Project reconstruction_artifact.json; uses its canonical_mesh_path",
+    )
+    particulate_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="Directory for Particulate outputs and particulate_result.json",
+    )
+    particulate_parser.add_argument(
+        "--particulate-root",
+        type=Path,
+        default=Path("Particulate"),
+        help="Path to the Particulate submodule checkout",
+    )
+    particulate_parser.add_argument(
+        "--python-bin",
+        default=os.environ.get("PARTICULATE_PYTHON", "python"),
+        help="Python executable for the Particulate environment, usually a CUDA GPU env",
+    )
+    particulate_parser.add_argument(
+        "--model-config",
+        default="configs/particulate-B.yaml",
+        help="Path passed to Particulate infer.py --model_config, relative to the submodule by default",
+    )
+    particulate_parser.add_argument("--ckpt-path", type=Path, default=None, help="Optional local Particulate checkpoint")
+    particulate_parser.add_argument(
+        "--up-dir",
+        choices=["X", "Y", "Z", "-X", "-Y", "-Z"],
+        default="-Z",
+        help="Input mesh up direction passed to Particulate",
+    )
+    particulate_parser.add_argument("--num-points", type=int, default=102400, help="Sample count for Particulate")
+    particulate_parser.add_argument(
+        "--min-part-confidence",
+        type=float,
+        default=0.0,
+        help="Minimum predicted part confidence passed to Particulate",
+    )
+    particulate_parser.add_argument(
+        "--no-strict",
+        action="store_true",
+        help="Disable Particulate strict connected-component refinement",
+    )
+    particulate_parser.add_argument("--animation-frames", type=int, default=50, help="Animated GLB frame count")
+    particulate_parser.add_argument("--no-export-urdf", action="store_true", help="Do not request URDF export")
+    particulate_parser.add_argument("--no-export-mjcf", action="store_true", help="Do not request MJCF export")
+    particulate_parser.add_argument("--no-eval", action="store_true", help="Do not request pred.npz evaluation artifact")
+    particulate_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write the project manifest without launching Particulate; useful for checking paths",
+    )
+
+    remote_articulation_parser = subparsers.add_parser(
+        "remote-articulate-generate",
+        help="Send observations to a remote Hunyuan3D+PARTICULATE server and unpack articulated outputs",
+    )
+    remote_articulation_parser.add_argument("--server-url", required=True, help="Remote articulation server URL")
+    remote_articulation_parser.add_argument("--output-dir", type=Path, required=True, help="Directory to unpack results into")
+    remote_articulation_parser.add_argument(
+        "--image",
+        type=Path,
+        nargs="+",
+        default=None,
+        help="One or more observation image paths",
+    )
+    remote_articulation_parser.add_argument(
+        "--image-views",
+        nargs="+",
+        choices=["front", "left", "right", "back"],
+        default=None,
+        help="View names matching --image order",
+    )
+    remote_articulation_parser.add_argument("--text", type=str, default=None, help="Optional text prompt")
+    remote_articulation_parser.add_argument("--texture", action="store_true", help="Request Hunyuan texture generation")
+    remote_articulation_parser.add_argument("--seed", type=int, default=1234, help="Hunyuan generation seed")
+    remote_articulation_parser.add_argument("--type", default="glb", help="Requested Hunyuan output type")
+    remote_articulation_parser.add_argument("--octree-resolution", type=int, default=None)
+    remote_articulation_parser.add_argument("--num-inference-steps", type=int, default=None)
+    remote_articulation_parser.add_argument("--guidance-scale", type=float, default=None)
+    remote_articulation_parser.add_argument("--face-count", type=int, default=None)
+    remote_articulation_parser.add_argument(
+        "--particulate-up-dir",
+        choices=["X", "Y", "Z", "-X", "-Y", "-Z"],
+        default="-Z",
+        help="Input mesh up direction passed to PARTICULATE on the server",
+    )
+    remote_articulation_parser.add_argument("--particulate-num-points", type=int, default=102400)
+    remote_articulation_parser.add_argument("--particulate-min-part-confidence", type=float, default=0.0)
+    remote_articulation_parser.add_argument(
+        "--particulate-no-strict",
+        action="store_true",
+        help="Disable PARTICULATE strict connected-component refinement",
+    )
+    remote_articulation_parser.add_argument("--timeout-s", type=float, default=3600.0)
+    remote_articulation_parser.add_argument("--poll-interval-s", type=float, default=5.0)
+    remote_articulation_parser.add_argument("--api-token", type=str, default=None)
+
+    compare_parser = subparsers.add_parser(
+        "compare-articulation-backends",
+        help="Summarize tracking joint inference and Particulate mesh articulation outputs side by side",
+    )
+    compare_parser.add_argument("tracking_joint_inference", type=Path, help="Path to joint_inference.json")
+    compare_parser.add_argument("particulate_result", type=Path, help="Path to particulate_result.json")
+    compare_parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Comparison output path (defaults next to particulate_result.json)",
     )
 
     # MuJoCo recording and mask generation.
@@ -1124,6 +1288,25 @@ def main(argv: list[str] | None = None) -> int:
                 dynamics_jobs=args.dynamics_jobs,
                 dynamics_jax_platform=args.dynamics_jax_platform,
                 dynamics_enable_pjrt_compatibility=args.dynamics_enable_pjrt_compatibility,
+                dynamics_render_gl_backend=args.dynamics_render_gl_backend,
+                plot_dynamics=bool(args.plot_dynamics),
+            )
+        ).run()
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "convert-usd-mjcf-batch":
+        from .batch.articulation_pipeline import UsdMjcfBatchConfig, UsdMjcfBatchConverter
+
+        if args.jobs < 1:
+            parser.error("--jobs must be a positive integer")
+        result = UsdMjcfBatchConverter(
+            UsdMjcfBatchConfig(
+                manifest_path=args.manifest,
+                output_dir=args.output_dir,
+                converted_manifest=args.converted_manifest,
+                jobs=int(args.jobs),
+                force=bool(args.force),
             )
         ).run()
         print(json.dumps(result, indent=2))
@@ -1366,6 +1549,81 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         print(json.dumps({"generated_model_path": str(output_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "particulate-infer":
+        from .perception.particulate_adapter import ParticulateInferenceConfig, ParticulateInferenceRunner
+
+        manifest_path = ParticulateInferenceRunner().run(
+            ParticulateInferenceConfig(
+                mesh_path=args.mesh,
+                reconstruction_artifact_path=args.reconstruction_artifact,
+                output_dir=args.output_dir,
+                particulate_root=args.particulate_root,
+                python_bin=args.python_bin,
+                model_config=args.model_config,
+                ckpt_path=args.ckpt_path,
+                up_dir=args.up_dir,
+                num_points=max(1, int(args.num_points)),
+                min_part_confidence=float(args.min_part_confidence),
+                strict=not bool(args.no_strict),
+                animation_frames=max(2, int(args.animation_frames)),
+                export_urdf=not bool(args.no_export_urdf),
+                export_mjcf=not bool(args.no_export_mjcf),
+                eval=not bool(args.no_eval),
+                dry_run=bool(args.dry_run),
+            )
+        )
+        print(json.dumps({"particulate_result": str(manifest_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "remote-articulate-generate":
+        from .perception.remote_articulation_client import RemoteArticulationClient, RemoteArticulationConfig
+
+        output_dir = RemoteArticulationClient(
+            server_url=args.server_url,
+            api_token=args.api_token,
+            timeout_s=min(float(args.timeout_s), 120.0),
+        ).generate(
+            RemoteArticulationConfig(
+                server_url=args.server_url,
+                output_dir=args.output_dir,
+                image_path=args.image,
+                image_views=args.image_views,
+                text=args.text,
+                texture=bool(args.texture),
+                seed=int(args.seed),
+                output_type=args.type,
+                octree_resolution=args.octree_resolution,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale,
+                face_count=args.face_count,
+                particulate_up_dir=args.particulate_up_dir,
+                particulate_num_points=max(1, int(args.particulate_num_points)),
+                particulate_min_part_confidence=float(args.particulate_min_part_confidence),
+                particulate_strict=not bool(args.particulate_no_strict),
+                timeout_s=float(args.timeout_s),
+                poll_interval_s=float(args.poll_interval_s),
+                api_token=args.api_token,
+            )
+        )
+        print(json.dumps({"remote_articulation_output_dir": str(output_dir.resolve())}, indent=2))
+        return 0
+
+    if args.command == "compare-articulation-backends":
+        from .perception.particulate_adapter import (
+            ArticulationBackendComparisonConfig,
+            ArticulationBackendComparator,
+        )
+
+        output_path = ArticulationBackendComparator().compare(
+            ArticulationBackendComparisonConfig(
+                tracking_joint_inference_path=args.tracking_joint_inference,
+                particulate_result_path=args.particulate_result,
+                output_json=args.output_json,
+            )
+        )
+        print(json.dumps({"articulation_backend_comparison": str(output_path.resolve())}, indent=2))
         return 0
 
     if args.command == "render-mujoco-masks":

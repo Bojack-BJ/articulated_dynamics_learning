@@ -1,0 +1,8 @@
+command: particulate-infer
+args:
+  mesh: outputs/generated/object.glb
+  output-dir: outputs/particulate/object
+  particulate-root: Particulate
+  python-bin: python
+  num-points: 102400
+  min-part-confidence: 0.0

@@ -40,6 +40,7 @@ PREFERRED_JOINT_TOKENS = {
     "drawer": ("drawer", "slide"),
     "door": ("door", "hinge"),
 }
+USD_MODEL_SUFFIXES = {".usd", ".usda", ".usdc"}
 
 
 @dataclass(frozen=True)
@@ -114,6 +115,141 @@ class ArticulationBatchConfig:
     dynamics_jobs: int | None = None
     dynamics_jax_platform: str | None = None
     dynamics_enable_pjrt_compatibility: bool | None = None
+    dynamics_render_gl_backend: str | None = None
+    plot_dynamics: bool = False
+
+
+@dataclass(frozen=True)
+class UsdMjcfBatchConfig:
+    manifest_path: Path
+    output_dir: Path = PROJECT_ROOT / "examples" / "mujoco_models"
+    converted_manifest: Path | None = None
+    jobs: int = 1
+    force: bool = False
+
+
+class UsdMjcfBatchConverter:
+    def __init__(self, config: UsdMjcfBatchConfig) -> None:
+        self.config = config
+        self._console_lock = threading.Lock()
+        self._manifest_path = config.manifest_path.expanduser().resolve()
+        self._output_dir = resolve_project_path(config.output_dir)
+
+    def run(self) -> dict[str, Any]:
+        specs = parse_batch_manifest(self._manifest_path)
+        total = len(specs)
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._console(f"Queued {total} objects from {self._manifest_path} for USD -> MJCF conversion")
+
+        results: dict[str, Path] = {}
+        skipped_xml = 0
+        converted = 0
+        skipped_existing = 0
+        failures: list[str] = []
+
+        if self.config.jobs <= 1:
+            for index, spec in enumerate(specs, start=1):
+                try:
+                    status, xml_path = self._process_object(spec, index=index, total=total)
+                except Exception as exc:
+                    failures.append(spec.object_id)
+                    self._console(f"[{spec.object_id} {index}/{total}] failed: {exc}", error=True)
+                    continue
+                results[spec.object_id] = xml_path
+                converted, skipped_existing, skipped_xml = _count_conversion_status(
+                    status, converted, skipped_existing, skipped_xml
+                )
+        else:
+            with ThreadPoolExecutor(max_workers=self.config.jobs) as executor:
+                future_map = {
+                    executor.submit(self._process_object, spec, index, total): (spec, index, total)
+                    for index, spec in enumerate(specs, start=1)
+                }
+                for future in as_completed(future_map):
+                    spec, index, total = future_map[future]
+                    try:
+                        status, xml_path = future.result()
+                    except Exception as exc:
+                        failures.append(spec.object_id)
+                        self._console(f"[{spec.object_id} {index}/{total}] failed: {exc}", error=True)
+                        continue
+                    results[spec.object_id] = xml_path
+                    converted, skipped_existing, skipped_xml = _count_conversion_status(
+                        status, converted, skipped_existing, skipped_xml
+                    )
+
+        converted_manifest_path = None
+        if self.config.converted_manifest is not None:
+            converted_manifest_path = resolve_project_path(self.config.converted_manifest)
+            converted_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            write_converted_manifest(specs, results, converted_manifest_path)
+            self._console(f"Wrote converted manifest: {converted_manifest_path}")
+
+        if failures:
+            raise RuntimeError(f"USD -> MJCF batch conversion failed for: {' '.join(failures)}")
+        return {
+            "manifest_path": str(self._manifest_path),
+            "objects_total": total,
+            "converted": converted,
+            "skipped_existing": skipped_existing,
+            "skipped_xml": skipped_xml,
+            "converted_manifest": str(converted_manifest_path) if converted_manifest_path else None,
+            "output_dir": str(self._output_dir),
+        }
+
+    def _process_object(self, spec: BatchObjectSpec, index: int, total: int) -> tuple[str, Path]:
+        model_path = resolve_project_path(spec.model_path)
+        suffix = model_path.suffix.lower()
+        if suffix == ".xml":
+            self._console(f"[{spec.object_id} {index}/{total}] already MJCF XML: {model_path}")
+            return "xml", model_path
+        if suffix not in USD_MODEL_SUFFIXES:
+            raise ValueError(f"Unsupported model path for USD -> MJCF batch conversion: {model_path}")
+
+        output_prefix = mjcf_output_prefix_for_usd(model_path, self._output_dir)
+        output_xml = output_prefix.with_suffix(".xml")
+        if output_xml.exists() and not self.config.force:
+            self._console(f"[{spec.object_id} {index}/{total}] skip existing MJCF: {output_xml}")
+            return "existing", output_xml
+
+        self._console(f"[{spec.object_id} {index}/{total}] converting {model_path} -> {output_xml}")
+        command = [
+            sys.executable,
+            "-m",
+            "rgbd_urdf_mvp.sim.usd_to_mjcf",
+            str(model_path),
+            "--category",
+            spec.category,
+            "--output-prefix",
+            str(output_prefix),
+        ]
+        subprocess.run(
+            command,
+            cwd=PROJECT_ROOT,
+            env=subprocess_env(),
+            text=True,
+            check=True,
+        )
+        return "converted", output_xml
+
+    def _console(self, message: str, error: bool = False) -> None:
+        with self._console_lock:
+            print(message, file=sys.stderr if error else sys.stdout, flush=True)
+
+
+def _count_conversion_status(
+    status: str,
+    converted: int,
+    skipped_existing: int,
+    skipped_xml: int,
+) -> tuple[int, int, int]:
+    if status == "converted":
+        converted += 1
+    elif status == "existing":
+        skipped_existing += 1
+    elif status == "xml":
+        skipped_xml += 1
+    return converted, skipped_existing, skipped_xml
 
 
 class ArticulationBatchRunner:
@@ -420,11 +556,35 @@ class ArticulationBatchRunner:
                             dynamics_overrides["jax-platform"] = self.config.dynamics_jax_platform
                         if self.config.dynamics_enable_pjrt_compatibility is not None:
                             dynamics_overrides["enable-pjrt-compatibility"] = self.config.dynamics_enable_pjrt_compatibility
+                    if self.config.dynamics_render_gl_backend is not None:
+                        dynamics_overrides["render-gl-backend"] = self.config.dynamics_render_gl_backend
                     dynamics_argv = build_cli_argv_from_template(
                         self._resolve_dynamics_config_path(),
                         dynamics_overrides,
                     )
                     self._run_cli(dynamics_argv, stream)
+
+            if self.config.plot_dynamics:
+                plot_path = dynamics_artifact.parent / "optimization_history.svg"
+                if self._should_skip(plot_path):
+                    self._announce(
+                        spec.object_id,
+                        index,
+                        total,
+                        f"resume: skip plot-dynamics-identification; found {plot_path}",
+                        stream,
+                    )
+                else:
+                    self._announce(spec.object_id, index, total, "plot-dynamics-identification", stream)
+                    self._run_cli(
+                        [
+                            "plot-dynamics-identification",
+                            str(dynamics_artifact),
+                            "--output-svg",
+                            str(plot_path),
+                        ],
+                        stream,
+                    )
 
         if self.config.generate_viewer:
             if self._should_skip(artifacts.viewer_html):
@@ -515,10 +675,10 @@ class ArticulationBatchRunner:
         suffix = resolved.suffix.lower()
         if suffix == ".xml":
             return resolved
-        if suffix != ".usd":
+        if suffix not in USD_MODEL_SUFFIXES:
             raise ValueError(f"Unsupported model path for batch pipeline: {resolved}")
         stem = resolved.stem
-        output_prefix = PROJECT_ROOT / "examples" / "mujoco_models" / stem
+        output_prefix = mjcf_output_prefix_for_usd(resolved)
         output_xml = output_prefix.with_suffix(".xml")
         if not output_xml.exists():
             self._log(stream, f"=== [{stem}] usd_to_mjcf ===")
@@ -576,11 +736,7 @@ class ArticulationBatchRunner:
         )
 
     def _subprocess_env(self) -> dict[str, str]:
-        env = dict(os.environ)
-        pythonpath_entries = [str(SRC_ROOT)]
-        if env.get("PYTHONPATH"):
-            pythonpath_entries.append(env["PYTHONPATH"])
-        env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+        env = subprocess_env()
         env["TORCH_HOME"] = str(self._torch_home)
         return env
 
@@ -639,6 +795,35 @@ def resolve_project_path(path: str | Path) -> Path:
     if candidate.is_absolute():
         return candidate.resolve()
     return (PROJECT_ROOT / candidate).resolve()
+
+
+def mjcf_output_prefix_for_usd(
+    usd_path: Path,
+    output_dir: Path | None = None,
+) -> Path:
+    base_dir = resolve_project_path(output_dir) if output_dir is not None else PROJECT_ROOT / "examples" / "mujoco_models"
+    return base_dir / usd_path.stem
+
+
+def subprocess_env() -> dict[str, str]:
+    env = dict(os.environ)
+    pythonpath_entries = [str(SRC_ROOT)]
+    if env.get("PYTHONPATH"):
+        pythonpath_entries.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+    return env
+
+
+def write_converted_manifest(
+    specs: list[BatchObjectSpec],
+    object_xml_paths: Mapping[str, Path],
+    output_path: Path,
+) -> None:
+    lines = ["# category\tmodel_path\tobject_id\tjoint_name"]
+    for spec in specs:
+        model_path = object_xml_paths.get(spec.object_id, resolve_project_path(spec.model_path))
+        lines.append(f"{spec.category}\t{model_path}\t{spec.object_id}\t{spec.joint_name}")
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def build_cli_argv_from_template(config_path: Path, overrides: Mapping[str, Any]) -> list[str]:
