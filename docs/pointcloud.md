@@ -94,16 +94,13 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp estimate-part-poses \
   --min-points-per-part 32
 ```
 
-The CoTracker path uses the original RGB-D episode and part masks. Install the
-optional tracking dependencies first:
+The CoTracker path uses the original RGB-D episode and part masks. Install the optional tracking dependencies first:
 
 ```bash
 python -m pip install -e ".[tracking]"
 ```
 
-On Mac, use `--device auto`, `--device mps`, or `--device cpu`. Do not pass
-`--device cuda` unless you are on a CUDA machine. The repository already ships
-with `co-tracker/` as a submodule, so initialize submodules after cloning:
+On Mac, use `--device auto`, `--device mps`, or `--device cpu`. Do not pass `--device cuda` unless you are on a CUDA machine. The repository already ships with `co-tracker/` as a submodule, so initialize submodules after cloning:
 
 ```bash
 git submodule update --init --recursive
@@ -124,8 +121,7 @@ TORCH_HOME="$PWD/.cache/torch" PYTHONPATH=src python3 -m rgbd_urdf_mvp track-par
   --max-tracks-per-part-view 128
 ```
 
-For a `60 Hz` recording, `--frame-stride 4` reduces CoTracker to roughly
-`15 Hz` while keeping the original episode files unchanged.
+For a `60 Hz` recording, `--frame-stride 4` reduces CoTracker to roughly `15 Hz` while keeping the original episode files unchanged.
 
 Then fit per-part SE(3) trajectories from those 3D correspondences:
 
@@ -157,9 +153,7 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp infer-joints \
 
 This writes `joint_inference.json` next to `part_poses.json` by default.
 
-When `part_tracks.json`, `part_poses.json`, and `joint_inference.json` are in
-the same directory as the input manifest, `visualize-pointcloud` now loads them
-automatically and exposes:
+When `part_tracks.json`, `part_poses.json`, and `joint_inference.json` are in the same directory as the input manifest, `visualize-pointcloud` now loads them automatically and exposes:
 
 - per-part pose overlays with the pose estimator source
 - per-part visibility filters

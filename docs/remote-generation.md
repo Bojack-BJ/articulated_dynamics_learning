@@ -1,7 +1,6 @@
 # Remote 3D Generation Server
 
-This project can call a remote Hunyuan3D API server from the Mac client and
-save the generated 3D asset locally.
+This project can call a remote Hunyuan3D API server from the Mac client and save the generated 3D asset locally.
 
 The intended setup is:
 
@@ -41,8 +40,7 @@ For an existing checkout:
 git submodule update --init --recursive
 ```
 
-If the Hunyuan3D server patch changes later, commit and push inside
-`Hunyuan3D-2/` first, then update the submodule pointer in this repository.
+If the Hunyuan3D server patch changes later, commit and push inside `Hunyuan3D-2/` first, then update the submodule pointer in this repository.
 
 ## Hunyuan3D API Shape
 
@@ -70,10 +68,7 @@ The patched `Hunyuan3D-2/api_server.py` in this workspace accepts:
 - single-view input as `image: "<base64>"`
 - multiview input as `image: {"front": "<base64>", "left": "<base64>", "right": "<base64>"}`
 
-This dict format matches Hunyuan3D's multiview pipeline examples. Use this
-project's submodule fork for deployment; a fresh upstream Hunyuan3D checkout
-will fail on multi-view requests because the upstream sample server only decodes
-a single base64 image string.
+This dict format matches Hunyuan3D's multiview pipeline examples. Use this project's submodule fork for deployment; a fresh upstream Hunyuan3D checkout will fail on multi-view requests because the upstream sample server only decodes a single base64 image string.
 
 ## GPU Server Usage
 
@@ -101,8 +96,7 @@ python api_server.py \
   --variant fp16
 ```
 
-For faster debugging, use `--subfolder hunyuan3d-dit-v2-mv-turbo` and lower the
-client `--num-inference-steps`.
+For faster debugging, use `--subfolder hunyuan3d-dit-v2-mv-turbo` and lower the client `--num-inference-steps`.
 
 ## Client Usage
 
@@ -131,9 +125,23 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp hunyuan3d-generate \
   --octree-resolution 380
 ```
 
-If `--image-views` is omitted for multiple images, the client uses
-`front left right back` truncated to the number of provided images. Prefer
-explicit `--image-views` whenever the camera order is not obvious.
+If `--image-views` is omitted for multiple images, the client uses `front left right back` truncated to the number of provided images. Prefer explicit `--image-views` whenever the camera order is not obvious.
+
+Generated `.glb` meshes can be passed directly to the PARTICULATE adapter:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp particulate-infer \
+  --mesh outputs/generated/object.glb \
+  --output-dir outputs/particulate/object \
+  --python-bin "$PARTICULATE_PYTHON"
+```
+
+See [particulate-integration.md](particulate-integration.md) for the full
+comparison workflow against the RGB-D tracking pipeline.
+
+For the production path where both Hunyuan3D and PARTICULATE run on the GPU
+server and the Mac only sends observations, use the combined remote server in
+[remote-articulation-server.md](remote-articulation-server.md).
 
 If your reverse proxy or tunnel enforces bearer-token auth:
 
@@ -173,15 +181,13 @@ args:
 
 ## Public Networking Recommendation
 
-Do not expose the raw sample FastAPI server directly to the public internet.
-It is a model demo server, not a hardened production API.
+Do not expose the raw sample FastAPI server directly to the public internet. It is a model demo server, not a hardened production API.
 
 Use one of these patterns instead.
 
 ### Option A: Cloudflare Tunnel
 
-Good default when the GPU machine is behind NAT or a university/company
-network.
+Good default when the GPU machine is behind NAT or a university/company network.
 
 On the GPU machine:
 
@@ -202,8 +208,7 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp hunyuan3d-generate \
   --output outputs/generated/object.glb
 ```
 
-For longer-term use, configure a named Cloudflare Tunnel and protect it with
-Cloudflare Access.
+For longer-term use, configure a named Cloudflare Tunnel and protect it with Cloudflare Access.
 
 ### Option B: Reverse Proxy On A Public VPS
 
@@ -230,8 +235,7 @@ gen.example.com {
 }
 ```
 
-Add authentication at the reverse proxy layer before using it outside a trusted
-network.
+Add authentication at the reverse proxy layer before using it outside a trusted network.
 
 ### Option C: Direct Public IP
 
@@ -257,9 +261,6 @@ unless the port is reachable only from a protected private network.
 ## Notes
 
 - The client uses Python stdlib `urllib`, so no extra HTTP dependency is needed.
-- The async API is safer for long generation jobs than waiting on a single
-  blocking HTTP response.
-- If generated files are large, make sure your tunnel/proxy allows large
-  request and response bodies.
-- If you add API auth in the Hunyuan3D server itself later, keep the same client
-  interface and enforce the token on the server side.
+- The async API is safer for long generation jobs than waiting on a single blocking HTTP response.
+- If generated files are large, make sure your tunnel/proxy allows large request and response bodies.
+- If you add API auth in the Hunyuan3D server itself later, keep the same client interface and enforce the token on the server side.

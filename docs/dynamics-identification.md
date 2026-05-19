@@ -1,40 +1,34 @@
 # Dynamics Identification
 
-This stage assumes the kinematic structure is already fixed:
+This document summarizes the current Stage 3 dynamics-identification path. Stage 3 starts after the kinematic structure has already been inferred and exported:
 
 ```text
 episode.json
   + articulation_artifact.json
   + inferred MJCF
-  -> identify-dynamics
-  -> identify-dynamics-mjx
+  -> identify-dynamics or identify-dynamics-mjx
   -> optimized mass / damping / frictionloss
   -> optimized MJCF + dynamics_identification.json
 ```
 
-The current implementation is an optimization-first MVP:
+The implementation is still an MVP, but the current baseline is usable for single-DOF door/drawer-style experiments. The most reliable path today is the MuJoCo finite-difference optimizer with known-force replay from a forced-response recording. The MJX path is available as a parallel autodiff backend, but CPU is the default because JAX Metal setup is environment-sensitive.
 
-- it loads the inferred MJCF into MuJoCo
-- it reads observed `q(t)` tracks from `articulation_artifact.json`
-- it re-simulates the free-motion or forced-excitation episode
-- it replays known generalized forces from `dynamics_log.jsonl` when the
-  recording provides one
-- it optimizes:
-  - moving-part mass
-  - joint damping
-  - joint frictionloss
-- it minimizes rollout mismatch in `q(t)` and `qdot(t)`
+## Current Capabilities
 
-It currently uses finite-difference gradient descent around MuJoCo rollouts.
-It is not exact end-to-end autodiff through MuJoCo.
-
-The parallel `identify-dynamics-mjx` path uses JAX autodiff through MuJoCo MJX
-rollouts. It keeps the same input/output contract so you can compare the two
-optimizers on the same object.
+- Load inferred MJCF from the Stage 2 articulation export.
+- Read observed `q(t)` and `qdot(t)` tracks from `articulation_artifact.json`.
+- Replay known generalized forces from `dynamics_log.jsonl` when the episode was recorded with `--excitation-mode`.
+- Optimize moving-part mass, joint damping, and joint frictionloss against rollout mismatch.
+- Disable contacts by default to avoid invalid contact forces from coarse proxy geometry.
+- Initialize inertial parameters from pointcloud-sized collision proxies instead of a fixed placeholder box.
+- Save an optimized MJCF with the fitted dynamics parameters.
+- Report `q/qdot` trajectory errors and simulator-GT parameter diagnostics when the source MJCF is available.
+- Render optimized rollout videos and side-by-side comparison videos when MuJoCo rendering is available.
+- Plot optimization history with one panel per loss metric and one panel per optimized parameter, including simulator-GT reference lines when available.
 
 ## Run It
 
-If you already exported inferred articulation:
+Finite-difference MuJoCo path:
 
 ```bash
 PYTHONPATH=src python3 -m rgbd_urdf_mvp identify-dynamics \
@@ -44,13 +38,13 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp identify-dynamics \
   --render-gl-backend cgl
 ```
 
-Or use the YAML example:
+YAML entry point:
 
 ```bash
 PYTHONPATH=src python3 -m rgbd_urdf_mvp configs/identify_dynamics_microwave.yaml
 ```
 
-For a torque-pulse episode, use the forced-response YAML:
+Forced-response microwave example:
 
 ```bash
 PYTHONPATH=src python3 -m rgbd_urdf_mvp configs/identify_dynamics_microwave_torque_pulse.yaml
@@ -63,17 +57,18 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp identify-dynamics-mjx \
   outputs/recordings/$OBJECT_ID/episode.json \
   outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/articulation_artifact.json \
   outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/urdf/$OBJECT_ID.mjcf.xml \
-  --jax-platform metal \
-  --enable-pjrt-compatibility
+  --jax-platform cpu
 ```
 
-Or use the MJX YAML example:
+Probe Metal before using it:
 
 ```bash
-PYTHONPATH=src python3 -m rgbd_urdf_mvp configs/identify_dynamics_microwave_mjx.yaml
+PYTHONPATH=src python3 -m rgbd_urdf_mvp probe-mjx --jax-platform metal --enable-pjrt-compatibility
 ```
 
-Outputs:
+## Outputs
+
+MuJoCo finite-difference output:
 
 ```text
 outputs/recordings/<object-id>/pointcloud_4d_partseg/dynamics_identification/
@@ -81,7 +76,10 @@ outputs/recordings/<object-id>/pointcloud_4d_partseg/dynamics_identification/
   <object-id>.mjcf.identified.xml
   simulated_view_<view-index>.mp4
   comparison_view_<view-index>.mp4
+  optimization_history.svg
 ```
+
+MJX autodiff output:
 
 ```text
 outputs/recordings/<object-id>/pointcloud_4d_partseg/dynamics_identification_mjx/
@@ -89,19 +87,7 @@ outputs/recordings/<object-id>/pointcloud_4d_partseg/dynamics_identification_mjx
   <object-id>.mjcf.identified.xml
 ```
 
-The JSON artifact includes:
-
-- optimizer history
-- best rollout loss
-- force replay diagnostics under `simulation_options.force_replay`
-- per-part mass estimates
-- per-joint damping / frictionloss estimates
-- observed joint trajectories
-- simulated trajectories from the best-fit model
-- trajectory error metrics for `q` and `qdot`
-- simulator-GT parameter diagnostics when the original MJCF is available,
-  including joint effective inertia error
-- optional rollout rendering artifacts
+The JSON artifact includes optimizer history, fitted parameters, observed/simulated trajectories, force-replay diagnostics, trajectory error metrics, simulator-GT parameter diagnostics, and optional render diagnostics.
 
 Plot optimizer history:
 
@@ -110,195 +96,53 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp plot-dynamics-identification \
   outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/dynamics_identification/dynamics_identification.json
 ```
 
-This writes `optimization_history.svg` next to the input artifact. Each loss
-metric gets its own panel, so `total_loss`, `q_mse`, `qdot_mse`, and optional
-`prior_penalty` are not overlaid. Each optimized mass/damping/friction
-parameter also gets its own panel. When simulator GT is available from the
-recording MJCF, the parameter panel includes a dashed horizontal ground-truth
-line. Use `--linear-loss` if you do not want the default log-scale loss plots.
+Use `--linear-loss` if you do not want log-scale loss panels.
 
-The inferred MJCF is initialized from the exported articulation proxies. When `export-inferred-articulation` can resolve the sibling `fusion_manifest.json`,
-those proxies are sized from the reference-frame fused pointcloud for each part. The artifact marks this with `metadata.source =
-"pointcloud-reference-bounds"`. If the pointcloud cannot be resolved, the
-exporter falls back to the bounds already stored in `part_poses.json`.
+## Current Validation Snapshot
 
-By default, dynamics identification disables MuJoCo contacts between the
-inferred proxy geoms. These proxy boxes are coarse geometry/inertial estimates
-and can overlap at the joint, so enabling contacts too early can cause the
-rollout to jam before the door/drawer reaches the observed state. The optimized
-MJCF written by this stage records that policy with `contype="0"` and
-`conaffinity="0"` on all geoms. Use `--enable-contact` only when the proxy
-geometry has been validated for contact-rich identification.
+The current microwave torque-pulse validation uses a separate forced-response recording, known generalized force replay, contact-disabled rollout, and `--gravity-mode zero` for hinge debugging.
 
-If the inferred proxy geometry or joint axis produces spurious gravity torque,
-use `--gravity-mode zero` for the identification rollout. This is useful for
-door-like vertical hinge tests where the intended dynamics are dominated by the
-known input torque, damping, and joint-axis inertia. The optimized MJCF records
-this choice with `<option gravity="0 0 0">`.
+Representative result for `microwave011_torque_pulse`:
 
-## Debugging History And Current Status
+- `q_rmse`: about `0.0089 rad`
+- `qdot_rmse`: about `0.033 rad/s`
+- damping relative error against simulator GT: `0.0`
+- frictionloss relative error against simulator GT: `0.0`
+- effective joint inertia relative error: about `5.2%`
+- raw body mass relative error remains large, about `87.9%`
+- raw body inertia relative error remains large, about `141%`
 
-This section records the important failure modes found during the microwave
-MVP. It is meant to prevent repeating the same conclusions when the pipeline is
-scaled to more objects.
+The large raw mass/inertia error is expected for now. The inferred MJCF uses pointcloud-derived proxy geometry, while the simulator GT uses the original asset body/mesh decomposition. For single-DOF dynamics, the more meaningful diagnostic is the effective joint inertia `M[dof,dof]`, because the observed motion constrains the inertia seen by the joint rather than the full body mass distribution.
 
-### 1. Collision Proxies Were Not Accurate Enough For Contact
+## Resolved Issues And Implemented Fixes
 
-The exported URDF/MJCF uses simple box proxies derived from part pointcloud
-bounds. These proxies are useful for a kinematic/collision placeholder, but
-they are not yet reliable contact geometry. In early dynamics rollouts the
-boxes overlapped near the hinge and MuJoCo contacts prevented the door from
-following the observed motion. The symptom was a comparison video where the
-door appeared stuck or jammed.
+| Issue | Why it mattered | Current solution |
+| --- | --- | --- |
+| Coarse proxy contacts jammed the rollout | Box proxies can overlap near hinges, so MuJoCo contact forces can stop the door before it follows the observed video. | Contacts are disabled by default in `identify-dynamics`; optimized MJCF geoms get `contype="0"` and `conaffinity="0"` unless `--enable-contact` is passed. |
+| Inertial initialization used fixed placeholders | A fixed box heuristic produced poor starting inertia and made mass diagnostics misleading. | Exported MJCF now initializes mass/inertia from pointcloud-sized part proxies when `fusion_manifest.json` is available. |
+| Passive free motion could not identify absolute mass | Free decay mostly constrains damping/effective-inertia ratios; many mass/damping pairs can fit the same trajectory. | Recorder supports forced-response episodes through `--excitation-mode pulse|prbs|sine` and writes sim-rate `dynamics_log.jsonl`. |
+| Forced-response recordings had polluted initial conditions | The old free-motion fallback could inject an unintended initial velocity even when testing known external force. | Excitation episodes respect `--initial-qvel 0.0`; forced-response configs use separate object ids, such as `microwave011_torque_pulse`. |
+| The optimizer ignored known applied forces | A torque-pulse episode was initially treated as autonomous motion, making fitted parameters meaningless. | `identify-dynamics` reads `dynamics_log.jsonl`, maps source joint names to inferred joint names, and replays forces into `qfrc_applied`. |
+| Finite-difference descent could start in a bad local basin | Joint limits, dry friction, and rollout discontinuities can make a local finite-difference step point the wrong way. | The optimizer now runs a coordinate-search warm start before local finite-difference gradient descent; optimization history should still be inspected. |
+| Geometry errors produced fake gravity torque | Small errors in inferred axis or center of mass can create gravity torques that the original source model did not effectively have. | `--gravity-mode zero` is available for door-like hinge debugging when the intended experiment is dominated by known input torque and damping. |
+| Rendering failed in sandbox/headless contexts | MuJoCo rendering may fail under sandboxed execution even when it works in the local GUI terminal. | Rendering is optional; the artifact stores `render_artifacts.available=false` and a reason instead of failing optimization. Use `--render-gl-backend cgl` locally on macOS. |
+| Loss/parameter plots were hard to read | Overlaying many metrics on one plot made optimizer behavior difficult to diagnose. | `plot-dynamics-identification` now writes one panel per loss metric and one panel per parameter, with GT reference lines when available. |
 
-Current behavior:
+## Recommended Validation Procedure
 
-- `identify-dynamics` disables geom contacts by default.
-- The optimized MJCF writes `contype="0"` and `conaffinity="0"` unless
-  `--enable-contact` is passed.
-- Contact-rich system ID is intentionally deferred until the collision proxies
-  are validated or replaced with better geometry.
+For a clean single-DOF dynamics experiment:
 
-### 2. Inertial Initialization Was Too Crude
-
-The first MJCF export used a fixed placeholder-like heuristic for inertial
-values. That made the starting effective joint inertia too far from the source
-model, and it also made mass comparisons misleading. The exporter now sizes
-the proxy boxes from the reference-frame fused pointcloud when
-`fusion_manifest.json` is available.
-
-Current behavior:
-
-- `articulation.json` records proxy metadata such as
-  `metadata.source = "pointcloud-reference-bounds"`.
-- The inferred MJCF initializes mass and diagonal inertia from those proxy
-  boxes.
-- The dynamics report compares both raw body mass/inertia and joint effective
-  inertia. For single-DOF behavior, joint effective inertia `M[dof,dof]` is the
-  more meaningful metric than body mass alone.
-
-### 3. Passive Free Motion Could Not Identify Absolute Mass
-
-A passive free-decay episode without known external input mostly constrains
-ratios such as damping/effective-inertia. Many different mass and damping
-combinations can produce similar trajectories. This is not an optimizer bug;
-it is an identifiability issue in the experiment design.
-
-Current behavior:
-
-- Free-motion recordings are still useful for checking `q(t)` extraction and
-  qualitative rollout behavior.
-- For parameter identification, use a forced-response episode with a known
-  generalized force.
-- The recorder now supports `--excitation-mode pulse|prbs|sine` and writes a
-  sim-rate `dynamics_log.jsonl`.
-
-### 4. Forced-Response Recording Needed Clean Initial Conditions
-
-The original free-mode recorder had a fallback initial velocity when
-`initial-qvel` was zero. That was helpful for passive motion, but it polluted
-forced-response recordings with an unknown impulse. The result was a mismatch
-between the intended known input and the actual initial state.
-
-Current behavior:
-
-- When `--excitation-mode` is not `none`, the recorder respects
-  `--initial-qvel 0.0`.
-- It does not auto-generate a fallback free initial velocity unless explicitly
-  requested through the free-motion settings.
-- The forced-response config writes a separate object id, for example
-  `microwave011_torque_pulse`, so it does not overwrite the free-motion
-  episode.
-
-### 5. The Optimizer Initially Ignored Known Forces
-
-The first dynamics identifier only replayed autonomous/free dynamics. Running
-it on a torque-pulse recording treated the observed forced response as if it
-were free motion, so the fitted parameters were not meaningful.
-
-Current behavior:
-
-- `identify-dynamics` reads `dynamics_log.jsonl` when available.
-- It maps recorded source joint names, such as `microjoint`, to inferred joint
-  names, such as `Microwave011_door_joint`, using the MuJoCo prior stored in
-  `articulation_artifact.json`.
-- The output records replay diagnostics under
-  `simulation_options.force_replay`.
-
-### 6. Local Finite-Difference Optimization Had Bad Basins
-
-The MuJoCo finite-difference optimizer can be misled by local discontinuities
-from joint limits, dry friction, or contact. On the microwave pulse episode,
-starting near damping `0.1` gave a local finite-difference direction that moved
-away from the correct damping near `1.0`.
-
-Current behavior:
-
-- `identify-dynamics` runs a small coordinate-search warm start before local
-  finite-difference gradient descent.
-- This is still a pragmatic optimizer, not a globally reliable solver.
-- The SVG plot from `plot-dynamics-identification` should be checked to verify
-  that loss actually falls and parameters do not just hit arbitrary bounds.
-
-### 7. Autodiff/MJX Is Useful But Environment-Sensitive
-
-MJX gives a cleaner autodiff path than finite differences, but local setup on
-macOS Metal was brittle. We saw cases where sandboxed execution reported
-backend errors that were not reproducible in the user's real local terminal.
-JAX Metal also produced compatibility errors such as
-`UNIMPLEMENTED: default_memory_space is not supported` in some environments.
-
-Current behavior:
-
-- `identify-dynamics-mjx` exists as a parallel backend with the same artifact
-  contract.
-- The default JAX platform is CPU for predictable behavior.
-- Use `probe-mjx --jax-platform metal --enable-pjrt-compatibility` before
-  requesting Metal.
-- Treat sandbox-only MuJoCo rendering, PyTorch MPS, or JAX Metal failures as
-  possible false negatives and retry in the real local environment when needed.
-
-### 8. Geometry Errors Can Create Fake Gravity Torque
-
-The inferred door axis and proxy center of mass can be slightly different from
-the source MJCF. With normal gravity, this creates gravity torque that does not
-exist in the intended hinge model, and the optimizer may compensate by changing
-friction or mass. This was visible as a good-ish trajectory fit but poor raw
-mass/friction interpretation.
-
-Current behavior:
-
-- `--gravity-mode zero` is available for door-like hinge identification when
-  the goal is to estimate input-driven effective inertia and damping.
-- Normal-gravity rollout remains available for cases where gravity is part of
-  the target behavior.
-- The current microwave torque-pulse validation is considered healthy under
-  zero gravity:
-  - `q_rmse` is about `0.009 rad`
-  - `qdot_rmse` is about `0.033 rad/s`
-  - damping and friction match simulator GT
-  - joint effective inertia error is about `5%`
-
-### 9. Current Recommended Dynamics Validation Path
-
-For a clean single-DOF door/drawer dynamics check:
-
-1. Record a free-motion episode for qualitative behavior and the original RGB-D
-   artifact.
-2. Record a separate forced-response episode with known generalized force.
-3. Run pointcloud fusion, part pose, joint inference, and inferred articulation
-   export on the forced-response episode.
-4. Run `identify-dynamics` with force replay enabled by the episode log.
-5. Use `--gravity-mode zero` first for door-like hinge debugging.
-6. Inspect `q_rmse`, `qdot_rmse`, damping/friction error, and effective joint
-   inertia error.
-7. Use the comparison video and optimizer SVG plot before trusting the
-   optimized MJCF.
+1. Record a normal free-motion episode for qualitative inspection.
+2. Record a separate forced-response episode with a known generalized force.
+3. Run pointcloud fusion, part pose estimation, joint inference, and inferred articulation export on the forced-response episode.
+4. Run `identify-dynamics` with force replay from `dynamics_log.jsonl`.
+5. Start with `--gravity-mode zero` for door-like hinges to isolate input-driven dynamics from geometry-induced gravity torque.
+6. Inspect `q_rmse`, `qdot_rmse`, damping/friction error, effective joint inertia error, comparison video, and `optimization_history.svg`.
+7. Only enable contacts after the collision proxies have been validated.
 
 ## Rollout Video Rendering
 
-`identify-dynamics` and `identify-dynamics-mjx` can render the optimized rollout
-and save a side-by-side video against the original recorded RGB frames:
+`identify-dynamics` and `identify-dynamics-mjx` can render the optimized rollout and save a side-by-side video against the original recorded RGB frames:
 
 ```bash
 PYTHONPATH=src python3 -m rgbd_urdf_mvp identify-dynamics \
@@ -310,72 +154,51 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp identify-dynamics \
 
 Backend choices:
 
-- `cgl`: recommended on macOS when running from a normal local GUI terminal.
+- `cgl`: recommended on macOS from a normal local GUI terminal.
 - `glfw`: fallback if CGL fails and a display session is available.
-- `none`: disable video rendering, useful for batch/headless runs.
+- `none`: disable video rendering for batch/headless runs.
 - `auto`: let MuJoCo choose; this can fail in sandboxed or SSH/headless contexts.
 
-The videos are written next to `dynamics_identification.json` as
-`simulated_view_<view-index>.mp4` and `comparison_view_<view-index>.mp4`. The
-comparison video uses original RGB on the left and the simulated rollout on the
-right. If rendering is unavailable, the JSON artifact stores
-`render_artifacts.available = false` and a diagnostic `reason` instead of
-failing the optimization.
+If rendering is unavailable, the JSON artifact stores `render_artifacts.available = false` and a diagnostic `reason`.
 
-## Current Limitations
+## Remaining Limitations
 
-- The current MVP supports `control_mode=free` recordings.
-- It does not yet replay closed-loop `track` control episodes.
-- Absolute mass can be weakly identifiable from passive single-DOF motion.
-  In practice, damping and friction are often better constrained than mass.
-- Contact-rich identification is not implemented yet.
-- The current MJX path assumes all observed joints share the same timestamp schedule.
-- The repository defaults `identify-dynamics-mjx` to `--jax-platform cpu`.
-  Use `--jax-platform metal` explicitly after `probe-mjx` succeeds on your
-  local machine.
+- The current pipeline is most reliable for single-DOF objects.
+- Contact-rich dynamics identification is deferred until collision proxies are accurate enough.
+- Raw body mass and body inertia are still hard to compare when inferred proxy geometry differs from simulator GT geometry.
+- Passive free-motion episodes remain weakly identifiable for absolute mass.
+- The finite-difference optimizer is a pragmatic baseline, not a globally reliable solver.
+- MJX autodiff exists, but CPU is the stable default; Metal should be used only after `probe-mjx` succeeds in the real local environment.
+- Closed-loop `track` control replay is not yet the main supported dynamics-ID path.
 
-## How This Connects To A Lagrangian Network
+## Meeting Log Summary
 
-Later, if you switch from direct MuJoCo system identification to a learned
-dynamics model, keep the same contract:
+- We extended the RGB-D-to-articulation pipeline with a Stage 3 dynamics-identification module that consumes the inferred articulation artifact and MJCF, then fits moving-part mass, joint damping, and joint frictionloss.
+- The first major issue was identifiability: passive free motion cannot uniquely determine absolute mass and damping, because it mainly constrains a damping/effective-inertia ratio. The fix is to record a separate forced-response episode with a known generalized force and replay that force during optimization.
+- The recorder now supports forced excitation (`pulse`, `prbs`, `sine`) and writes `dynamics_log.jsonl` at simulation rate. Excitation recordings also preserve clean initial conditions, so `initial-qvel=0` is respected.
+- The dynamics optimizer now reads the force log, maps the simulator joint name to the inferred joint name, and applies the recorded force schedule during rollout.
+- Coarse pointcloud proxy geometry caused contact jamming in rollout videos. The current default disables contacts during dynamics ID and writes the same contact policy into the optimized MJCF.
+- The inferred MJCF no longer uses a fixed placeholder inertial box. It initializes proxy size, mass, and diagonal inertia from the fused pointcloud bounds for each inferred part.
+- Normal gravity can amplify small geometry or axis errors into fake hinge torques. For the current microwave hinge test, zero-gravity identification is used to focus on input torque, damping, friction, and effective joint inertia.
+- Current microwave forced-response validation is healthy at the trajectory level: `q_rmse` is about `0.0089 rad`, `qdot_rmse` is about `0.033 rad/s`, damping/friction match simulator GT, and effective joint inertia error is about `5.2%`.
+- Raw mass and raw inertia errors are still large because inferred pointcloud proxy geometry is not the same representation as the source MJCF mesh/body decomposition. For single-DOF behavior, effective joint inertia and rollout error are currently more meaningful than raw body-mass error.
+- We added optimizer diagnostics: `dynamics_identification.json`, optimized MJCF, optional rollout comparison video, and `optimization_history.svg` with separate panels for loss terms and parameters.
+- MJX autodiff has been added as a parallel backend with the same artifact contract. CPU is the stable default; JAX Metal remains environment-sensitive and should be probed separately.
+- Next steps are to improve geometry/proxy quality, scale the forced-response protocol to more objects, add richer excitation for better mass observability, and later use the identified MuJoCo model as a teacher/baseline for a Lagrangian-network dynamics model.
+
+## Connection To A Lagrangian Network
+
+The learned-dynamics path should reuse the same artifact contract rather than replace the perception or kinematic stages:
 
 ```text
 input:  q, qdot, u
-target: qdd  or  next-state
+target: qdd or next-state
 ```
 
-Recommended progression:
+Recommended use:
 
-1. Use the current optimization artifact as a structured baseline.
-   It gives you:
-   - joint type
-   - limits
-   - initial mass / damping / friction guesses
-   - clean `q(t), qdot(t)` trajectories
-
-2. Build a Lagrangian model in generalized coordinates.
-   Predict:
-   - mass matrix `M(q)`
-   - potential energy `V(q)`
-   - optional dissipation `D(q, qdot)`
-
-3. Train against acceleration or one-step rollout targets.
-   For this project, the practical target is:
-   - differentiate smoothed `q(t)` to get `qdot(t), qdd(t)`
-   - train `f(q, qdot, u) -> qdd`
-
-4. Keep friction/contact outside the pure conservative core.
-   A robust decomposition is:
-   - Lagrangian core for rigid-body dynamics
-   - separate residual head for friction/contact impulses
-
-5. Use the system-ID MJCF as a teacher or prior.
-   Useful strategies:
-   - behavior cloning on MuJoCo rollouts from the identified model
-   - initialize a learned damping head near the fitted damping/friction values
-   - compare learned rollout error against the identified-physics baseline
-
-In short: the current optimizer gives you a physically grounded stage-3
-baseline; the Lagrangian-network path should be layered on top of the same
-`URDF/MJCF + q,qdot` artifact contract, not replace the earlier perception and
-kinematic stages.
+1. Use the current system-ID artifact as a structured physics baseline.
+2. Train a Lagrangian core to predict mass matrix `M(q)` and potential energy `V(q)`.
+3. Keep dissipation, friction, and contact as separate residual terms instead of forcing them into the conservative Lagrangian core.
+4. Use identified MuJoCo rollouts as teacher data or as a comparison baseline.
+5. Report learned rollout error against the same `q/qdot/u` trajectories used by `identify-dynamics`.

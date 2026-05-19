@@ -167,10 +167,7 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp record-mujoco path/to/object.xml \
 
 ## Forced-Response Episodes For Dynamics ID
 
-Free-decay episodes are useful, but they mostly constrain damping/inertia
-ratios. To make inertia and damping more identifiable, record a separate
-forced-response episode with a known applied generalized force. Do not overwrite
-the free episode; use a distinct `object-id`.
+Free-decay episodes are useful, but they mostly constrain damping/inertia ratios. To make inertia and damping more identifiable, record a separate forced-response episode with a known applied generalized force. Do not overwrite the free episode; use a distinct `object-id`.
 
 Example torque-pulse microwave episode:
 
@@ -194,8 +191,7 @@ The original free episode remains at:
 outputs/recordings/microwave011/
 ```
 
-The forced-response episode keeps `control_mode: free`, because there is still
-no PD tracking. The distinction is stored under:
+The forced-response episode keeps `control_mode: free`, because there is still no PD tracking. The distinction is stored under:
 
 - `metadata.recording_variant = "forced-excitation"`
 - `metadata.excitation`
@@ -223,16 +219,14 @@ If you pass `--write-concat-assets`, tri-view additionally writes:
 
 - `assets/concat/`
 
-To compact an older triview episode that still has duplicated `assets/concat/` raw
-frames, run:
+To compact an older triview episode that still has duplicated `assets/concat/` raw frames, run:
 
 ```bash
 PYTHONPATH=src python3 -m rgbd_urdf_mvp compact-mujoco-recording \
   outputs/recordings/<object-id>/episode.json
 ```
 
-To transcode an older episode from `ppm/pgm` assets to `png` in place and
-update `episode.json`, run:
+To transcode an older episode from `ppm/pgm` assets to `png` in place and update `episode.json`, run:
 
 ```bash
 PYTHONPATH=src python3 -m rgbd_urdf_mvp repack-mujoco-recording \

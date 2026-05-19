@@ -25,10 +25,10 @@ OBJECT_ID=refrigerator031_e2e
 CATEGORY=refrigerator
 ```
 
-If you start from a USD asset, convert it first:
+If you start from a USD asset, convert one model first:
 
 ```bash
-PYTHONPATH=src python3 -m rgbd_urdf_mvp.usd_to_mjcf \
+PYTHONPATH=src python3 -m rgbd_urdf_mvp.sim.usd_to_mjcf \
   Lightwheel/Refrigerator031/Refrigerator031.usd \
   --category refrigerator
 ```
@@ -38,6 +38,28 @@ Then point `MODEL_XML` at the generated MJCF file:
 ```bash
 MODEL_XML=examples/mujoco_models/Refrigerator031.xml
 ```
+
+For many USD assets, use the batch converter with the same four-column manifest
+format used by the articulation batch runner:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp convert-usd-mjcf-batch \
+  configs/batch_usd_objects_example.tsv \
+  --output-dir examples/mujoco_models \
+  --converted-manifest configs/batch_usd_objects_converted.tsv \
+  --jobs 2
+```
+
+The generated manifest replaces USD paths with generated MJCF XML paths, so it
+can be passed directly to the full batch pipeline:
+
+```bash
+bash scripts/run_articulation_pipeline.sh --resume configs/batch_usd_objects_converted.tsv
+```
+
+The full batch pipeline also accepts `.usd`, `.usda`, and `.usdc` paths directly
+in the manifest and will convert missing MJCF files automatically before
+`record-mujoco`.
 
 ## 2. Record RGB-D With Object And Part Masks
 
