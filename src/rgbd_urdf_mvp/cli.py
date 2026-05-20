@@ -865,6 +865,55 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="generation_images.json from prepare-generation-images. Overrides --image/--image-views.",
     )
+    remote_articulation_parser.add_argument(
+        "--episode",
+        type=Path,
+        default=None,
+        help="Prepare masked generation images from an existing episode.json before sending. Overrides --image.",
+    )
+    remote_articulation_parser.add_argument(
+        "--generation-image-output-dir",
+        type=Path,
+        default=None,
+        help="Where to write prepared generation images when --episode is used.",
+    )
+    remote_articulation_parser.add_argument(
+        "--frame-index",
+        type=int,
+        default=0,
+        help="Episode frame used for generation images when --episode is used.",
+    )
+    remote_articulation_parser.add_argument(
+        "--view-indices",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Episode view indices to export when --episode is used.",
+    )
+    remote_articulation_parser.add_argument(
+        "--mask-source",
+        choices=["auto", "object", "part"],
+        default="auto",
+        help="Mask source used when --episode is used.",
+    )
+    remote_articulation_parser.add_argument(
+        "--background",
+        choices=["transparent", "white", "black", "original"],
+        default="transparent",
+        help="Background policy for prepared generation images when --episode is used.",
+    )
+    remote_articulation_parser.add_argument(
+        "--padding-ratio",
+        type=float,
+        default=0.15,
+        help="Square crop padding around mask bbox when --episode is used.",
+    )
+    remote_articulation_parser.add_argument(
+        "--min-mask-pixels",
+        type=int,
+        default=16,
+        help="Minimum foreground mask pixels per prepared view when --episode is used.",
+    )
     remote_articulation_parser.add_argument("--text", type=str, default=None, help="Optional text prompt")
     remote_articulation_parser.add_argument("--texture", action="store_true", help="Request Hunyuan texture generation")
     remote_articulation_parser.add_argument("--seed", type=int, default=1234, help="Hunyuan generation seed")
@@ -1700,13 +1749,32 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "remote-articulate-generate":
-        from .perception.generation_preprocess import load_generation_image_manifest
+        from .perception.generation_preprocess import (
+            GenerationImagePreparationConfig,
+            GenerationImagePreparer,
+            load_generation_image_manifest,
+        )
         from .perception.remote_articulation_client import RemoteArticulationClient, RemoteArticulationConfig
 
         image_path = args.image
         image_views = args.image_views
-        if args.image_manifest is not None:
-            image_path, image_views = load_generation_image_manifest(args.image_manifest)
+        generation_image_manifest = args.image_manifest
+        if args.episode is not None:
+            generation_image_manifest = GenerationImagePreparer().prepare(
+                GenerationImagePreparationConfig(
+                    episode_path=args.episode,
+                    output_dir=args.generation_image_output_dir,
+                    frame_index=int(args.frame_index),
+                    view_indices=args.view_indices,
+                    image_views=args.image_views,
+                    mask_source=args.mask_source,
+                    background=args.background,
+                    padding_ratio=float(args.padding_ratio),
+                    min_mask_pixels=max(1, int(args.min_mask_pixels)),
+                )
+            )
+        if generation_image_manifest is not None:
+            image_path, image_views = load_generation_image_manifest(generation_image_manifest)
 
         output_dir = RemoteArticulationClient(
             server_url=args.server_url,

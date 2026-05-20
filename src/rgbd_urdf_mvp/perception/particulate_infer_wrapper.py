@@ -25,11 +25,13 @@ def main() -> int:
         sys.path.insert(0, str(partfield_root))
 
     module = _load_infer_module(infer_path)
+    sharp_edge_cache: dict[int, dict[str, Any]] = {}
 
     def prepare_inputs_with_global_points(mesh: Any, *args: Any, **kwargs: Any) -> Any:
         kwargs.pop("num_points_global", None)
         return _prepare_inputs_with_timing(module, max(1, int(known.num_points_global)), mesh, *args, **kwargs)
 
+    module.sample_points = _make_cached_sample_points(module, sharp_edge_cache)
     module.prepare_inputs = prepare_inputs_with_global_points
     module.predict_mesh = _make_predict_mesh_with_timing(module)
     module_args = module.argparse.ArgumentParser(description="Particulate Inference Script")
@@ -109,6 +111,162 @@ def _prepare_inputs_with_timing(module: Any, configured_num_points_global: int, 
     print(f"[particulate-timing] prepare_inputs_total_s={time.perf_counter() - started:.2f}", flush=True)
 
     return dict(xyz=points, normals=normals, feats=feats), sharp_flag, face_indices
+
+
+def _make_cached_sample_points(module: Any, sharp_edge_cache: dict[int, dict[str, Any]]) -> Any:
+    def sample_points_cached(mesh: Any, num_points: int, sharp_point_ratio: float) -> Any:
+        started = time.perf_counter()
+        np = module.np
+        num_points = max(1, int(num_points))
+        num_points_sharp_edges = int(num_points * float(sharp_point_ratio))
+        num_points_uniform = num_points - num_points_sharp_edges
+        if num_points_sharp_edges > 0:
+            points_sharp, normals_sharp, edge_indices, sharp_edge_faces = _sample_sharp_points_cached(
+                module,
+                sharp_edge_cache,
+                mesh,
+                num_points_sharp_edges,
+            )
+        else:
+            points_sharp = np.zeros((0, 3), dtype=np.float64)
+            normals_sharp = np.zeros((0, 3), dtype=np.float64)
+            edge_indices = np.zeros((0,), dtype=np.int32)
+            sharp_edge_faces = np.zeros((0, 2), dtype=np.int32)
+
+        if len(points_sharp) == 0 and sharp_point_ratio > 0:
+            print("[particulate-timing] no_sharp_edges_found; sampling uniformly", flush=True)
+            num_points_uniform = num_points
+
+        if num_points_uniform > 0:
+            stage = time.perf_counter()
+            points_uniform, face_indices = mesh.sample(num_points_uniform, return_index=True)
+            normals_uniform = mesh.face_normals[face_indices]
+            print(
+                f"[particulate-timing] uniform_sample_points={num_points_uniform} "
+                f"elapsed_s={time.perf_counter() - stage:.2f}",
+                flush=True,
+            )
+        else:
+            points_uniform = np.zeros((0, 3), dtype=np.float64)
+            normals_uniform = np.zeros((0, 3), dtype=np.float64)
+            face_indices = np.zeros((0,), dtype=np.int32)
+
+        points = np.concatenate([points_sharp, points_uniform], axis=0)
+        normals = np.concatenate([normals_sharp, normals_uniform], axis=0)
+        sharp_flag = np.concatenate(
+            [
+                np.ones(len(points_sharp), dtype=np.bool_),
+                np.zeros(len(points_uniform), dtype=np.bool_),
+            ],
+            axis=0,
+        )
+
+        sharp_face_indices = np.zeros(len(points_sharp), dtype=np.int32)
+        if len(points_sharp) > 0:
+            selected_faces = sharp_edge_faces[edge_indices]
+            choices = np.random.randint(0, selected_faces.shape[1], size=len(edge_indices))
+            sharp_face_indices = selected_faces[np.arange(len(edge_indices)), choices].astype(np.int32)
+
+        face_indices = np.concatenate([sharp_face_indices, face_indices], axis=0)
+        print(
+            f"[particulate-timing] sample_points_total points={num_points} sharp={len(points_sharp)} "
+            f"uniform={len(points_uniform)} elapsed_s={time.perf_counter() - started:.2f}",
+            flush=True,
+        )
+        return points, normals, sharp_flag, face_indices
+
+    return sample_points_cached
+
+
+def _sample_sharp_points_cached(module: Any, sharp_edge_cache: dict[int, dict[str, Any]], mesh: Any, num_points: int) -> Any:
+    np = module.np
+    cache = _get_sharp_edge_cache(module, sharp_edge_cache, mesh)
+    sharp_edges = cache["edges"]
+    sharp_edge_faces = cache["faces"]
+    sharp_edge_normals = cache["normals"]
+    weights = cache["weights"]
+    if len(sharp_edges) == 0:
+        return (
+            np.zeros((0, 3), dtype=np.float64),
+            np.zeros((0, 3), dtype=np.float64),
+            np.zeros((0,), dtype=np.int32),
+            sharp_edge_faces,
+        )
+
+    stage = time.perf_counter()
+    edge_indices = np.random.choice(len(sharp_edges), size=max(1, int(num_points)), replace=True, p=weights)
+    w = np.random.rand(max(1, int(num_points)), 1)
+    vertices = mesh.vertices
+    edge_a = sharp_edges[edge_indices, 0]
+    edge_b = sharp_edges[edge_indices, 1]
+    samples = w * vertices[edge_a] + (1.0 - w) * vertices[edge_b]
+    normals = sharp_edge_normals[edge_indices]
+    print(
+        f"[particulate-timing] sharp_sample_points={num_points} sharp_edges={len(sharp_edges)} "
+        f"elapsed_s={time.perf_counter() - stage:.2f}",
+        flush=True,
+    )
+    return samples, normals, edge_indices.astype(np.int32), sharp_edge_faces
+
+
+def _get_sharp_edge_cache(module: Any, sharp_edge_cache: dict[int, dict[str, Any]], mesh: Any) -> dict[str, Any]:
+    cache_key = id(mesh)
+    if cache_key in sharp_edge_cache:
+        return sharp_edge_cache[cache_key]
+
+    np = module.np
+    started = time.perf_counter()
+    adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
+    adjacency_edges = np.asarray(mesh.face_adjacency_edges, dtype=np.int64)
+    normals = np.asarray(mesh.face_normals, dtype=np.float64)
+
+    if len(adjacency) == 0 or len(adjacency_edges) == 0:
+        cache = {
+            "edges": np.zeros((0, 2), dtype=np.int32),
+            "faces": np.zeros((0, 2), dtype=np.int32),
+            "normals": np.zeros((0, 3), dtype=np.float64),
+            "weights": np.zeros((0,), dtype=np.float64),
+        }
+        sharp_edge_cache[cache_key] = cache
+        return cache
+
+    n1 = normals[adjacency[:, 0]]
+    n2 = normals[adjacency[:, 1]]
+    dot = np.einsum("ij,ij->i", n1, n2)
+    valid_normals = (np.linalg.norm(n1, axis=1) > 1e-8) & (np.linalg.norm(n2, axis=1) > 1e-8)
+    sharp_mask = (np.cos(np.radians(150)) < dot) & (dot < np.cos(np.radians(30))) & valid_normals
+    sharp_edges = adjacency_edges[sharp_mask].astype(np.int32)
+    sharp_edge_faces = adjacency[sharp_mask].astype(np.int32)
+
+    if len(sharp_edges) > 0:
+        sharp_edge_normals = n1[sharp_mask] + n2[sharp_mask]
+        normal_lengths = np.linalg.norm(sharp_edge_normals, axis=1, keepdims=True)
+        sharp_edge_normals = np.divide(
+            sharp_edge_normals,
+            np.maximum(normal_lengths, 1e-8),
+            out=np.zeros_like(sharp_edge_normals),
+        )
+        edge_vectors = mesh.vertices[sharp_edges[:, 1]] - mesh.vertices[sharp_edges[:, 0]]
+        weights = np.linalg.norm(edge_vectors, axis=1).astype(np.float64)
+        weights_sum = float(weights.sum())
+        weights = weights / weights_sum if weights_sum > 0 else np.full(len(sharp_edges), 1.0 / len(sharp_edges))
+    else:
+        sharp_edge_normals = np.zeros((0, 3), dtype=np.float64)
+        weights = np.zeros((0,), dtype=np.float64)
+
+    cache = {
+        "edges": sharp_edges,
+        "faces": sharp_edge_faces,
+        "normals": sharp_edge_normals,
+        "weights": weights,
+    }
+    sharp_edge_cache[cache_key] = cache
+    print(
+        f"[particulate-timing] sharp_edge_cache faces={len(mesh.faces)} adjacency={len(adjacency)} "
+        f"sharp_edges={len(sharp_edges)} elapsed_s={time.perf_counter() - started:.2f}",
+        flush=True,
+    )
+    return cache
 
 
 def _make_predict_mesh_with_timing(module: Any) -> Any:

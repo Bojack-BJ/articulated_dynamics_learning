@@ -211,8 +211,29 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp remote-articulate-generate \
   --timeout-s 3600
 ```
 
-For simulator recordings, first prepare clean masked Hunyuan3D inputs from the
-recorded prior masks:
+For simulator recordings, send selected masked views directly from an existing
+recording:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp remote-articulate-generate \
+  --server-url https://your-remote-articulation-endpoint.example.com \
+  --episode outputs/recordings/$OBJECT_ID/episode.json \
+  --generation-image-output-dir outputs/recordings/$OBJECT_ID/generation_images \
+  --frame-index 0 \
+  --view-indices 0 1 2 \
+  --image-views front left right \
+  --mask-source auto \
+  --background transparent \
+  --output-dir outputs/remote_articulation/$OBJECT_ID \
+  --timeout-s 3600
+```
+
+`--view-indices` selects the recording camera slots and `--image-views` names
+those slots for Hunyuan3D. Single-view generation is the same path with one view,
+for example `--view-indices 0 --image-views front`.
+
+Alternatively, prepare clean masked Hunyuan3D inputs from the recorded prior
+masks as a separate step:
 
 ```bash
 PYTHONPATH=src python3 -m rgbd_urdf_mvp prepare-generation-images \
@@ -252,6 +273,59 @@ files to a node-local directory first, then copies the completed job back to
 `--output-root` and returns the zip to the client. This avoids slow mesh
 sampling and GLB/OBJ export on network filesystems. PARTICULATE timing logs are
 printed with the `[particulate-timing]` prefix.
+
+## Debug And Performance Notes
+
+The slow path observed in PARTICULATE is usually before the GPU forward pass.
+Hunyuan3D may emit dense GLB meshes; one sofa example produced about `178k`
+faces. PARTICULATE's original `prepare_inputs` then samples two point sets:
+
+```text
+sample_points(mesh, 40000, sharp_point_ratio=0.5)
+sample_points(mesh, 102400, sharp_point_ratio=0.5)
+```
+
+In upstream PARTICULATE, every `sample_points` call recomputes sharp edges by
+looping over all faces in Python and building an edge dictionary. That means the
+same dense mesh can be scanned twice on CPU before `model.infer` runs. In
+`nvidia-smi` this appears as low GPU utilization with one CPU core busy.
+
+The project wrapper now replaces that sampling implementation at runtime:
+
+- uses `trimesh.face_adjacency` and `face_adjacency_edges` for vectorized
+  sharp-edge detection;
+- caches sharp edges per transformed mesh, so global and decode sampling reuse
+  the same cache;
+- logs stage timings with `[particulate-timing]`;
+- writes PARTICULATE stdout/stderr to `particulate_stdout.log` and
+  `particulate_stderr.log`;
+- fails the remote job if upstream exits successfully but produces no artifacts.
+
+Useful timing lines:
+
+```text
+[particulate-timing] sharp_edge_cache faces=... adjacency=... sharp_edges=... elapsed_s=...
+[particulate-timing] sample_global_s=...
+[particulate-timing] sample_decode_s=...
+[particulate-timing] load_partfield_s=...
+[particulate-timing] obtain_partfield_feats_s=...
+[particulate-timing] model_infer_s=...
+```
+
+If `sharp_edge_cache` or `sample_decode_s` dominates, the bottleneck is CPU mesh
+sampling rather than CUDA. If `model_infer_s` dominates, inspect GPU utilization,
+CUDA/PyTorch compatibility, and available GPU memory.
+
+Optimization history:
+
+- Moved job working files to node-local storage with `--scratch-root`; this
+  avoids repeated mesh IO and export on network filesystems.
+- Added `--particulate-global-points` and `--particulate-target-faces` for
+  smoke tests and controlled experiments.
+- Added timing logs around `prepare_inputs`, PartField feature extraction, and
+  `model.infer`.
+- Replaced repeated Python sharp-edge scans with one vectorized, cached
+  sharp-edge pass in the project wrapper.
 
 With auth:
 
