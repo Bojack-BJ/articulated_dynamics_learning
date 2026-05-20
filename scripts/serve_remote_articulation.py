@@ -6,6 +6,7 @@ import base64
 import os
 import shutil
 import threading
+import time
 import traceback
 import uuid
 from pathlib import Path
@@ -68,14 +69,21 @@ def build_app(args: argparse.Namespace) -> FastAPI:
             jobs.setdefault(uid, {"uid": uid}).update(updates)
 
     def run_job(uid: str, payload: ArticulateRequest) -> None:
-        job_dir = Path(args.output_root).expanduser().resolve() / uid
+        persistent_root = Path(args.output_root).expanduser().resolve()
+        work_root = Path(args.scratch_root).expanduser().resolve() if args.scratch_root else persistent_root
+        persistent_root.mkdir(parents=True, exist_ok=True)
+        work_root.mkdir(parents=True, exist_ok=True)
+        job_dir = work_root / uid
         mesh_path = job_dir / "hunyuan" / "generated.glb"
         particulate_dir = job_dir / "particulate"
         try:
+            job_started = time.perf_counter()
             update_job(uid, status="running", stage="hunyuan3d", output_dir=str(job_dir))
             mesh_path.parent.mkdir(parents=True, exist_ok=True)
             hunyuan_payload = dict(payload.hunyuan)
             hunyuan_payload.setdefault("type", "glb")
+            _log_job(uid, f"hunyuan3d start work_dir={job_dir}")
+            stage_started = time.perf_counter()
             hclient = Hunyuan3DClient(args.hunyuan_url, api_token=args.hunyuan_api_token, timeout_s=120.0)
             hunyuan_uid = hclient.send(hunyuan_payload)
             model_base64 = hclient.wait_for_model_base64(
@@ -84,9 +92,12 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 poll_interval_s=float(args.hunyuan_poll_interval_s),
             )
             mesh_path.write_bytes(base64.b64decode(model_base64))
+            _log_job(uid, f"hunyuan3d done elapsed_s={time.perf_counter() - stage_started:.2f}")
 
             update_job(uid, status="running", stage="particulate", generated_mesh_path=str(mesh_path))
             particulate_cfg = dict(payload.particulate)
+            _log_job(uid, "particulate start")
+            stage_started = time.perf_counter()
             manifest_path = ParticulateInferenceRunner().run(
                 ParticulateInferenceConfig(
                     mesh_path=mesh_path,
@@ -112,11 +123,23 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     dry_run=False,
                 )
             )
+            _log_job(uid, f"particulate done elapsed_s={time.perf_counter() - stage_started:.2f}")
 
             update_job(uid, status="running", stage="packaging", particulate_result=str(manifest_path))
-            zip_base = job_dir.parent / f"{uid}_remote_articulation_result"
+            _log_job(uid, "packaging start")
+            stage_started = time.perf_counter()
+            if job_dir.parent != persistent_root:
+                persistent_job_dir = persistent_root / uid
+                if persistent_job_dir.exists():
+                    shutil.rmtree(persistent_job_dir)
+                shutil.copytree(job_dir, persistent_job_dir)
+            zip_base = persistent_root / f"{uid}_remote_articulation_result"
             zip_path = shutil.make_archive(str(zip_base), "zip", root_dir=job_dir)
             result_zip_base64 = base64.b64encode(Path(zip_path).read_bytes()).decode("utf-8")
+            _log_job(
+                uid,
+                f"packaging done elapsed_s={time.perf_counter() - stage_started:.2f} total_s={time.perf_counter() - job_started:.2f}",
+            )
             update_job(
                 uid,
                 status="completed",
@@ -147,6 +170,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--hunyuan-timeout-s", type=float, default=1800.0)
     parser.add_argument("--hunyuan-poll-interval-s", type=float, default=5.0)
     parser.add_argument("--output-root", default="outputs/remote_articulation_server")
+    parser.add_argument(
+        "--scratch-root",
+        default=os.environ.get("REMOTE_ARTICULATION_SCRATCH_ROOT"),
+        help="Optional node-local working directory; completed jobs are copied back to --output-root",
+    )
     parser.add_argument("--particulate-root", default="Particulate")
     parser.add_argument("--particulate-python", default=os.environ.get("PARTICULATE_PYTHON", "python"))
     parser.add_argument("--particulate-model-config", default="configs/particulate-B.yaml")
@@ -163,6 +191,10 @@ def _optional_int(value: Any) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def _log_job(uid: str, message: str) -> None:
+    print(f"[remote-articulation:{uid}] {message}", flush=True)
 
 
 def main() -> int:

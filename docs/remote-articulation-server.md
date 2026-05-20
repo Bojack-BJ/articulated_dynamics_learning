@@ -69,6 +69,7 @@ PYTHONPATH=src python scripts/serve_remote_articulation.py \
   --particulate-root Particulate \
   --particulate-python "$PARTICULATE_PYTHON" \
   --particulate-ckpt-path /path/to/Particulate/model.pt \
+  --scratch-root /tmp/remote_articulation_server \
   --output-root outputs/remote_articulation_server
 ```
 
@@ -109,6 +110,7 @@ PYTHONPATH=src python scripts/serve_remote_articulation.py \
   --particulate-root Particulate \
   --particulate-python "$PARTICULATE_PYTHON" \
   --particulate-ckpt-path /path/to/Particulate/model.pt \
+  --scratch-root /tmp/remote_articulation_server \
   --output-root outputs/remote_articulation_server
 ```
 
@@ -143,6 +145,7 @@ PYTHONPATH=src python scripts/serve_remote_articulation.py \
   --particulate-root Particulate \
   --particulate-python "$PARTICULATE_PYTHON" \
   --particulate-ckpt-path /path/to/Particulate/model.pt \
+  --scratch-root /tmp/remote_articulation_server \
   --output-root outputs/remote_articulation_server
 ```
 
@@ -240,6 +243,12 @@ For smoke tests, keep `--particulate-global-points` and
 roughly `50k` faces can spend a long time in PARTICULATE's CPU-side sharp-edge
 sampling before the GPU forward pass; use `--face-count` and
 `--particulate-target-faces` to keep the mesh small enough for iteration.
+
+When `--scratch-root` is set, the server writes Hunyuan and PARTICULATE working
+files to a node-local directory first, then copies the completed job back to
+`--output-root` and returns the zip to the client. This avoids slow mesh
+sampling and GLB/OBJ export on network filesystems. PARTICULATE timing logs are
+printed with the `[particulate-timing]` prefix.
 
 With auth:
 
