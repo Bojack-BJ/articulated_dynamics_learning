@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from rgbd_urdf_mvp.perception.particulate_adapter import (
@@ -46,6 +48,37 @@ class ParticulateAdapterTests(unittest.TestCase):
             self.assertIn("rgbd_urdf_mvp.perception.particulate_infer_wrapper", payload["command"])
             self.assertIn("--num_points_global", payload["command"])
             self.assertIn("10000", payload["command"])
+
+    def test_successful_subprocess_without_artifacts_is_failure_with_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            particulate_root = root / "Particulate"
+            particulate_root.mkdir()
+            mesh_path = root / "object.glb"
+            mesh_path.write_bytes(b"glb")
+            output_dir = root / "out"
+
+            def fake_run(command, cwd, env, text, stdout, stderr, check):
+                stdout.write("Running inference...\nError processing object.glb: synthetic failure\n")
+                stderr.write("stderr tail\n")
+                return subprocess.CompletedProcess(command, 0)
+
+            with unittest.mock.patch("subprocess.run", side_effect=fake_run):
+                with self.assertRaisesRegex(RuntimeError, "without producing artifacts") as ctx:
+                    ParticulateInferenceRunner().run(
+                        ParticulateInferenceConfig(
+                            mesh_path=mesh_path,
+                            output_dir=output_dir,
+                            particulate_root=particulate_root,
+                            python_bin="python",
+                        )
+                    )
+
+            self.assertIn("synthetic failure", str(ctx.exception))
+            self.assertTrue((output_dir / "particulate_stdout.log").exists())
+            self.assertTrue((output_dir / "particulate_stderr.log").exists())
+            manifest = json.loads((output_dir / "particulate_result.json").read_text(encoding="utf-8"))
+            self.assertIn("logs", manifest)
 
     def test_compare_summarizes_tracking_and_particulate_npz(self) -> None:
         try:

@@ -93,14 +93,31 @@ class ParticulateInferenceRunner:
         }
 
         if not config.dry_run:
-            subprocess.run(
-                command,
-                cwd=particulate_root,
-                env=self._subprocess_env(particulate_root),
-                text=True,
-                check=True,
-            )
+            stdout_path = output_dir / "particulate_stdout.log"
+            stderr_path = output_dir / "particulate_stderr.log"
+            with stdout_path.open("w", encoding="utf-8") as stdout_file:
+                with stderr_path.open("w", encoding="utf-8") as stderr_file:
+                    subprocess.run(
+                        command,
+                        cwd=particulate_root,
+                        env=self._subprocess_env(particulate_root),
+                        text=True,
+                        stdout=stdout_file,
+                        stderr=stderr_file,
+                        check=True,
+                    )
             manifest["artifacts"] = self._collect_artifacts(output_dir)
+            manifest["logs"] = {
+                "stdout": str(stdout_path.resolve()),
+                "stderr": str(stderr_path.resolve()),
+            }
+            if not any(manifest["artifacts"].values()):
+                save_json(manifest, manifest_path)
+                tail = _tail_text(stdout_path) + _tail_text(stderr_path)
+                raise RuntimeError(
+                    "PARTICULATE finished without producing artifacts. "
+                    f"See logs: {stdout_path} {stderr_path}{tail}"
+                )
 
         save_json(manifest, manifest_path)
         return manifest_path
@@ -283,3 +300,12 @@ def _resolve_path(path: str | Path | None) -> Path:
     if candidate.is_absolute():
         return candidate.resolve()
     return (PROJECT_ROOT / candidate).resolve()
+
+
+def _tail_text(path: Path, max_chars: int = 4000) -> str:
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if not text:
+        return ""
+    return f"\n--- tail {path.name} ---\n{text[-max_chars:]}"
