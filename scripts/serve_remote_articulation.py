@@ -97,6 +97,10 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     ckpt_path=particulate_cfg.get("ckpt_path") or args.particulate_ckpt_path,
                     up_dir=particulate_cfg.get("up_dir", "-Z"),
                     num_points=int(particulate_cfg.get("num_points", args.particulate_num_points)),
+                    num_points_global=int(
+                        particulate_cfg.get("num_points_global", args.particulate_num_points_global)
+                    ),
+                    target_faces=_optional_int(particulate_cfg.get("target_faces", args.particulate_target_faces)),
                     min_part_confidence=float(
                         particulate_cfg.get("min_part_confidence", args.particulate_min_part_confidence)
                     ),
@@ -148,9 +152,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--particulate-model-config", default="configs/particulate-B.yaml")
     parser.add_argument("--particulate-ckpt-path", default=None)
     parser.add_argument("--particulate-num-points", type=int, default=102400)
+    parser.add_argument("--particulate-num-points-global", type=int, default=40000)
+    parser.add_argument("--particulate-target-faces", type=int, default=None)
     parser.add_argument("--particulate-min-part-confidence", type=float, default=0.0)
     parser.add_argument("--particulate-animation-frames", type=int, default=50)
     return parser
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
 
 
 def main() -> int:

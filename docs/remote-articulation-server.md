@@ -68,6 +68,7 @@ PYTHONPATH=src python scripts/serve_remote_articulation.py \
   --hunyuan-url http://127.0.0.1:8080 \
   --particulate-root Particulate \
   --particulate-python "$PARTICULATE_PYTHON" \
+  --particulate-ckpt-path /path/to/Particulate/model.pt \
   --output-root outputs/remote_articulation_server
 ```
 
@@ -87,6 +88,103 @@ The wrapper API:
 - `POST /send-articulate`
 - `GET /status-articulate/{uid}`
 
+## Expose The Wrapper
+
+Keep the Hunyuan3D API server bound to `127.0.0.1:8080`. Only expose the
+wrapper server on port `8090`; it is the API boundary that accepts client
+requests and calls Hunyuan3D locally.
+
+### Option A: SSH Local Forward
+
+Use this when the Mac can SSH into the GPU server. Start the wrapper on the
+server bound to localhost:
+
+```bash
+export REMOTE_ARTICULATION_API_TOKEN='replace-with-a-long-random-token'
+PYTHONPATH=src python scripts/serve_remote_articulation.py \
+  --host 127.0.0.1 \
+  --port 8090 \
+  --api-token "$REMOTE_ARTICULATION_API_TOKEN" \
+  --hunyuan-url http://127.0.0.1:8080 \
+  --particulate-root Particulate \
+  --particulate-python "$PARTICULATE_PYTHON" \
+  --particulate-ckpt-path /path/to/Particulate/model.pt \
+  --output-root outputs/remote_articulation_server
+```
+
+From the Mac:
+
+```bash
+ssh -N -L 8090:127.0.0.1:8090 user@gpu-server.example.com
+```
+
+Then use the local forwarded URL:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp remote-articulate-generate \
+  --server-url http://127.0.0.1:8090 \
+  --image path/to/front.png \
+  --output-dir outputs/remote_articulation/object \
+  --api-token "$REMOTE_ARTICULATION_API_TOKEN"
+```
+
+### Option B: Bind To A Public Interface
+
+Use this only behind a firewall, VPN, or trusted network. Start the wrapper on
+all interfaces and keep token auth enabled:
+
+```bash
+export REMOTE_ARTICULATION_API_TOKEN='replace-with-a-long-random-token'
+PYTHONPATH=src python scripts/serve_remote_articulation.py \
+  --host 0.0.0.0 \
+  --port 8090 \
+  --api-token "$REMOTE_ARTICULATION_API_TOKEN" \
+  --hunyuan-url http://127.0.0.1:8080 \
+  --particulate-root Particulate \
+  --particulate-python "$PARTICULATE_PYTHON" \
+  --particulate-ckpt-path /path/to/Particulate/model.pt \
+  --output-root outputs/remote_articulation_server
+```
+
+Open only the wrapper port in the firewall, then call:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp remote-articulate-generate \
+  --server-url http://gpu-server-public-host:8090 \
+  --image path/to/front.png \
+  --output-dir outputs/remote_articulation/object \
+  --api-token "$REMOTE_ARTICULATION_API_TOKEN"
+```
+
+### Option C: HTTPS Reverse Proxy
+
+Use this for a longer-running shared endpoint. Run the wrapper on localhost and
+put nginx, Caddy, or another TLS reverse proxy in front of it:
+
+```text
+https://articulation.example.com
+  -> 127.0.0.1:8090
+```
+
+Keep `--api-token` enabled even when HTTPS is configured. The client URL then
+becomes:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp remote-articulate-generate \
+  --server-url https://articulation.example.com \
+  --image path/to/front.png \
+  --output-dir outputs/remote_articulation/object \
+  --api-token "$REMOTE_ARTICULATION_API_TOKEN"
+```
+
+Quick server-side checks:
+
+```bash
+curl http://127.0.0.1:8090/health
+curl -H "Authorization: Bearer $REMOTE_ARTICULATION_API_TOKEN" \
+  http://127.0.0.1:8090/status-articulate/not-a-real-job
+```
+
 ## Client Usage
 
 From the Mac:
@@ -99,8 +197,49 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp remote-articulate-generate \
   --output-dir outputs/remote_articulation/object \
   --num-inference-steps 50 \
   --octree-resolution 380 \
+  --face-count 20000 \
+  --particulate-target-faces 30000 \
+  --particulate-global-points 10000 \
+  --particulate-num-points 10000 \
+  --particulate-no-strict \
   --timeout-s 3600
 ```
+
+For simulator recordings, first prepare clean masked Hunyuan3D inputs from the
+recorded prior masks:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp prepare-generation-images \
+  outputs/recordings/$OBJECT_ID/episode.json \
+  --output-dir outputs/recordings/$OBJECT_ID/generation_images \
+  --frame-index 0 \
+  --view-indices 0 1 2 \
+  --image-views front left right \
+  --mask-source auto \
+  --background transparent
+```
+
+Then send the manifest to the combined remote server:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp remote-articulate-generate \
+  --server-url https://your-remote-articulation-endpoint.example.com \
+  --image-manifest outputs/recordings/$OBJECT_ID/generation_images/generation_images.json \
+  --output-dir outputs/remote_articulation/$OBJECT_ID \
+  --num-inference-steps 50 \
+  --octree-resolution 380 \
+  --face-count 20000 \
+  --particulate-target-faces 30000 \
+  --particulate-global-points 10000 \
+  --particulate-num-points 10000 \
+  --timeout-s 3600
+```
+
+For smoke tests, keep `--particulate-global-points` and
+`--particulate-num-points` around `5000-10000`. Hunyuan3D meshes with more than
+roughly `50k` faces can spend a long time in PARTICULATE's CPU-side sharp-edge
+sampling before the GPU forward pass; use `--face-count` and
+`--particulate-target-faces` to keep the mesh small enough for iteration.
 
 With auth:
 

@@ -24,6 +24,8 @@ class ParticulateInferenceConfig:
     ckpt_path: str | Path | None = None
     up_dir: str = "-Z"
     num_points: int = 102400
+    num_points_global: int = 40000
+    target_faces: int | None = None
     min_part_confidence: float = 0.0
     strict: bool = True
     animation_frames: int = 50
@@ -42,23 +44,26 @@ class ParticulateInferenceRunner:
                 "Run: git submodule update --init --recursive Particulate"
             )
 
-        mesh_path = self._resolve_mesh_path(config)
         output_dir = _resolve_path(config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        source_mesh_path = self._resolve_mesh_path(config)
+        mesh_path = self._prepare_mesh_path(source_mesh_path, output_dir, config.target_faces)
 
         command = [
             str(config.python_bin),
-            "infer.py",
+            "-m",
+            "rgbd_urdf_mvp.perception.particulate_infer_wrapper",
             "--input_mesh",
             str(mesh_path),
             "--output_dir",
             str(output_dir),
             "--model_config",
             str(config.model_config),
-            "--up_dir",
-            str(config.up_dir),
+            f"--up_dir={config.up_dir}",
             "--num_points",
             str(max(1, int(config.num_points))),
+            "--num_points_global",
+            str(max(1, int(config.num_points_global))),
             "--min_part_confidence",
             str(float(config.min_part_confidence)),
             "--animation_frames",
@@ -79,7 +84,8 @@ class ParticulateInferenceRunner:
         manifest: dict[str, Any] = {
             "source": "particulate-submodule",
             "particulate_root": str(particulate_root),
-            "input_mesh_path": str(mesh_path),
+            "input_mesh_path": str(source_mesh_path),
+            "particulate_input_mesh_path": str(mesh_path),
             "output_dir": str(output_dir),
             "command": command,
             "dry_run": bool(config.dry_run),
@@ -98,6 +104,45 @@ class ParticulateInferenceRunner:
 
         save_json(manifest, manifest_path)
         return manifest_path
+
+    def _prepare_mesh_path(self, mesh_path: Path, output_dir: Path, target_faces: int | None) -> Path:
+        if target_faces is None or int(target_faces) <= 0:
+            return mesh_path
+
+        try:
+            import trimesh
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("Mesh decimation requires trimesh in the wrapper environment") from exc
+
+        mesh = trimesh.load(mesh_path, process=False)
+        if isinstance(mesh, trimesh.Scene):
+            mesh = trimesh.util.concatenate(tuple(mesh.geometry.values()))
+        if not isinstance(mesh, trimesh.Trimesh):
+            raise ValueError(f"Expected a trimesh.Trimesh after loading {mesh_path}, got {type(mesh).__name__}")
+        if len(mesh.faces) <= int(target_faces):
+            return mesh_path
+
+        simplified = self._simplify_mesh(mesh, int(target_faces))
+        decimated_path = output_dir / f"{mesh_path.stem}.particulate_decimated.glb"
+        simplified.export(decimated_path)
+        return decimated_path
+
+    def _simplify_mesh(self, mesh: Any, target_faces: int) -> Any:
+        try:
+            return mesh.simplify_quadric_decimation(face_count=target_faces)
+        except TypeError:
+            try:
+                return mesh.simplify_quadric_decimation(target_faces)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Mesh decimation failed. Install fast-simplification/open3d in the wrapper environment, "
+                    "or lower Hunyuan --face-count before running PARTICULATE."
+                ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                "Mesh decimation failed. Install fast-simplification/open3d in the wrapper environment, "
+                "or lower Hunyuan --face-count before running PARTICULATE."
+            ) from exc
 
     def _resolve_mesh_path(self, config: ParticulateInferenceConfig) -> Path:
         if config.mesh_path is not None:
@@ -130,7 +175,7 @@ class ParticulateInferenceRunner:
 
     def _subprocess_env(self, particulate_root: Path) -> dict[str, str]:
         env = dict(os.environ)
-        pythonpath_entries = [str(particulate_root), str(particulate_root / "PartField")]
+        pythonpath_entries = [str(PROJECT_ROOT / "src"), str(particulate_root), str(particulate_root / "PartField")]
         if env.get("PYTHONPATH"):
             pythonpath_entries.append(env["PYTHONPATH"])
         env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)

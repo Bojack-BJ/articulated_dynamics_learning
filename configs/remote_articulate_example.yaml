@@ -12,4 +12,7 @@ args:
   output-dir: outputs/remote_articulation/object
   num-inference-steps: 50
   octree-resolution: 380
-  particulate-num-points: 102400
+  face-count: 20000
+  particulate-num-points: 10000
+  particulate-global-points: 10000
+  particulate-target-faces: 30000

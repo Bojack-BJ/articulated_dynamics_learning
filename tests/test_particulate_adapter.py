@@ -29,6 +29,8 @@ class ParticulateAdapterTests(unittest.TestCase):
                     output_dir=output_dir,
                     particulate_root=particulate_root,
                     python_bin="python",
+                    num_points=5000,
+                    num_points_global=10000,
                     dry_run=True,
                 )
             )
@@ -39,6 +41,11 @@ class ParticulateAdapterTests(unittest.TestCase):
             self.assertIn("--export_urdf", payload["command"])
             self.assertIn("--export_mjcf", payload["command"])
             self.assertIn("--eval", payload["command"])
+            self.assertIn("--up_dir=-Z", payload["command"])
+            self.assertNotIn("-Z", payload["command"])
+            self.assertIn("rgbd_urdf_mvp.perception.particulate_infer_wrapper", payload["command"])
+            self.assertIn("--num_points_global", payload["command"])
+            self.assertIn("10000", payload["command"])
 
     def test_compare_summarizes_tracking_and_particulate_npz(self) -> None:
         try:

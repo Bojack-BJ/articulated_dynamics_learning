@@ -673,6 +673,47 @@ def build_parser() -> argparse.ArgumentParser:
     dynamics_plot_parser.add_argument("--width", type=int, default=1280, help="SVG width in pixels")
     dynamics_plot_parser.add_argument("--height", type=int, default=760, help="SVG height in pixels")
 
+    generation_image_parser = subparsers.add_parser(
+        "prepare-generation-images",
+        help="Use existing prior masks to create clean object-centric images for Hunyuan3D",
+    )
+    generation_image_parser.add_argument("episode", type=Path, help="Path to episode.json")
+    generation_image_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Output directory for clean PNGs and generation_images.json",
+    )
+    generation_image_parser.add_argument("--frame-index", type=int, default=0, help="Episode frame used for generation images")
+    generation_image_parser.add_argument(
+        "--view-indices",
+        type=int,
+        nargs="+",
+        default=None,
+        help="View indices to export. Defaults to all RGB/mask views in the selected frame.",
+    )
+    generation_image_parser.add_argument(
+        "--image-views",
+        nargs="+",
+        choices=["front", "left", "right", "back"],
+        default=None,
+        help="Hunyuan3D view names matching --view-indices order. Defaults to front left right back.",
+    )
+    generation_image_parser.add_argument(
+        "--mask-source",
+        choices=["auto", "object", "part"],
+        default="auto",
+        help="Use object mask, part-mask union, or auto-prefer object mask.",
+    )
+    generation_image_parser.add_argument(
+        "--background",
+        choices=["transparent", "white", "black", "original"],
+        default="transparent",
+        help="Background policy outside the mask.",
+    )
+    generation_image_parser.add_argument("--padding-ratio", type=float, default=0.15, help="Square crop padding around mask bbox")
+    generation_image_parser.add_argument("--min-mask-pixels", type=int, default=16, help="Minimum foreground mask pixels per view")
+
     hunyuan_parser = subparsers.add_parser(
         "hunyuan3d-generate",
         help="Request a remote Hunyuan3D API server and save the generated 3D asset",
@@ -698,6 +739,12 @@ def build_parser() -> argparse.ArgumentParser:
             "View names matching --image order for multiview generation. "
             "Defaults to front left right back truncated to the number of images."
         ),
+    )
+    hunyuan_parser.add_argument(
+        "--image-manifest",
+        type=Path,
+        default=None,
+        help="generation_images.json from prepare-generation-images. Overrides --image/--image-views.",
     )
     hunyuan_parser.add_argument("--text", type=str, default=None, help="Optional text prompt")
     hunyuan_parser.add_argument("--mesh", type=Path, default=None, help="Optional input mesh for texture generation")
@@ -760,6 +807,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     particulate_parser.add_argument("--num-points", type=int, default=102400, help="Sample count for Particulate")
     particulate_parser.add_argument(
+        "--num-points-global",
+        type=int,
+        default=40000,
+        help="PartField encoder point count used before Particulate decode sampling",
+    )
+    particulate_parser.add_argument(
+        "--target-faces",
+        type=int,
+        default=None,
+        help="Optionally decimate the input mesh before passing it to Particulate",
+    )
+    particulate_parser.add_argument(
         "--min-part-confidence",
         type=float,
         default=0.0,
@@ -800,6 +859,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="View names matching --image order",
     )
+    remote_articulation_parser.add_argument(
+        "--image-manifest",
+        type=Path,
+        default=None,
+        help="generation_images.json from prepare-generation-images. Overrides --image/--image-views.",
+    )
     remote_articulation_parser.add_argument("--text", type=str, default=None, help="Optional text prompt")
     remote_articulation_parser.add_argument("--texture", action="store_true", help="Request Hunyuan texture generation")
     remote_articulation_parser.add_argument("--seed", type=int, default=1234, help="Hunyuan generation seed")
@@ -815,6 +880,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Input mesh up direction passed to PARTICULATE on the server",
     )
     remote_articulation_parser.add_argument("--particulate-num-points", type=int, default=102400)
+    remote_articulation_parser.add_argument(
+        "--particulate-global-points",
+        type=int,
+        default=40000,
+        help="PartField encoder point count used by PARTICULATE on the server",
+    )
+    remote_articulation_parser.add_argument(
+        "--particulate-target-faces",
+        type=int,
+        default=None,
+        help="Optionally decimate the generated mesh before PARTICULATE runs",
+    )
     remote_articulation_parser.add_argument("--particulate-min-part-confidence", type=float, default=0.0)
     remote_articulation_parser.add_argument(
         "--particulate-no-strict",
@@ -836,6 +913,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Comparison output path (defaults next to particulate_result.json)",
+    )
+
+    kinematic_eval_parser = subparsers.add_parser(
+        "evaluate-kinematic-model",
+        help="Evaluate inferred joints against MuJoCo GT joints when the recording model is available",
+    )
+    kinematic_eval_parser.add_argument("joint_inference", type=Path, help="Path to joint_inference.json")
+    kinematic_eval_parser.add_argument(
+        "--part-poses",
+        type=Path,
+        default=None,
+        help="Optional path to part_poses.json. Defaults to joint_inference.input_path.",
+    )
+    kinematic_eval_parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Evaluation output path (defaults next to joint_inference.json)",
     )
 
     # MuJoCo recording and mask generation.
@@ -1520,8 +1615,33 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"optimization_history_svg": str(output_svg.resolve())}, indent=2))
         return 0
 
+    if args.command == "prepare-generation-images":
+        from .perception.generation_preprocess import GenerationImagePreparationConfig, GenerationImagePreparer
+
+        manifest_path = GenerationImagePreparer().prepare(
+            GenerationImagePreparationConfig(
+                episode_path=args.episode,
+                output_dir=args.output_dir,
+                frame_index=int(args.frame_index),
+                view_indices=args.view_indices,
+                image_views=args.image_views,
+                mask_source=str(args.mask_source),
+                background=str(args.background),
+                padding_ratio=float(args.padding_ratio),
+                min_mask_pixels=max(1, int(args.min_mask_pixels)),
+            )
+        )
+        print(json.dumps({"generation_image_manifest": str(manifest_path.resolve())}, indent=2))
+        return 0
+
     if args.command == "hunyuan3d-generate":
         from .perception.hunyuan3d_client import Hunyuan3DClient, Hunyuan3DGenerationConfig
+        from .perception.generation_preprocess import load_generation_image_manifest
+
+        image_path = args.image
+        image_views = args.image_views
+        if args.image_manifest is not None:
+            image_path, image_views = load_generation_image_manifest(args.image_manifest)
 
         output_path = Hunyuan3DClient(
             server_url=args.server_url,
@@ -1531,8 +1651,8 @@ def main(argv: list[str] | None = None) -> int:
             Hunyuan3DGenerationConfig(
                 server_url=args.server_url,
                 output_path=args.output,
-                image_path=args.image,
-                image_views=args.image_views,
+                image_path=image_path,
+                image_views=image_views,
                 text=args.text,
                 mesh_path=args.mesh,
                 mode=args.mode,
@@ -1565,6 +1685,8 @@ def main(argv: list[str] | None = None) -> int:
                 ckpt_path=args.ckpt_path,
                 up_dir=args.up_dir,
                 num_points=max(1, int(args.num_points)),
+                num_points_global=max(1, int(args.num_points_global)),
+                target_faces=args.target_faces,
                 min_part_confidence=float(args.min_part_confidence),
                 strict=not bool(args.no_strict),
                 animation_frames=max(2, int(args.animation_frames)),
@@ -1578,7 +1700,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "remote-articulate-generate":
+        from .perception.generation_preprocess import load_generation_image_manifest
         from .perception.remote_articulation_client import RemoteArticulationClient, RemoteArticulationConfig
+
+        image_path = args.image
+        image_views = args.image_views
+        if args.image_manifest is not None:
+            image_path, image_views = load_generation_image_manifest(args.image_manifest)
 
         output_dir = RemoteArticulationClient(
             server_url=args.server_url,
@@ -1588,8 +1716,8 @@ def main(argv: list[str] | None = None) -> int:
             RemoteArticulationConfig(
                 server_url=args.server_url,
                 output_dir=args.output_dir,
-                image_path=args.image,
-                image_views=args.image_views,
+                image_path=image_path,
+                image_views=image_views,
                 text=args.text,
                 texture=bool(args.texture),
                 seed=int(args.seed),
@@ -1600,6 +1728,8 @@ def main(argv: list[str] | None = None) -> int:
                 face_count=args.face_count,
                 particulate_up_dir=args.particulate_up_dir,
                 particulate_num_points=max(1, int(args.particulate_num_points)),
+                particulate_global_points=max(1, int(args.particulate_global_points)),
+                particulate_target_faces=args.particulate_target_faces,
                 particulate_min_part_confidence=float(args.particulate_min_part_confidence),
                 particulate_strict=not bool(args.particulate_no_strict),
                 timeout_s=float(args.timeout_s),
@@ -1624,6 +1754,19 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         print(json.dumps({"articulation_backend_comparison": str(output_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "evaluate-kinematic-model":
+        from .kinematics.evaluation import KinematicModelEvaluationConfig, KinematicModelEvaluator
+
+        output_path = KinematicModelEvaluator().evaluate(
+            KinematicModelEvaluationConfig(
+                joint_inference_path=args.joint_inference,
+                part_pose_path=args.part_poses,
+                output_json=args.output_json,
+            )
+        )
+        print(json.dumps({"kinematic_evaluation": str(output_path.resolve())}, indent=2))
         return 0
 
     if args.command == "render-mujoco-masks":

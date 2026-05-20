@@ -34,6 +34,9 @@ class RemoteArticulationClientTests(unittest.TestCase):
                             server_url="https://example.test",
                             image_path=image_path,
                             output_dir=root / "out",
+                            particulate_num_points=5000,
+                            particulate_global_points=10000,
+                            particulate_target_faces=30000,
                         )
                     )
 
@@ -42,6 +45,9 @@ class RemoteArticulationClientTests(unittest.TestCase):
             self.assertIn("hunyuan", sent_payload)
             self.assertIn("particulate", sent_payload)
             self.assertEqual(sent_payload["hunyuan"]["type"], "glb")
+            self.assertEqual(sent_payload["particulate"]["num_points"], 5000)
+            self.assertEqual(sent_payload["particulate"]["num_points_global"], 10000)
+            self.assertEqual(sent_payload["particulate"]["target_faces"], 30000)
 
 
 if __name__ == "__main__":

@@ -28,6 +28,8 @@ class RemoteArticulationConfig:
     face_count: int | None = None
     particulate_up_dir: str = "-Z"
     particulate_num_points: int = 102400
+    particulate_global_points: int = 40000
+    particulate_target_faces: int | None = None
     particulate_min_part_confidence: float = 0.0
     particulate_strict: bool = True
     timeout_s: float = 3600.0
@@ -80,6 +82,8 @@ class RemoteArticulationClient:
             "particulate": {
                 "up_dir": str(config.particulate_up_dir),
                 "num_points": int(config.particulate_num_points),
+                "num_points_global": int(config.particulate_global_points),
+                "target_faces": config.particulate_target_faces,
                 "min_part_confidence": float(config.particulate_min_part_confidence),
                 "strict": bool(config.particulate_strict),
             },
