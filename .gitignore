@@ -8,3 +8,9 @@ Lightwheel/
 .cache/
 examples/mujoco_models
 MUJOCO_LOG.TXT
+PartField_ckpt.zip
+Particulate/
+Particulate_ckpt.zip
+Particulate_ckpt/
+__MACOSX/
+Hunyuan3D-2/

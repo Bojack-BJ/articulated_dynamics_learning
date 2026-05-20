@@ -46,11 +46,13 @@ Run the Hunyuan server on localhost:
 
 ```bash
 cd Hunyuan3D-2
+SNAP=$(cat /root/Users/models--tencent--Hunyuan3D-2mini/refs/main)
+
 python api_server.py \
   --host 127.0.0.1 \
   --port 8080 \
-  --model_path tencent/Hunyuan3D-2mv \
-  --subfolder hunyuan3d-dit-v2-mv \
+  --model_path /root/Users/models--tencent--Hunyuan3D-2mini/snapshots/$SNAP \
+  --subfolder hunyuan3d-dit-v2-mini-turbo \
   --variant fp16 \
   --device cuda
 ```
@@ -65,11 +67,12 @@ From the project root:
 PYTHONPATH=src python scripts/serve_remote_articulation.py \
   --host 127.0.0.1 \
   --port 8090 \
+  --api-token "lxt" \
   --hunyuan-url http://127.0.0.1:8080 \
   --particulate-root Particulate \
-  --particulate-python "$PARTICULATE_PYTHON" \
-  --particulate-ckpt-path /path/to/Particulate/model.pt \
   --scratch-root /tmp/remote_articulation_server \
+  --particulate-python /root/Users/miniconda3/envs/particulate/bin/python \
+  --particulate-ckpt-path /root/Users/lixiaotong/articulated_dynamics_learning/Particulate_ckpt/model.pt \
   --output-root outputs/remote_articulation_server
 ```
 
