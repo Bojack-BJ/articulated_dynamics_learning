@@ -26,8 +26,9 @@ def main() -> int:
 
     module = _load_infer_module(infer_path)
 
-    def prepare_inputs_with_global_points(*args: Any, **kwargs: Any) -> Any:
-        return _prepare_inputs_with_timing(module, max(1, int(known.num_points_global)), *args, **kwargs)
+    def prepare_inputs_with_global_points(mesh: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.pop("num_points_global", None)
+        return _prepare_inputs_with_timing(module, max(1, int(known.num_points_global)), mesh, *args, **kwargs)
 
     module.prepare_inputs = prepare_inputs_with_global_points
     module.predict_mesh = _make_predict_mesh_with_timing(module)
@@ -63,21 +64,21 @@ def _load_infer_module(infer_path: Path) -> Any:
     return module
 
 
-def _prepare_inputs_with_timing(module: Any, num_points_global: int, mesh: Any, *args: Any, **kwargs: Any) -> Any:
-    num_points_decode = int(kwargs.get("num_points_decode", 2048))
-    device = str(kwargs.get("device", "cuda"))
+def _prepare_inputs_with_timing(module: Any, configured_num_points_global: int, mesh: Any, *args: Any, **kwargs: Any) -> Any:
+    num_points_decode = int(args[1] if len(args) > 1 else kwargs.get("num_points_decode", 2048))
+    device = str(args[2] if len(args) > 2 else kwargs.get("device", "cuda"))
     sharp_point_ratio = module.DATA_CONFIG["sharp_point_ratio"]
     started = time.perf_counter()
 
     print(
         "[particulate-timing] prepare_inputs start "
         f"faces={len(mesh.faces)} verts={len(mesh.vertices)} "
-        f"global_points={num_points_global} decode_points={num_points_decode}",
+        f"global_points={configured_num_points_global} decode_points={num_points_decode}",
         flush=True,
     )
 
     stage = time.perf_counter()
-    all_points, _, _, _ = module.sample_points(mesh, num_points_global, sharp_point_ratio)
+    all_points, _, _, _ = module.sample_points(mesh, configured_num_points_global, sharp_point_ratio)
     print(f"[particulate-timing] sample_global_s={time.perf_counter() - stage:.2f}", flush=True)
 
     stage = time.perf_counter()
