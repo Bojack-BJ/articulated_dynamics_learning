@@ -16,6 +16,8 @@ The current code is scaffold-first. It is meant to keep the full contract execut
 - MuJoCo recording and USD-to-MJCF conversion: [docs/mujoco-recording.md](docs/mujoco-recording.md)
 - RGB-D fusion, part segmentation, and viewer workflow: [docs/pointcloud.md](docs/pointcloud.md)
 - Dynamics identification and Lagrangian-network handoff: [docs/dynamics-identification.md](docs/dynamics-identification.md)
+- Downstream MuJoCo manipulation planning: [docs/downstream-manipulation.md](docs/downstream-manipulation.md)
+- Real-data adapters: [docs/real-data-adapters.md](docs/real-data-adapters.md)
 - MuJoCo MJX setup for differentiable rollouts: [docs/mjx-setup.md](docs/mjx-setup.md)
 - Remote 3D generation client/server setup: [docs/remote-generation.md](docs/remote-generation.md)
 - Research-stack replacement points: [docs/research-stack.md](docs/research-stack.md)

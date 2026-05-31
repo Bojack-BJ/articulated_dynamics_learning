@@ -101,3 +101,16 @@ manifest. The current comparison is intentionally conservative: it reports part
 counts, hierarchy edge counts, revolute/prismatic counts, and tracking joint
 axis/limit summaries. It does not yet solve cross-method part correspondence or
 axis alignment in a shared frame.
+
+For MuJoCo simulation recordings, the tracking/optimization-side
+`joint_inference.json` can also be evaluated against source MJCF ground truth:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp evaluate-kinematic-model \
+  outputs/recordings/<object-id>/pointcloud_4d_partseg/joint_inference.json
+```
+
+This produces quantitative joint type, axis, pivot, limit, and `q(t)` errors for
+the tracking pipeline. PARTICULATE outputs are not yet scored with the same
+metric because that requires matching PARTICULATE parts/joints to the tracking
+parts and expressing both axes in one common frame.

@@ -178,6 +178,26 @@ The artifact contains:
 - per-frame scalar `q` samples
 - simple confidence and motion metrics
 
+## Evaluate Kinematic Model Against MuJoCo GT
+
+For simulation/debug recordings, `joint_inference.json` can be evaluated against the source MJCF referenced by the episode metadata:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp evaluate-kinematic-model \
+  outputs/recordings/door-mj-partseg-001/pointcloud_4d_partseg/joint_inference.json
+```
+
+This writes `kinematic_evaluation.json` next to `joint_inference.json`. The evaluator currently reports:
+
+- joint coverage and joint type accuracy
+- sign-invariant axis angular error
+- revolute pivot error as shortest distance between predicted and GT hinge lines
+- prismatic pivot/origin distance as point distance
+- lower/upper/span limit error when GT limits exist
+- `q_rmse` and offset-aligned `q_rmse` against simulator joint positions when they are logged
+
+This is a MuJoCo-oracle eval tool for development. It does not yet solve cross-method part correspondence for arbitrary generated/PARTICULATE URDFs.
+
 ## Export Inferred Articulation To URDF/MJCF
 
 Once `part_poses.json` and `joint_inference.json` exist, build an `articulation_artifact.json` plus URDF/MJCF package:
