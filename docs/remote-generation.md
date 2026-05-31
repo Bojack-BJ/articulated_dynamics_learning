@@ -127,6 +127,55 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp hunyuan3d-generate \
 
 If `--image-views` is omitted for multiple images, the client uses `front left right back` truncated to the number of provided images. Prefer explicit `--image-views` whenever the camera order is not obvious.
 
+## Clean Masked Images From Recordings
+
+For simulator recordings, use recorded object or part masks as a temporary prior
+segmentation provider before calling Hunyuan3D. This creates square,
+object-centric PNGs and a `generation_images.json` manifest.
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp prepare-generation-images \
+  outputs/recordings/$OBJECT_ID/episode.json \
+  --output-dir outputs/recordings/$OBJECT_ID/generation_images \
+  --frame-index 0 \
+  --view-indices 0 1 2 \
+  --image-views front left right \
+  --mask-source auto \
+  --background transparent
+```
+
+Current mask sources:
+
+- `auto`: prefer recorded object masks, then fall back to the union of part masks.
+- `object`: require recorded object masks from `--segmentation-masks`.
+- `part`: require recorded part masks from `--part-segmentation-masks` and use their union as the object mask.
+
+The manifest is the interface that future real segmentation should preserve:
+
+```text
+outputs/recordings/$OBJECT_ID/generation_images/
+  front.png
+  left.png
+  right.png
+  generation_images.json
+```
+
+Send the prepared images by manifest instead of passing image paths manually:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp hunyuan3d-generate \
+  --server-url https://your-public-generation-endpoint.example.com \
+  --image-manifest outputs/recordings/$OBJECT_ID/generation_images/generation_images.json \
+  --output outputs/generated/$OBJECT_ID.glb \
+  --mode async \
+  --num-inference-steps 50 \
+  --octree-resolution 380
+```
+
+`--image-manifest` overrides `--image` and `--image-views`. The default
+`transparent` background is useful for clean object crops; use `white` or
+`black` if a specific Hunyuan3D checkpoint handles opaque backgrounds better.
+
 Generated `.glb` meshes can be passed directly to the PARTICULATE adapter:
 
 ```bash

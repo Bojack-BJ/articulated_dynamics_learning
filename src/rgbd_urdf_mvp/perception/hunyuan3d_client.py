@@ -185,7 +185,11 @@ def _encode_image_payload(
     image_paths = _normalize_image_paths(image_path)
     if not image_paths:
         raise Hunyuan3DClientError("image_path must include at least one image.")
-    if len(image_paths) == 1 and image_views is None:
+    if image_views is not None and len(image_views) != len(image_paths):
+        raise Hunyuan3DClientError(
+            f"image_views length ({len(image_views)}) must match image_path length ({len(image_paths)})."
+        )
+    if len(image_paths) == 1:
         return _file_to_base64(image_paths[0])
     if len(image_paths) > len(HUNYUAN_VIEW_ORDER):
         raise Hunyuan3DClientError(
@@ -193,10 +197,6 @@ def _encode_image_payload(
         )
 
     views = list(image_views) if image_views is not None else list(HUNYUAN_VIEW_ORDER[: len(image_paths)])
-    if len(views) != len(image_paths):
-        raise Hunyuan3DClientError(
-            f"image_views length ({len(views)}) must match image_path length ({len(image_paths)})."
-        )
     invalid_views = [view for view in views if view not in HUNYUAN_VIEW_ORDER]
     if invalid_views:
         raise Hunyuan3DClientError(
