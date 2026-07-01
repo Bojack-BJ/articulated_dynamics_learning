@@ -15,6 +15,7 @@ from .pointcloud_fusion import (
     _load_depth_u16,
     _resolve_view_camera_poses,
     _resolve_view_depth_paths,
+    _resolve_view_mask_paths,
     _resolve_view_part_mask_paths,
 )
 from ..core.serialization import load_episode, load_json, save_json
@@ -284,6 +285,10 @@ def _count_part_pixels(mask_u16: list[list[int]], part_id: int) -> int:
     return sum(1 for row in mask_u16 for value in row if int(value) == part_id)
 
 
+def _count_foreground_pixels(mask_u16: list[list[int]]) -> int:
+    return sum(1 for row in mask_u16 for value in row if int(value) > 0)
+
+
 def _sample_part_seed_pixels(mask_u16: list[list[int]], part_id: int, stride_px: int, max_points: int) -> list[tuple[int, int]]:
     height = len(mask_u16)
     width = len(mask_u16[0]) if height else 0
@@ -298,6 +303,22 @@ def _sample_part_seed_pixels(mask_u16: list[list[int]], part_id: int, stride_px:
         return candidates
 
     # Deterministic uniform downsampling keeps tests reproducible and avoids a random seed knob.
+    step = len(candidates) / float(max_points)
+    return [candidates[min(len(candidates) - 1, int(round(index * step)))] for index in range(max_points)]
+
+
+def _sample_foreground_seed_pixels(mask_u16: list[list[int]], stride_px: int, max_points: int) -> list[tuple[int, int]]:
+    height = len(mask_u16)
+    width = len(mask_u16[0]) if height else 0
+    stride = max(1, int(stride_px))
+    candidates: list[tuple[int, int]] = []
+    for v_coord in range(0, height, stride):
+        row = mask_u16[v_coord]
+        for u_coord in range(0, width, stride):
+            if int(row[u_coord]) > 0:
+                candidates.append((u_coord, v_coord))
+    if len(candidates) <= max_points:
+        return candidates
     step = len(candidates) / float(max_points)
     return [candidates[min(len(candidates) - 1, int(round(index * step)))] for index in range(max_points)]
 
@@ -331,7 +352,10 @@ def _backproject_track_sample(
 
     mask_consistent = True
     if part_mask_u16 is not None:
-        mask_consistent = int(part_mask_u16[v_coord][u_coord]) == int(expected_part_id)
+        if int(expected_part_id) < 0:
+            mask_consistent = int(part_mask_u16[v_coord][u_coord]) > 0
+        else:
+            mask_consistent = int(part_mask_u16[v_coord][u_coord]) == int(expected_part_id)
         if require_part_mask_consistency and not mask_consistent:
             return None, False, mask_consistent
 
@@ -363,6 +387,21 @@ def _choose_reference_frame_for_part(
         count = 0
         for mask_path in paths_by_view:
             count += _count_part_pixels(_load_depth_u16(mask_path), part_id)
+        if count > best_count:
+            best_count = count
+            best_frame_index = frame_index
+    return best_frame_index
+
+
+def _choose_reference_frame_for_object(requested_reference_frame: int, masks_by_frame_view: list[list[Path]]) -> int:
+    if requested_reference_frame >= 0:
+        return min(requested_reference_frame, max(0, len(masks_by_frame_view) - 1))
+    best_frame_index = 0
+    best_count = -1
+    for frame_index, paths_by_view in enumerate(masks_by_frame_view):
+        count = 0
+        for mask_path in paths_by_view:
+            count += _count_foreground_pixels(_load_depth_u16(mask_path))
         if count > best_count:
             best_count = count
             best_frame_index = frame_index
@@ -463,13 +502,30 @@ class PartPixelTracker:
         )
         part_names = part_name_lookup(part_segmentation)
         part_metadata = _part_metadata(part_segmentation)
+        object_mask_mode = False
         if not part_metadata:
-            raise ValueError("Episode metadata does not contain part_segmentation. Re-record with part masks first.")
+            object_mask_mode = True
+            part_segmentation = {
+                "source": "object-mask-tracking-fallback",
+                "background_part_id": 0,
+                "parts": [{"part_id": 1, "name": "object", "role": "object"}],
+            }
+            part_names = {1: "object"}
+            part_metadata = {1: {"part_id": 1, "name": "object", "role": "object"}}
 
         rgb_paths_by_frame_view = [_resolve_view_rgb_paths(frame, episode_root) for frame in sampled_frames]
         depth_paths_by_frame_view = [_resolve_view_depth_paths(frame, episode_root) for frame in sampled_frames]
-        part_masks_by_frame_view = [_resolve_view_part_mask_paths(frame, episode_root) for frame in sampled_frames]
+        part_masks_by_frame_view = [
+            (
+                _resolve_view_mask_paths(frame, episode_root)
+                if object_mask_mode
+                else _resolve_view_part_mask_paths(frame, episode_root)
+            )
+            for frame in sampled_frames
+        ]
         if not all(part_masks_by_frame_view):
+            if object_mask_mode:
+                raise ValueError("Episode does not contain per-view object masks. Run segment-episode-masks first.")
             raise ValueError("Episode does not contain per-view part masks. Re-record with --part-segmentation-masks.")
 
         view_count = min(len(paths) for paths in rgb_paths_by_frame_view)
@@ -484,7 +540,11 @@ class PartPixelTracker:
             pose_sources.add(pose_source)
 
         reference_frame_by_part = {
-            part_id: _choose_reference_frame_for_part(part_id, self.config.reference_frame, part_masks_by_frame_view)
+            part_id: (
+                _choose_reference_frame_for_object(self.config.reference_frame, part_masks_by_frame_view)
+                if object_mask_mode
+                else _choose_reference_frame_for_part(part_id, self.config.reference_frame, part_masks_by_frame_view)
+            )
             for part_id in sorted(part_metadata)
         }
         depth_cache: dict[Path, list[list[int]]] = {}
@@ -518,12 +578,19 @@ class PartPixelTracker:
                     if view_index >= len(mask_paths_at_reference):
                         continue
                     reference_mask = load_depth_cached(mask_paths_at_reference[view_index])
-                    seed_pixels = _sample_part_seed_pixels(
-                        reference_mask,
-                        part_id=part_id,
-                        stride_px=self.config.seed_stride_px,
-                        max_points=max(1, self.config.max_tracks_per_part_view),
-                    )
+                    if object_mask_mode:
+                        seed_pixels = _sample_foreground_seed_pixels(
+                            reference_mask,
+                            stride_px=self.config.seed_stride_px,
+                            max_points=max(1, self.config.max_tracks_per_part_view),
+                        )
+                    else:
+                        seed_pixels = _sample_part_seed_pixels(
+                            reference_mask,
+                            part_id=part_id,
+                            stride_px=self.config.seed_stride_px,
+                            max_points=max(1, self.config.max_tracks_per_part_view),
+                        )
                     part_name = part_names.get(part_id, f"part_{part_id}")
                     if not seed_pixels:
                         completed_steps += 1
@@ -580,7 +647,7 @@ class PartPixelTracker:
                                 v_float=float(uv[1]),
                                 depth_u16=load_depth_cached(depth_path),
                                 part_mask_u16=load_depth_cached(part_mask_path) if part_mask_path is not None else None,
-                                expected_part_id=part_id,
+                                expected_part_id=-1 if object_mask_mode else part_id,
                                 intrinsics=episode.camera_intrinsics,
                                 camera_pose=camera_poses_by_frame_view[frame_index][view_index],
                                 depth_convention=depth_convention,
@@ -658,6 +725,7 @@ class PartPixelTracker:
                 "depth_convention": depth_convention,
                 "pose_sources_used": sorted(pose_sources),
                 "part_segmentation": part_segmentation,
+                "object_mask_tracking_mode": bool(object_mask_mode),
                 "part_reference_frames": {str(part_id): frame for part_id, frame in sorted(reference_frame_by_part.items())},
                 "config": {
                     "reference_frame": self.config.reference_frame,

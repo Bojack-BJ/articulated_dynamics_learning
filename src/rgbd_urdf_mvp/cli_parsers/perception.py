@@ -487,6 +487,49 @@ def register(subparsers: Any) -> None:
         help="Minimum visible 3D tracks required per frame when --method tracks is used",
     )
 
+    motion_seg_parser = subparsers.add_parser(
+        "segment-motion-parts",
+        help="Relabel object-level 3D CoTracker tracks into rigid motion-based parts",
+    )
+    motion_seg_parser.add_argument("input_tracks", type=Path, help="Path to object-level part_tracks.json")
+    motion_seg_parser.add_argument("--output-json", type=Path, default=None, help="Output relabeled part_tracks.json")
+    motion_seg_parser.add_argument(
+        "--rigidity-threshold-m",
+        type=float,
+        default=0.015,
+        help="Maximum pairwise distance-variation RMSE for connecting two tracks as one rigid part",
+    )
+    motion_seg_parser.add_argument(
+        "--max-neighbor-distance-m",
+        type=float,
+        default=0.18,
+        help="Soft locality cutoff used when linking tracks with similar rigidity scores",
+    )
+    motion_seg_parser.add_argument(
+        "--min-common-frames",
+        type=int,
+        default=3,
+        help="Minimum overlapping visible frames required to compare two variable-start tracks",
+    )
+    motion_seg_parser.add_argument(
+        "--min-tracks-per-part",
+        type=int,
+        default=4,
+        help="Small motion clusters are merged into nearby rigid clusters below this size",
+    )
+    motion_seg_parser.add_argument(
+        "--min-motion-m",
+        type=float,
+        default=0.01,
+        help="Reserved motion scale for downstream filtering and artifact metadata",
+    )
+    motion_seg_parser.add_argument(
+        "--static-motion-threshold-m",
+        type=float,
+        default=0.01,
+        help="Mean endpoint motion below this threshold is treated as static/base for part ordering",
+    )
+
     joint_parser = subparsers.add_parser(
         "infer-joints",
         help="Infer joint type, axis, and pivot from per-part per-frame pose tracks",

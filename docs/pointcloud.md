@@ -123,6 +123,55 @@ TORCH_HOME="$PWD/.cache/torch" PYTHONPATH=src python3 -m rgbd_urdf_mvp track-par
 
 For a `60 Hz` recording, `--frame-stride 4` reduces CoTracker to roughly `15 Hz` while keeping the original episode files unchanged.
 
+### Object-Mask-Only Motion Part Discovery
+
+When part masks are unreliable, run CoTracker from an object-level mask and
+recover parts from 3D trajectory rigidity. This path only assumes foreground
+object masks; every nonzero object-mask pixel is treated as a candidate seed.
+
+First track object foreground points:
+
+```bash
+TORCH_HOME="$PWD/.cache/torch" PYTHONPATH=src python3 -m rgbd_urdf_mvp track-part-pixels \
+  outputs/recordings/door-mj-object-mask/episode.json \
+  --output-json outputs/recordings/door-mj-object-mask/pointcloud_4d_object/object_tracks.json \
+  --cotracker-repo ./co-tracker \
+  --cotracker-checkpoint ./co-tracker/ckpt/scaled_offline.pth \
+  --device auto \
+  --reference-frame 0 \
+  --frame-stride 4 \
+  --seed-stride-px 12 \
+  --max-tracks-per-part-view 512
+```
+
+Then relabel tracks into motion-derived rigid parts:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp segment-motion-parts \
+  outputs/recordings/door-mj-object-mask/pointcloud_4d_object/object_tracks.json \
+  --output-json outputs/recordings/door-mj-object-mask/pointcloud_4d_object/motion_part_tracks.json \
+  --rigidity-threshold-m 0.015 \
+  --max-neighbor-distance-m 0.18 \
+  --min-common-frames 3 \
+  --min-tracks-per-part 4
+```
+
+The relabeled artifact is still a normal `part_tracks.json`-style file. It can
+be passed directly to the existing pose and joint stages:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp estimate-part-poses \
+  outputs/recordings/door-mj-object-mask/pointcloud_4d_object/motion_part_tracks.json \
+  --method tracks \
+  --output-json outputs/recordings/door-mj-object-mask/pointcloud_4d_object/part_poses.json
+```
+
+This v1 uses connected components over a trajectory graph. Edges combine
+pairwise distance invariance, visibility overlap, and a soft spatial locality
+prior. Tracks can start at different frames; pairwise rigidity is computed only
+over their common visible frames. Static/low-motion clusters are ordered first
+and used as the default anchor/base candidate.
+
 Then fit per-part SE(3) trajectories from those 3D correspondences:
 
 ```bash

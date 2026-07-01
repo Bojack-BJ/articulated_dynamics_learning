@@ -7,7 +7,12 @@ import unittest
 from pathlib import Path
 
 from rgbd_urdf_mvp.cli import build_parser
-from rgbd_urdf_mvp.perception.part_tracking import TrackPartPoseEstimationConfig, TrackPartPoseEstimator
+from rgbd_urdf_mvp.perception.part_tracking import (
+    TrackPartPoseEstimationConfig,
+    TrackPartPoseEstimator,
+    _backproject_track_sample,
+    _sample_foreground_seed_pixels,
+)
 
 
 def _rotation_z(angle_rad: float) -> list[list[float]]:
@@ -117,6 +122,40 @@ class PartTrackingTests(unittest.TestCase):
         )
         self.assertEqual(args.command, "probe-torch-mps")
         self.assertTrue(args.unsafe_force_mps)
+
+    def test_object_mask_helpers_treat_any_nonzero_label_as_foreground(self) -> None:
+        mask = [
+            [0, 0, 0, 0],
+            [0, 255, 0, 2],
+            [0, 0, 0, 0],
+        ]
+        seeds = _sample_foreground_seed_pixels(mask, stride_px=1, max_points=8)
+        self.assertEqual(seeds, [(1, 1), (3, 1)])
+        xyz, depth_valid, mask_consistent = _backproject_track_sample(
+            u_float=1.0,
+            v_float=1.0,
+            depth_u16=[
+                [1000, 1000, 1000, 1000],
+                [1000, 1200, 1000, 1000],
+                [1000, 1000, 1000, 1000],
+            ],
+            part_mask_u16=mask,
+            expected_part_id=-1,
+            intrinsics={"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0},
+            camera_pose=[
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            depth_convention="opengl",
+            min_depth_m=0.05,
+            max_depth_m=6.0,
+            require_part_mask_consistency=True,
+        )
+        self.assertTrue(depth_valid)
+        self.assertTrue(mask_consistent)
+        self.assertIsNotNone(xyz)
 
     def test_track_based_pose_estimation_recovers_rigid_motion(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

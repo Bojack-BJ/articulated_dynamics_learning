@@ -381,6 +381,24 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"part_pose_artifact": str(output_json.resolve())}, indent=2))
         return 0
 
+    if args.command == "segment-motion-parts":
+        from .perception.motion_segmentation import MotionPartSegmentationConfig, MotionPartSegmenter
+
+        output_json = MotionPartSegmenter(
+            MotionPartSegmentationConfig(
+                input_tracks=args.input_tracks,
+                output_json=args.output_json,
+                rigidity_threshold_m=float(args.rigidity_threshold_m),
+                max_neighbor_distance_m=float(args.max_neighbor_distance_m),
+                min_common_frames=max(2, int(args.min_common_frames)),
+                min_tracks_per_part=max(1, int(args.min_tracks_per_part)),
+                min_motion_m=float(args.min_motion_m),
+                static_motion_threshold_m=float(args.static_motion_threshold_m),
+            )
+        ).segment()
+        print(json.dumps({"motion_part_tracks": str(output_json.resolve())}, indent=2))
+        return 0
+
     if args.command == "infer-joints":
         from .kinematics.joint_inference import JointInferenceConfig, JointInferencer
 
