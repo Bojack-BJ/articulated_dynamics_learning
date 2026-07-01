@@ -17,7 +17,9 @@ The current code is scaffold-first. It is meant to keep the full contract execut
 - RGB-D fusion, part segmentation, and viewer workflow: [docs/pointcloud.md](docs/pointcloud.md)
 - Dynamics identification and Lagrangian-network handoff: [docs/dynamics-identification.md](docs/dynamics-identification.md)
 - Downstream MuJoCo manipulation planning: [docs/downstream-manipulation.md](docs/downstream-manipulation.md)
+- Ballistic dynamics-conditioned IL pipeline: [docs/ballistic-il-pipeline.md](docs/ballistic-il-pipeline.md)
 - Real-data adapters: [docs/real-data-adapters.md](docs/real-data-adapters.md)
+- Segmentation providers: [docs/segmentation-providers.md](docs/segmentation-providers.md)
 - MuJoCo MJX setup for differentiable rollouts: [docs/mjx-setup.md](docs/mjx-setup.md)
 - Remote 3D generation client/server setup: [docs/remote-generation.md](docs/remote-generation.md)
 - Research-stack replacement points: [docs/research-stack.md](docs/research-stack.md)
@@ -50,6 +52,12 @@ Optional CoTracker support for track-based part trajectories:
 
 ```bash
 python -m pip install -e ".[tracking]"
+```
+
+Optional ballistic imitation-learning support:
+
+```bash
+python -m pip install -e ".[imitation]"
 ```
 
 Optional MuJoCo MJX support for differentiable JAX rollouts:

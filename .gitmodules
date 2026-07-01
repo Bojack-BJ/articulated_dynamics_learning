@@ -7,3 +7,6 @@
 	url = https://github.com/facebookresearch/co-tracker.git
 	branch = main
 	ignore = dirty
+[submodule "Particulate"]
+	path = Particulate
+	url = git@github.com:Bojack-BJ/particulate.git

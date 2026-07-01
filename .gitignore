@@ -15,3 +15,7 @@ Particulate_ckpt/
 __MACOSX/
 Hunyuan3D-2/
 real_data/
+sam2/
+sam3_ckpt/
+Particulate/
+external_reart_tmp/

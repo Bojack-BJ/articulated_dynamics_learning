@@ -29,6 +29,12 @@ tracking = [
 	"numpy>=1.26",
 ]
 
+imitation = [
+	"torch>=2.1",
+	"numpy>=1.26",
+	"mujoco>=3.1.0",
+]
+
 mjx = [
 	"jax>=0.4.30",
 	"mujoco-mjx>=3.3.0",
