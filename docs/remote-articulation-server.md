@@ -16,6 +16,8 @@ Mac client RGB observations
 The wrapper intentionally composes the existing Hunyuan3D API server and
 PARTICULATE CLI instead of modifying either project.
 
+For the ReArt point-cloud baseline, see [ReArt Remote Integration](reart-integration.md).
+
 ## Server Environment
 
 Use one CUDA Linux environment for the wrapper, Hunyuan3D, and PARTICULATE:
@@ -337,11 +339,30 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp remote-articulate-generate \
   --api-token "$REMOTE_ARTICULATION_API_TOKEN"
 ```
 
+On a slow SSH tunnel, result download can dominate the wall time even when the
+remote job is done. Use `--remote-skip-download` to submit, poll, and save
+status/timing without pulling the zip immediately:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp remote-articulate-generate \
+  --server-url http://127.0.0.1:8888 \
+  --image path/to/front.png \
+  --output-dir outputs/remote_articulation/object \
+  --api-token "$REMOTE_ARTICULATION_API_TOKEN" \
+  --remote-skip-download
+```
+
+In this mode the local output still contains `remote_articulation_status.json`
+and `remote_articulation_timing.json`. The timing file includes
+`remote_result_zip_path`, which points to the zip on the server for later `scp`
+or batch transfer.
+
 The client writes:
 
 ```text
 outputs/remote_articulation/object/
   remote_articulation_result.zip
+  remote_articulation_timing.json
   remote_articulation_status.json
   hunyuan/generated.glb
   particulate/particulate_result.json
@@ -352,10 +373,85 @@ outputs/remote_articulation/object/
   particulate/eval/pred.npz
 ```
 
-Then compare with tracking:
+`remote_articulation_timing.json` separates local client time from remote server
+time:
+
+- `client_timings.prepare_generation_images_s`: local episode frame extraction,
+  object masking, crop/pad, and Hunyuan input image writing.
+- `client_timings.send_s`: upload/request submission to the remote articulation
+  server.
+- `client_timings.wait_until_completed_s`: polling time until the remote job is
+  complete.
+- `client_timings.download_result_s`: final result zip transfer through the
+  binary `download-articulate-zip` endpoint. This should be separate from
+  polling; if it is missing or near zero while `wait_until_completed_s` is much
+  larger than `server_timings.total_s`, the server is probably old and still
+  returning the result zip from the status endpoint.
+- `client_timings.zip_write_s`: local write time for the binary zip response.
+- `client_timings.download_result_base64_s` and
+  `client_timings.zip_base64_decode_write_s`: compatibility fallback timing for
+  old servers that only provide a base64 JSON result.
+- `client_timings.unpack_zip_s`: local unzip.
+- `server_timings.hunyuan3d_s`: Hunyuan3D generation and GLB decode/write.
+- `server_timings.particulate_s`: PARTICULATE mesh inference and export.
+- `server_timings.packaging_s`: server-side copy/zip/base64 packaging.
+- `server_resource_usage.hunyuan3d`: `nvidia-smi` samples collected while
+  waiting for Hunyuan3D and writing the returned GLB.
+- `server_resource_usage.particulate`: `nvidia-smi` samples collected while
+  PARTICULATE runs.
+
+Each resource stage records `baseline_gpus`, `peak_gpus`, `final_gpus`,
+`peak_memory_used_mib`, and `peak_memory_delta_mib`. `peak_memory_used_mib` is
+the largest total `memory.used` sample seen on any GPU during the stage.
+`peak_memory_delta_mib` subtracts that GPU's stage-start baseline, so it is the
+more useful number when other jobs already occupy the server. Because this is
+sampled externally through `nvidia-smi`, it is an approximation; short spikes
+between samples may be missed, and unrelated jobs on the same GPU can affect the
+total VRAM number.
+
+For batch reports, summarize optimized and feedforward timings into one table:
 
 ```bash
-PYTHONPATH=src python3 -m rgbd_urdf_mvp compare-articulation-backends \
-  outputs/recordings/<object-id>/pointcloud_4d_partseg/joint_inference.json \
-  outputs/remote_articulation/object/particulate/particulate_result.json
+PYTHONPATH=src python scripts/summarize_articulation_timing.py \
+  --batch-config configs/batch_lightwheel_refrigerators_mjcf.tsv \
+  --optimized-root outputs/recordings_refrigerators_staged_dense_mps \
+  --feedforward-root outputs/feedforward_articulation/lightwheel_refrigerators_view1_dooropen_upY
 ```
+
+This writes:
+
+```text
+outputs/feedforward_articulation/lightwheel_refrigerators_view1_dooropen_upY/_evaluation/
+  timing_summary.json
+  timing_summary.tsv
+  timing_summary.md
+```
+
+For the optimized path, the summary reads batch `stage_timing` JSON lines and
+reports `record-mujoco`, `fuse-pointcloud`, `track-part-pixels` (CoTracker),
+`estimate-part-poses`, `infer-joints`, export, and viewer serialization. It
+does not include segmentation model time; for simulation batches using clean GT
+masks, there is no learned segmentation stage in the optimized path. Blank
+fields mean the object was skipped by `--resume`, predates timing
+instrumentation, or has not completed.
+
+Then summarize optimized-vs-feedforward accuracy, timing, VRAM, and white-background
+SVG plots with the shared comparison script:
+
+```bash
+PYTHONPATH=src python scripts/summarize_articulation_comparison.py \
+  --batch-config configs/batch_lightwheel_refrigerators_mjcf.tsv \
+  --optimized-root outputs/recordings_refrigerators_staged_dense_mps \
+  --feedforward-root outputs/feedforward_articulation/lightwheel_refrigerators_view1_dooropen_upY \
+  --optimized-joint-rotation-threshold-rad 0.90
+```
+
+This writes `path_comparison_summary.json`, `path_comparison_summary.md`,
+`path_comparison_per_joint.tsv`, and reusable SVG plots under the same
+`_evaluation/` directory. For the refrigerator run, the optimized path should use
+`configs/track_refrigerator_dense.yaml`; otherwise sparse freezer/drawer tracks
+can produce apparent SE(3) rotation and inflate `prismatic->revolute` errors.
+For joint type selection ablations on the optimized path only, use
+`scripts/summarize_joint_type_ablation.py` to compare the older pose-gated
+residual decision against the default track-model-first residual decision while
+reusing the same `part_poses.json` and `part_tracks.json` artifacts.

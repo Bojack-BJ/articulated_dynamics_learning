@@ -283,6 +283,60 @@ def register(subparsers: Any) -> None:
     remote_articulation_parser.add_argument("--timeout-s", type=float, default=3600.0)
     remote_articulation_parser.add_argument("--poll-interval-s", type=float, default=5.0)
     remote_articulation_parser.add_argument("--api-token", type=str, default=None)
+    remote_articulation_parser.add_argument(
+        "--remote-skip-download",
+        action="store_true",
+        help="Only submit/poll the remote job and write status/timing; do not download the result zip.",
+    )
+
+    reart_export_parser = subparsers.add_parser(
+        "export-reart-sequence",
+        help="Export fused per-frame point clouds as a ReArt point-cloud sequence directory",
+    )
+    reart_export_parser.add_argument("fusion_manifest", type=Path, help="Path to fusion_manifest.json")
+    reart_export_parser.add_argument("--output-dir", type=Path, required=True, help="Output ReArt sequence directory")
+    reart_export_parser.add_argument("--frame-stride", type=int, default=1, help="Export every Nth frame")
+    reart_export_parser.add_argument("--max-frames", type=int, default=None, help="Optional cap on exported frames")
+    reart_export_parser.add_argument(
+        "--max-points-per-frame",
+        type=int,
+        default=20000,
+        help="Optional random downsample cap per frame before ReArt samples its fixed num_points",
+    )
+    reart_export_parser.add_argument(
+        "--include-background",
+        action="store_true",
+        help="Keep part_id=0 points instead of exporting only foreground part points",
+    )
+    reart_export_parser.add_argument("--random-seed", type=int, default=1234)
+
+    remote_reart_parser = subparsers.add_parser(
+        "remote-reart-run",
+        help="Send a ReArt point-cloud sequence to a remote CUDA ReArt server",
+    )
+    remote_reart_parser.add_argument("--server-url", required=True)
+    remote_reart_parser.add_argument("--sequence-dir", type=Path, required=True)
+    remote_reart_parser.add_argument("--output-dir", type=Path, required=True)
+    remote_reart_parser.add_argument("--sequence-name", type=str, default=None)
+    remote_reart_parser.add_argument("--cano-idx", type=int, default=0)
+    remote_reart_parser.add_argument("--num-points", type=int, default=4096)
+    remote_reart_parser.add_argument("--num-parts", type=int, default=10)
+    remote_reart_parser.add_argument("--stage", choices=["base", "kinematic", "both", "evaluate"], default="base")
+    remote_reart_parser.add_argument("--base-n-iter", type=int, default=2000)
+    remote_reart_parser.add_argument("--kinematic-n-iter", type=int, default=200)
+    remote_reart_parser.add_argument("--assign-iter", type=int, default=1000)
+    remote_reart_parser.add_argument("--snapshot-gap", type=int, default=100)
+    remote_reart_parser.add_argument("--use-assign-loss", action="store_true")
+    remote_reart_parser.add_argument("--use-flow-loss", action="store_true")
+    remote_reart_parser.add_argument("--use-nproc", action="store_true")
+    remote_reart_parser.add_argument("--timeout-s", type=float, default=7200.0)
+    remote_reart_parser.add_argument("--poll-interval-s", type=float, default=5.0)
+    remote_reart_parser.add_argument("--api-token", type=str, default=None)
+    remote_reart_parser.add_argument(
+        "--remote-skip-download",
+        action="store_true",
+        help="Only submit/poll and write status/timing; do not download the result zip.",
+    )
 
     compare_parser = subparsers.add_parser(
         "compare-articulation-backends",
@@ -313,4 +367,45 @@ def register(subparsers: Any) -> None:
         type=Path,
         default=None,
         help="Evaluation output path (defaults next to joint_inference.json)",
+    )
+
+    feedforward_eval_parser = subparsers.add_parser(
+        "evaluate-feedforward-articulation",
+        help="Evaluate PARTICULATE feedforward URDFs by searching all exported joint candidates",
+    )
+    feedforward_eval_parser.add_argument(
+        "feedforward_root",
+        type=Path,
+        help="Directory containing per-object feedforward articulation outputs and an _evaluation reference JSON",
+    )
+    feedforward_eval_parser.add_argument(
+        "--reference-evaluation",
+        type=Path,
+        default=None,
+        help="Existing GT reference evaluation JSON. Defaults to <feedforward_root>/_evaluation/gt_axis_position_evaluation_unified_scale.json.",
+    )
+    feedforward_eval_parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Output JSON path (defaults to <feedforward_root>/_evaluation/gt_axis_position_evaluation_unified_scale_best_joint.json)",
+    )
+    feedforward_eval_parser.add_argument(
+        "--yaw-degrees",
+        type=int,
+        nargs="+",
+        default=[0, 90, 180, 270],
+        help="Yaw rotations around +Z to test for each URDF joint candidate",
+    )
+    feedforward_eval_parser.add_argument(
+        "--angle-score-weight",
+        type=float,
+        default=1.0 / 180.0,
+        help="Weight for axis angle error in the joint candidate selection score",
+    )
+    feedforward_eval_parser.add_argument(
+        "--position-score-weight",
+        type=float,
+        default=1.0,
+        help="Weight for normalized axis position error in the joint candidate selection score",
     )

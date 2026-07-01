@@ -179,6 +179,7 @@ class KinematicModelEvaluator:
             "limit_abs_error_mean": _mean_or_none(limit_abs_errors),
             "q_rmse_mean": _mean_or_none(q_rmse),
             "q_rmse_offset_aligned_mean": _mean_or_none(q_rmse_aligned),
+            "by_ground_truth_joint_type": _summary_by_joint_type(matched),
         }
 
 
@@ -259,6 +260,39 @@ def _finite_values(values: Any) -> list[float]:
     return out
 
 
+def _summary_by_joint_type(matched: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    joint_types = sorted({str(item.get("ground_truth_joint_type", "unknown")) for item in matched})
+    for joint_type in joint_types:
+        rows = [item for item in matched if str(item.get("ground_truth_joint_type", "unknown")) == joint_type]
+        type_correct = [
+            bool(item.get("joint_type_correct", False))
+            for item in rows
+            if "joint_type_correct" in item
+        ]
+        axis_errors = _finite_values(item.get("axis_angle_error_deg") for item in rows)
+        pivot_errors = _finite_values(item.get("pivot_error_m") for item in rows)
+        q_rmse_aligned = []
+        for item in rows:
+            q_error = item.get("q_error")
+            if isinstance(q_error, dict):
+                q_rmse_aligned.extend(_finite_values([q_error.get("q_rmse_offset_aligned")]))
+        out[joint_type] = {
+            "joint_count": len(rows),
+            "joint_type_accuracy": (
+                sum(1 for value in type_correct if value) / len(type_correct)
+                if type_correct
+                else None
+            ),
+            "axis_angle_error_deg_mean": _mean_or_none(axis_errors),
+            "axis_angle_error_deg_max": max(axis_errors) if axis_errors else None,
+            "pivot_error_m_mean": _mean_or_none(pivot_errors),
+            "pivot_error_m_max": max(pivot_errors) if pivot_errors else None,
+            "q_rmse_offset_aligned_mean": _mean_or_none(q_rmse_aligned),
+        }
+    return out
+
+
 def _mean_or_none(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
@@ -281,4 +315,3 @@ def _cross(a: list[float], b: list[float]) -> list[float]:
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
     ]
-

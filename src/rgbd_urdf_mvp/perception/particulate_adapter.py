@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ class ParticulateInferenceConfig:
 
 class ParticulateInferenceRunner:
     def run(self, config: ParticulateInferenceConfig) -> Path:
+        total_started = time.perf_counter()
         particulate_root = _resolve_path(config.particulate_root)
         if not particulate_root.exists():
             raise FileNotFoundError(
@@ -47,7 +49,9 @@ class ParticulateInferenceRunner:
         output_dir = _resolve_path(config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         source_mesh_path = self._resolve_mesh_path(config)
+        mesh_prepare_started = time.perf_counter()
         mesh_path = self._prepare_mesh_path(source_mesh_path, output_dir, config.target_faces)
+        mesh_prepare_s = time.perf_counter() - mesh_prepare_started
 
         command = [
             str(config.python_bin),
@@ -90,11 +94,15 @@ class ParticulateInferenceRunner:
             "command": command,
             "dry_run": bool(config.dry_run),
             "artifacts": {},
+            "timings": {
+                "mesh_prepare_s": mesh_prepare_s,
+            },
         }
 
         if not config.dry_run:
             stdout_path = output_dir / "particulate_stdout.log"
             stderr_path = output_dir / "particulate_stderr.log"
+            subprocess_started = time.perf_counter()
             with stdout_path.open("w", encoding="utf-8") as stdout_file:
                 with stderr_path.open("w", encoding="utf-8") as stderr_file:
                     subprocess.run(
@@ -106,11 +114,15 @@ class ParticulateInferenceRunner:
                         stderr=stderr_file,
                         check=True,
                     )
+            manifest["timings"]["subprocess_s"] = time.perf_counter() - subprocess_started
+            collect_started = time.perf_counter()
             manifest["artifacts"] = self._collect_artifacts(output_dir)
+            manifest["timings"]["collect_artifacts_s"] = time.perf_counter() - collect_started
             manifest["logs"] = {
                 "stdout": str(stdout_path.resolve()),
                 "stderr": str(stderr_path.resolve()),
             }
+            manifest["timings"]["wrapper_reported"] = _parse_particulate_timing_log(stdout_path)
             if not any(manifest["artifacts"].values()):
                 save_json(manifest, manifest_path)
                 tail = _tail_text(stdout_path) + _tail_text(stderr_path)
@@ -119,6 +131,7 @@ class ParticulateInferenceRunner:
                     f"See logs: {stdout_path} {stderr_path}{tail}"
                 )
 
+        manifest["timings"]["total_s"] = time.perf_counter() - total_started
         save_json(manifest, manifest_path)
         return manifest_path
 
@@ -309,3 +322,29 @@ def _tail_text(path: Path, max_chars: int = 4000) -> str:
     if not text:
         return ""
     return f"\n--- tail {path.name} ---\n{text[-max_chars:]}"
+
+
+def _parse_particulate_timing_log(path: Path) -> dict[str, float]:
+    if not path.exists():
+        return {}
+    timings: dict[str, float] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "[particulate-timing]" not in line:
+            continue
+        tokens = line.split()
+        if len(tokens) < 2:
+            continue
+        name = tokens[1]
+        for token in tokens[2:]:
+            if token.startswith("elapsed_s="):
+                try:
+                    timings[f"{name}_elapsed_s"] = float(token.split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif token.endswith("_s") and "=" in token:
+                key, value = token.split("=", 1)
+                try:
+                    timings[key] = float(value)
+                except ValueError:
+                    pass
+    return timings
