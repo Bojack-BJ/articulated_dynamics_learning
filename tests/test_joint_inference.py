@@ -254,6 +254,115 @@ class JointInferenceTests(unittest.TestCase):
             self.assertEqual(joint["limits"], [-1.0, 0.0])
             self.assertEqual([sample["q"] for sample in joint["q_samples"]], [-0.2, -0.5, -0.8])
 
+    def test_mujoco_joint_prior_accepts_tracking_manifest_input_episode_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_path = root / "model.xml"
+            episode_path = root / "episode.json"
+            manifest_path = root / "part_tracks.json"
+            part_pose_path = root / "part_poses.json"
+
+            model_path.write_text(
+                """
+<mujoco model="prior_test">
+  <worldbody>
+    <body name="base">
+      <body name="drawer">
+        <joint name="slide" type="slide" axis="1 0 0" range="0 0.5" />
+      </body>
+    </body>
+  </worldbody>
+</mujoco>
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            episode_path.write_text(
+                json.dumps(
+                    {
+                        "frames": [
+                            {"action_log": {"joint_positions": {"slide": value}}}
+                            for value in [0.0, 0.2, 0.4]
+                        ],
+                        "metadata": {"model_path": str(model_path)},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "input_episode_path": str(episode_path),
+                        "part_segmentation": {
+                            "parts": [
+                                {"part_id": 1, "name": "base", "role": "base", "joint_names": []},
+                                {
+                                    "part_id": 2,
+                                    "name": "drawer",
+                                    "role": "articulated",
+                                    "joint_names": ["slide"],
+                                },
+                            ]
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            part_pose_path.write_text(
+                json.dumps(
+                    {
+                        "input_path": str(manifest_path),
+                        "anchor_part_id": 1,
+                        "anchor_part_name": "base",
+                        "parts": [
+                            {
+                                "part_id": 1,
+                                "name": "base",
+                                "canonical_frame": {
+                                    "rotation_matrix": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                                    "translation": [0.0, 0.0, 0.0],
+                                },
+                                "samples": [],
+                            },
+                            {
+                                "part_id": 2,
+                                "name": "drawer",
+                                "samples": [
+                                    {
+                                        "frame_index": index,
+                                        "timestamp_s": index * 0.1,
+                                        "valid": True,
+                                        "relative_to_anchor": {
+                                            "rotation_matrix": _rotation_z(angle),
+                                            "translation": [offset, 0.0, 0.0],
+                                        },
+                                    }
+                                    for index, (angle, offset) in enumerate([(0.0, 0.0), (0.4, 0.2), (0.8, 0.4)])
+                                ],
+                                "relative_motion_summary": {
+                                    "translation_range": [0.4, 0.0, 0.0],
+                                    "rotation_angle_range_rad": 0.8,
+                                },
+                            },
+                        ],
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            output_path = JointInferencer(JointInferenceConfig(input_path=part_pose_path, mujoco_prior="required")).infer()
+            artifact = json.loads(output_path.read_text(encoding="utf-8"))
+            joint = artifact["joints"][0]
+
+            self.assertEqual(artifact["mujoco_prior_count"], 1)
+            self.assertEqual(joint["joint_type"], "prismatic")
+            self.assertEqual(joint["prior"]["joint_name"], "slide")
+            self.assertEqual([sample["q"] for sample in joint["q_samples"]], [0.0, 0.2, 0.4])
+
 
 if __name__ == "__main__":
     unittest.main()

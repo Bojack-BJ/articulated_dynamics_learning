@@ -18,6 +18,12 @@ class JointInferenceConfig:
     translation_threshold_m: float = 0.02
     delta_rotation_epsilon_rad: float = 0.01
     delta_translation_epsilon_m: float = 1e-4
+    use_track_translation_axis: bool = True
+    use_track_residual_type: bool = True
+    track_residual_requires_pose_candidate: bool = False
+    track_residual_decision_ratio: float = 0.85
+    min_track_residual_samples: int = 20
+    min_track_residual_tracks: int = 12
     mujoco_prior: str = "auto"
 
 
@@ -54,6 +60,10 @@ def _subtract(a: list[float], b: list[float]) -> list[float]:
 
 def _scale(vec: list[float], scalar: float) -> list[float]:
     return [scalar * value for value in vec]
+
+
+def _distance(a: list[float], b: list[float]) -> float:
+    return _norm(_subtract(a, b))
 
 
 def _transpose3(matrix: list[list[float]]) -> list[list[float]]:
@@ -152,6 +162,29 @@ def _mean_point(points: list[list[float]]) -> list[float]:
 def _project_point_to_line(point: list[float], line_direction: list[float]) -> list[float]:
     direction = _normalize(line_direction, fallback=[1.0, 0.0, 0.0])
     return _scale(direction, _dot(point, direction))
+
+
+def _rotate_vector_about_axis(vector: list[float], axis: list[float], angle: float) -> list[float]:
+    unit_axis = _normalize(axis, fallback=[0.0, 0.0, 1.0])
+    cos_q = math.cos(angle)
+    sin_q = math.sin(angle)
+    return _add(
+        _add(_scale(vector, cos_q), _scale(_cross(unit_axis, vector), sin_q)),
+        _scale(unit_axis, _dot(unit_axis, vector) * (1.0 - cos_q)),
+    )
+
+
+def _signed_angle_between_about_axis(a: list[float], b: list[float], axis: list[float]) -> float | None:
+    unit_axis = _normalize(axis, fallback=[0.0, 0.0, 1.0])
+    a_perp = _subtract(a, _scale(unit_axis, _dot(a, unit_axis)))
+    b_perp = _subtract(b, _scale(unit_axis, _dot(b, unit_axis)))
+    a_norm = _norm(a_perp)
+    b_norm = _norm(b_perp)
+    if a_norm < 1e-8 or b_norm < 1e-8:
+        return None
+    a_unit = _scale(a_perp, 1.0 / a_norm)
+    b_unit = _scale(b_perp, 1.0 / b_norm)
+    return math.atan2(_dot(unit_axis, _cross(a_unit, b_unit)), max(-1.0, min(1.0, _dot(a_unit, b_unit))))
 
 
 def _parse_vec3(raw: str | None, fallback: list[float]) -> list[float]:
@@ -273,10 +306,12 @@ def _load_mujoco_joint_priors(artifact: dict[str, Any]) -> dict[int, dict[str, A
     if not manifest_path.exists():
         return {}
     manifest = load_json(manifest_path)
-    episode_path_raw = manifest.get("episode_path")
+    episode_path_raw = manifest.get("episode_path") or manifest.get("input_episode_path")
     if not isinstance(episode_path_raw, str):
         return {}
     episode_path = Path(episode_path_raw)
+    if not episode_path.is_absolute():
+        episode_path = manifest_path.parent / episode_path
     if not episode_path.exists():
         return {}
     episode = load_json(episode_path)
@@ -284,6 +319,8 @@ def _load_mujoco_joint_priors(artifact: dict[str, Any]) -> dict[int, dict[str, A
     if not isinstance(model_path_raw, str):
         return {}
     model_path = Path(model_path_raw)
+    if not model_path.is_absolute():
+        model_path = episode_path.parent / model_path
     if not model_path.exists():
         return {}
 
@@ -339,14 +376,44 @@ def _load_mujoco_joint_priors(artifact: dict[str, Any]) -> dict[int, dict[str, A
     return priors
 
 
+def _load_track_artifact(part_pose_artifact: dict[str, Any]) -> dict[str, Any] | None:
+    input_path = part_pose_artifact.get("input_path")
+    if not isinstance(input_path, str):
+        return None
+    track_path = Path(input_path)
+    if not track_path.exists():
+        return None
+    try:
+        payload = load_json(track_path)
+    except Exception:
+        return None
+    return payload if isinstance(payload.get("tracks"), list) else None
+
+
+def _tracks_by_part(track_artifact: dict[str, Any] | None) -> dict[int, list[dict[str, Any]]]:
+    if track_artifact is None:
+        return {}
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for track in track_artifact.get("tracks", []):
+        if not isinstance(track, dict):
+            continue
+        part_id = int(track.get("part_id", 0))
+        if part_id <= 0:
+            continue
+        grouped.setdefault(part_id, []).append(track)
+    return grouped
+
+
 class JointInferencer:
     def __init__(self, config: JointInferenceConfig) -> None:
         self.config = config
+        self._tracks_by_part: dict[int, list[dict[str, Any]]] = {}
 
     def infer(self) -> Path:
         input_path = Path(self.config.input_path).resolve()
         artifact = load_json(input_path)
         parts = artifact.get("parts", [])
+        self._tracks_by_part = _tracks_by_part(_load_track_artifact(artifact))
         anchor_part_id = int(artifact.get("anchor_part_id", 0))
         anchor_part_name = str(artifact.get("anchor_part_name", "anchor"))
         mujoco_priors = {}
@@ -432,6 +499,34 @@ class JointInferencer:
         mean_delta_angle = fmean(delta_angles) if delta_angles else 0.0
         mean_delta_translation = fmean(delta_translation_magnitudes) if delta_translation_magnitudes else 0.0
 
+        rev_axis, rev_pivot, rev_q_values, rev_confidence = self._infer_revolute(
+            relative_poses,
+            delta_rotations,
+            delta_translations,
+        )
+        prism_axis, prism_pivot, prism_q_values, prism_confidence = self._infer_prismatic(
+            relative_poses,
+            delta_translations,
+            translation_range,
+        )
+        track_translation_axis = self._track_translation_axis(
+            int(part.get("part_id", 0)),
+            {int(pose["frame_index"]) for pose in relative_poses},
+        )
+        if self.config.use_track_translation_axis and track_translation_axis is not None:
+            prism_axis = track_translation_axis["axis"]
+            prism_q_values = self._prismatic_q_values_for_axis(relative_poses, prism_axis)
+            prism_confidence = max(prism_confidence, min(1.0, 0.65 + 0.35 * min(1.0, track_translation_axis["track_count"] / 32.0)))
+        track_model_comparison = self._compare_track_motion_models(
+            part_id=int(part.get("part_id", 0)),
+            revolute_axis=rev_axis,
+            revolute_pivot=rev_pivot,
+            prismatic_axis=prism_axis,
+            frame_indices=[int(pose["frame_index"]) for pose in relative_poses],
+            rotation_candidate=rotation_range >= self.config.rotation_threshold_rad,
+            translation_candidate=translation_range_norm >= self.config.translation_threshold_m,
+        )
+
         if mujoco_prior is not None:
             joint_type = str(mujoco_prior.get("joint_type", "fixed"))
             axis = [float(value) for value in mujoco_prior.get("axis", [0.0, 0.0, 1.0])]
@@ -443,24 +538,23 @@ class JointInferencer:
                     for pose in relative_poses
                 ]
             elif joint_type == "prismatic":
-                _, _, q_values, _ = self._infer_prismatic(relative_poses, delta_translations, translation_range)
+                q_values = prism_q_values
             elif joint_type == "revolute":
-                _, _, q_values, _ = self._infer_revolute(relative_poses, delta_rotations, delta_translations)
+                q_values = rev_q_values
             else:
                 q_values = [0.0 for _ in relative_poses]
             confidence = 1.0
-        elif rotation_range >= self.config.rotation_threshold_rad:
-            joint_type = "revolute"
-            axis, pivot, q_values, confidence = self._infer_revolute(relative_poses, delta_rotations, delta_translations)
-        elif translation_range_norm >= self.config.translation_threshold_m:
-            joint_type = "prismatic"
-            axis, pivot, q_values, confidence = self._infer_prismatic(relative_poses, delta_translations, translation_range)
         else:
-            joint_type = "fixed"
-            axis = [0.0, 0.0, 1.0]
-            pivot = _mean_point([pose["translation"] for pose in relative_poses])
-            q_values = [0.0 for _ in relative_poses]
-            confidence = 0.25
+            joint_type = self._select_joint_type(rotation_range, translation_range_norm, track_model_comparison)
+            if joint_type == "prismatic":
+                axis, pivot, q_values, confidence = prism_axis, prism_pivot, prism_q_values, prism_confidence
+            elif joint_type == "revolute":
+                axis, pivot, q_values, confidence = rev_axis, rev_pivot, rev_q_values, rev_confidence
+            else:
+                axis = [0.0, 0.0, 1.0]
+                pivot = _mean_point([pose["translation"] for pose in relative_poses])
+                q_values = [0.0 for _ in relative_poses]
+                confidence = 0.25
 
         limits = [min(q_values), max(q_values)] if q_values else [0.0, 0.0]
         if mujoco_prior is not None and mujoco_prior.get("limits") is not None:
@@ -492,6 +586,8 @@ class JointInferencer:
                 "mean_delta_angle_rad": mean_delta_angle,
                 "mean_delta_translation_m": mean_delta_translation,
                 "valid_sample_count": len(relative_poses),
+                "track_translation_axis": track_translation_axis,
+                "track_model_comparison": track_model_comparison,
             },
             "q_samples": [
                 {
@@ -600,3 +696,239 @@ class JointInferencer:
         q_values = [_dot(_subtract(translation, reference_translation), axis) for translation in translations]
         confidence = min(1.0, 0.45 + 0.45 * alignment + 0.10 * min(1.0, len(relative_poses) / 20.0))
         return axis, pivot, q_values, confidence
+
+    def _prismatic_q_values_for_axis(self, relative_poses: list[dict[str, Any]], axis: list[float]) -> list[float]:
+        unit_axis = _normalize(axis, fallback=[1.0, 0.0, 0.0])
+        translations = [pose["translation"] for pose in relative_poses]
+        reference_translation = translations[0]
+        return [_dot(_subtract(translation, reference_translation), unit_axis) for translation in translations]
+
+    def _track_translation_axis(self, part_id: int, allowed_frames: set[int]) -> dict[str, Any] | None:
+        tracks = self._tracks_by_part.get(part_id, [])
+        if len(tracks) < self.config.min_track_residual_tracks:
+            return None
+        displacements = []
+        for track in tracks:
+            valid_samples = [
+                sample
+                for sample in track.get("samples", [])
+                if _valid_track_sample(sample) and int(sample["frame_index"]) in allowed_frames
+            ]
+            if len(valid_samples) < 2:
+                continue
+            start = [float(value) for value in valid_samples[0]["xyz_world"]]
+            end = [float(value) for value in valid_samples[-1]["xyz_world"]]
+            displacement = _subtract(end, start)
+            if _norm(displacement) < self.config.delta_translation_epsilon_m:
+                continue
+            displacements.append(displacement)
+        if len(displacements) < self.config.min_track_residual_tracks:
+            return None
+        mean_displacement = _mean_point(displacements)
+        if _norm(mean_displacement) < self.config.translation_threshold_m:
+            return None
+        axis = _normalize(mean_displacement, fallback=[1.0, 0.0, 0.0])
+        return {
+            "source": "track_endpoint_centroid_displacement",
+            "axis": axis,
+            "track_count": len(displacements),
+            "displacement": mean_displacement,
+            "displacement_norm_m": _norm(mean_displacement),
+        }
+
+    def _select_joint_type(
+        self,
+        rotation_range: float,
+        translation_range_norm: float,
+        track_model_comparison: dict[str, Any] | None,
+    ) -> str:
+        rotation_candidate = rotation_range >= self.config.rotation_threshold_rad
+        translation_candidate = translation_range_norm >= self.config.translation_threshold_m
+        residual_type = str(track_model_comparison.get("selected_type", "")) if track_model_comparison else ""
+        residual_decisive = bool(track_model_comparison.get("decision_applied", False)) if track_model_comparison else False
+        if residual_decisive and residual_type in {"revolute", "prismatic"}:
+            return residual_type
+        if rotation_candidate:
+            return "revolute"
+        if translation_candidate:
+            return "prismatic"
+        return "fixed"
+
+    def _compare_track_motion_models(
+        self,
+        part_id: int,
+        revolute_axis: list[float],
+        revolute_pivot: list[float],
+        prismatic_axis: list[float],
+        frame_indices: list[int],
+        rotation_candidate: bool,
+        translation_candidate: bool,
+    ) -> dict[str, Any] | None:
+        if not self.config.use_track_residual_type:
+            return None
+        tracks = self._tracks_by_part.get(part_id, [])
+        if not tracks:
+            return None
+        allowed_frames = set(frame_indices)
+        prismatic = self._prismatic_track_residual(tracks, prismatic_axis, allowed_frames)
+        revolute = self._revolute_track_residual(tracks, revolute_axis, revolute_pivot, allowed_frames)
+        if prismatic is None or revolute is None:
+            return None
+        sample_count = min(int(prismatic["sample_count"]), int(revolute["sample_count"]))
+        selected_type = "prismatic" if prismatic["rmse_m"] <= revolute["rmse_m"] else "revolute"
+        best = min(float(prismatic["rmse_m"]), float(revolute["rmse_m"]))
+        other = max(float(prismatic["rmse_m"]), float(revolute["rmse_m"]))
+        ratio = best / other if other > 1e-12 else 1.0
+        residual_decisive = (
+            sample_count >= self.config.min_track_residual_samples
+            and len(tracks) >= self.config.min_track_residual_tracks
+            and ratio <= self.config.track_residual_decision_ratio
+        )
+        pose_candidate_allows_selected_type = (
+            (selected_type == "revolute" and rotation_candidate)
+            or (selected_type == "prismatic" and translation_candidate)
+        )
+        type_override_applied = residual_decisive and (
+            pose_candidate_allows_selected_type
+            or not self.config.track_residual_requires_pose_candidate
+        )
+        return {
+            "source": "part_tracks_3d_replay",
+            "selected_type": selected_type,
+            "residual_decisive": bool(residual_decisive),
+            "type_override_applied": bool(type_override_applied),
+            "decision_applied": bool(type_override_applied),
+            "selection_mode": (
+                "pose_candidate_gated"
+                if self.config.track_residual_requires_pose_candidate
+                else "track_model_first"
+            ),
+            "pose_candidate_allows_selected_type": bool(pose_candidate_allows_selected_type),
+            "rotation_candidate": bool(rotation_candidate),
+            "translation_candidate": bool(translation_candidate),
+            "decision_ratio": float(ratio),
+            "decision_threshold": float(self.config.track_residual_decision_ratio),
+            "min_samples": int(self.config.min_track_residual_samples),
+            "min_tracks": int(self.config.min_track_residual_tracks),
+            "sample_count": int(sample_count),
+            "track_count": len(tracks),
+            "prismatic": prismatic,
+            "revolute": revolute,
+        }
+
+    def _prismatic_track_residual(
+        self,
+        tracks: list[dict[str, Any]],
+        axis: list[float],
+        allowed_frames: set[int],
+    ) -> dict[str, Any] | None:
+        unit_axis = _normalize(axis, fallback=[1.0, 0.0, 0.0])
+        reference_by_track: dict[int, list[float]] = {}
+        frame_samples: dict[int, list[tuple[int, list[float]]]] = {}
+        for track in tracks:
+            track_id = int(track.get("track_id", len(reference_by_track)))
+            reference = track.get("reference_xyz_world")
+            if not isinstance(reference, list) or len(reference) != 3:
+                continue
+            reference_by_track[track_id] = [float(value) for value in reference]
+            for sample in track.get("samples", []):
+                if not _valid_track_sample(sample):
+                    continue
+                frame_index = int(sample["frame_index"])
+                if frame_index not in allowed_frames:
+                    continue
+                frame_samples.setdefault(frame_index, []).append((track_id, [float(value) for value in sample["xyz_world"]]))
+        residuals: list[float] = []
+        q_values: list[float] = []
+        for samples in frame_samples.values():
+            frame_q_votes = []
+            valid_samples = []
+            for track_id, point in samples:
+                reference = reference_by_track.get(track_id)
+                if reference is None:
+                    continue
+                frame_q_votes.append(_dot(_subtract(point, reference), unit_axis))
+                valid_samples.append((reference, point))
+            if not frame_q_votes:
+                continue
+            q = fmean(frame_q_votes)
+            q_values.append(q)
+            for reference, point in valid_samples:
+                predicted = _add(reference, _scale(unit_axis, q))
+                residuals.append(_distance(point, predicted))
+        if not residuals:
+            return None
+        return {
+            "rmse_m": math.sqrt(fmean(value * value for value in residuals)),
+            "mae_m": fmean(residuals),
+            "sample_count": len(residuals),
+            "q_range": [min(q_values), max(q_values)] if q_values else [0.0, 0.0],
+        }
+
+    def _revolute_track_residual(
+        self,
+        tracks: list[dict[str, Any]],
+        axis: list[float],
+        pivot: list[float],
+        allowed_frames: set[int],
+    ) -> dict[str, Any] | None:
+        unit_axis = _normalize(axis, fallback=[0.0, 0.0, 1.0])
+        reference_by_track: dict[int, list[float]] = {}
+        frame_samples: dict[int, list[tuple[int, list[float]]]] = {}
+        for track in tracks:
+            track_id = int(track.get("track_id", len(reference_by_track)))
+            reference = track.get("reference_xyz_world")
+            if not isinstance(reference, list) or len(reference) != 3:
+                continue
+            reference_by_track[track_id] = [float(value) for value in reference]
+            for sample in track.get("samples", []):
+                if not _valid_track_sample(sample):
+                    continue
+                frame_index = int(sample["frame_index"])
+                if frame_index not in allowed_frames:
+                    continue
+                frame_samples.setdefault(frame_index, []).append((track_id, [float(value) for value in sample["xyz_world"]]))
+        residuals: list[float] = []
+        q_values: list[float] = []
+        for samples in frame_samples.values():
+            sin_sum = 0.0
+            cos_sum = 0.0
+            valid_samples = []
+            for track_id, point in samples:
+                reference = reference_by_track.get(track_id)
+                if reference is None:
+                    continue
+                angle = _signed_angle_between_about_axis(_subtract(reference, pivot), _subtract(point, pivot), unit_axis)
+                if angle is None:
+                    continue
+                radius = _norm(_subtract(_subtract(reference, pivot), _scale(unit_axis, _dot(_subtract(reference, pivot), unit_axis))))
+                weight = max(1e-6, radius)
+                sin_sum += weight * math.sin(angle)
+                cos_sum += weight * math.cos(angle)
+                valid_samples.append((reference, point))
+            if not valid_samples:
+                continue
+            q = math.atan2(sin_sum, cos_sum)
+            q_values.append(q)
+            for reference, point in valid_samples:
+                predicted = _add(pivot, _rotate_vector_about_axis(_subtract(reference, pivot), unit_axis, q))
+                residuals.append(_distance(point, predicted))
+        if not residuals:
+            return None
+        return {
+            "rmse_m": math.sqrt(fmean(value * value for value in residuals)),
+            "mae_m": fmean(residuals),
+            "sample_count": len(residuals),
+            "q_range": [min(q_values), max(q_values)] if q_values else [0.0, 0.0],
+        }
+
+
+def _valid_track_sample(sample: Any) -> bool:
+    return (
+        isinstance(sample, dict)
+        and bool(sample.get("visible", False))
+        and bool(sample.get("depth_valid", False))
+        and bool(sample.get("mask_consistent", True))
+        and isinstance(sample.get("xyz_world"), list)
+        and len(sample.get("xyz_world", [])) == 3
+    )

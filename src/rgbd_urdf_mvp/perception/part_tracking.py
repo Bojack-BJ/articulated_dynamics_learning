@@ -79,6 +79,91 @@ def _resolve_tracking_device(torch_module: Any, config: PartPixelTrackingConfig)
     return _resolve_device(torch_module, config.device)
 
 
+def _sync_torch_device(torch_module: Any, device: str) -> None:
+    try:
+        if str(device).startswith("cuda") and torch_module.cuda.is_available():
+            torch_module.cuda.synchronize()
+        elif str(device) == "mps" and hasattr(torch_module, "mps") and hasattr(torch_module.mps, "synchronize"):
+            torch_module.mps.synchronize()
+    except Exception:
+        return
+
+
+def _reset_torch_peak_stats(torch_module: Any, device: str) -> None:
+    try:
+        if str(device).startswith("cuda") and torch_module.cuda.is_available():
+            torch_module.cuda.reset_peak_memory_stats()
+        elif str(device) == "mps" and hasattr(torch_module, "mps") and hasattr(torch_module.mps, "reset_peak_memory_stats"):
+            torch_module.mps.reset_peak_memory_stats()
+    except Exception:
+        return
+
+
+def _torch_resource_snapshot(torch_module: Any, device: str, label: str) -> dict[str, Any]:
+    _sync_torch_device(torch_module, device)
+    snapshot: dict[str, Any] = {
+        "label": label,
+        "device": str(device),
+        "timestamp_s": time.time(),
+    }
+    try:
+        if str(device).startswith("cuda") and torch_module.cuda.is_available():
+            snapshot.update(
+                {
+                    "backend": "cuda",
+                    "current_allocated_bytes": int(torch_module.cuda.memory_allocated()),
+                    "driver_or_reserved_bytes": int(torch_module.cuda.memory_reserved()),
+                    "max_memory_allocated_bytes": int(torch_module.cuda.max_memory_allocated()),
+                    "max_memory_reserved_bytes": int(torch_module.cuda.max_memory_reserved()),
+                    "device_name": str(torch_module.cuda.get_device_name()),
+                }
+            )
+        elif str(device) == "mps" and hasattr(torch_module, "mps"):
+            mps = torch_module.mps
+            if hasattr(mps, "current_allocated_memory"):
+                snapshot["current_allocated_bytes"] = int(mps.current_allocated_memory())
+            if hasattr(mps, "driver_allocated_memory"):
+                snapshot["driver_or_reserved_bytes"] = int(mps.driver_allocated_memory())
+            if hasattr(mps, "recommended_max_memory"):
+                snapshot["recommended_max_bytes"] = int(mps.recommended_max_memory())
+            snapshot["backend"] = "mps"
+        else:
+            snapshot["backend"] = "cpu"
+    except Exception as exc:
+        snapshot["error"] = str(exc)
+    return snapshot
+
+
+def _summarize_torch_resource_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    def max_numeric(key: str) -> int | None:
+        values = [
+            int(sample[key])
+            for sample in samples
+            if isinstance(sample, dict) and isinstance(sample.get(key), (int, float))
+        ]
+        return max(values) if values else None
+
+    def mib(value: int | None) -> float | None:
+        return None if value is None else float(value) / (1024.0 * 1024.0)
+
+    peak_current = max_numeric("current_allocated_bytes")
+    peak_driver = max_numeric("driver_or_reserved_bytes")
+    peak_max_allocated = max_numeric("max_memory_allocated_bytes")
+    return {
+        "sample_count": len(samples),
+        "device": samples[-1].get("device") if samples else None,
+        "backend": samples[-1].get("backend") if samples else None,
+        "peak_current_allocated_bytes": peak_current,
+        "peak_current_allocated_mib": mib(peak_current),
+        "peak_driver_or_reserved_bytes": peak_driver,
+        "peak_driver_or_reserved_mib": mib(peak_driver),
+        "peak_max_memory_allocated_bytes": peak_max_allocated,
+        "peak_max_memory_allocated_mib": mib(peak_max_allocated),
+        "recommended_max_bytes": max_numeric("recommended_max_bytes"),
+        "samples": samples,
+    }
+
+
 class _ProgressPrinter:
     def __init__(self, total_steps: int, enabled: bool) -> None:
         self.total_steps = max(1, int(total_steps))
@@ -365,7 +450,11 @@ class PartPixelTracker:
         output_json.parent.mkdir(parents=True, exist_ok=True)
 
         device = _resolve_tracking_device(torch, self.config)
+        resource_samples: list[dict[str, Any]] = []
+        _reset_torch_peak_stats(torch, device)
+        resource_samples.append(_torch_resource_snapshot(torch, device, "before_model_load"))
         model = _load_cotracker_model(self.config, torch, device)
+        resource_samples.append(_torch_resource_snapshot(torch, device, "after_model_load"))
         depth_convention = _depth_convention(episode.metadata)
         part_segmentation = (
             dict(episode.metadata.get("part_segmentation", {}))
@@ -420,6 +509,7 @@ class PartPixelTracker:
                 )
                 view_rgb_paths = [paths[view_index] for paths in rgb_paths_by_frame_view]
                 video = _load_video_tensor(view_rgb_paths, torch, device)
+                resource_samples.append(_torch_resource_snapshot(torch, device, f"view_{view_index}_video_loaded"))
                 for part_id in sorted(part_metadata):
                     reference_frame = reference_frame_by_part[part_id]
                     if reference_frame >= len(part_masks_by_frame_view):
@@ -459,6 +549,13 @@ class PartPixelTracker:
                         video,
                         queries=queries,
                         backward_tracking=bool(self.config.allow_backward_tracking),
+                    )
+                    resource_samples.append(
+                        _torch_resource_snapshot(
+                            torch,
+                            device,
+                            f"view_{view_index}_part_{part_id}_cotracker_done",
+                        )
                     )
                     pred_tracks = pred_tracks.detach().cpu()
                     pred_visibility = pred_visibility.detach().cpu()
@@ -535,6 +632,7 @@ class PartPixelTracker:
                         f"view {view_index + 1}/{view_count} {part_name}: emitted {len(seed_pixels)} tracks",
                     )
         progress.finish(f"done; emitted {len(tracks)} total tracks")
+        resource_samples.append(_torch_resource_snapshot(torch, device, "finished"))
 
         track_counts: dict[int, int] = {}
         for track in tracks:
@@ -551,6 +649,9 @@ class PartPixelTracker:
                 "effective_tracking_fps_hz": _effective_fps(sampled_frames),
                 "view_count": view_count,
                 "device": device,
+                "resource_usage": {
+                    "torch": _summarize_torch_resource_samples(resource_samples),
+                },
                 "cotracker_model": self.config.cotracker_model,
                 "cotracker_repo": None if self.config.cotracker_repo is None else str(self.config.cotracker_repo),
                 "cotracker_checkpoint": None if self.config.cotracker_checkpoint is None else str(self.config.cotracker_checkpoint),

@@ -570,6 +570,7 @@ class MuJoCoRecorderTests(unittest.TestCase):
         qpos_adr = int(model.jnt_qposadr[joint_id])
         dof_adr = int(model.jnt_dofadr[joint_id])
         recorder._initialize_free_joint_state(
+            mujoco,
             model,
             data,
             joint_id,

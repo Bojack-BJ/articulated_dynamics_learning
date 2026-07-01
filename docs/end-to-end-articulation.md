@@ -357,12 +357,89 @@ The corresponding templates live in:
 - `configs/record_hinge.yaml`
 - `configs/record_drawer.yaml`
 - `configs/track_default.yaml`
+- `configs/track_refrigerator_dense.yaml`
 - `configs/identify_dynamics_default.yaml`
 - `configs/identify_dynamics_mjx_default.yaml`
 
 Use `--record-config path/to/template.yaml` or `--track-config path/to/template.yaml`
 when you want one batch run to use a different preset without editing the
 defaults.
+
+For refrigerator batches with drawers/freezers, prefer the dense tracking preset:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch \
+  configs/batch_lightwheel_refrigerators_mjcf.tsv \
+  --output-root outputs/recordings_refrigerators_staged_dense_mps \
+  --record-config configs/record_refrigerator_staged.yaml \
+  --track-config configs/track_refrigerator_dense.yaml \
+  --track-device mps \
+  --tracking-jobs 1 \
+  --mujoco-prior off \
+  --joint-rotation-threshold-rad 0.90
+```
+
+The dense preset uses `seed-stride-px: 8` and
+`max-tracks-per-part-view: 256`. This is intentionally heavier than the default
+because sliding freezer/drawer parts can occupy small visible regions. With only
+a few tracks, the full SE(3) pose fit can explain translation as apparent
+rotation and later misclassify a prismatic joint as revolute.
+
+`infer-joints` now also records `metrics.track_model_comparison` when the input
+`part_poses.json` was estimated from `part_tracks.json`. The comparison replays
+the same 3D tracks under revolute and prismatic candidates and reports both
+RMSEs. It is guarded by minimum distinct tracks and samples. When the residual
+comparison is decisive, it now chooses the joint type directly before falling
+back to pose-derived rotation/translation thresholds. This avoids a hard
+dependency on potentially noisy full-SE(3) pose deltas for sliding parts. Disable
+this diagnostic with `--no-track-residual-type` when you need pure
+pose-threshold behavior, or pass `--track-residual-requires-pose-candidate` to
+reproduce the older pose-gated residual behavior.
+
+For prismatic parts, `infer-joints` also prefers a track-endpoint centroid
+displacement axis when enough tracks are available. This is more robust than
+reading the axis from full SE(3) part poses: small sliding parts can have enough
+tracks to show clean translation while the rigid pose fit still reports spurious
+orientation drift. In refrigerator/freezer tests this reduced prismatic axis
+angle errors from tens of degrees to a few degrees. The prismatic axis location
+or pivot-like position remains less observable from motion alone than a revolute
+hinge pivot; interpret prismatic position/RMSE separately from revolute pivot
+error and prefer axis direction plus q replay error when diagnosing drawer
+motion.
+
+To reproduce the ablation, disable the track-displacement prismatic axis and
+keep everything else fixed:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp infer-joints \
+  outputs/recordings_refrigerators_staged_dense_mps/refrigerator039/pointcloud_4d_partseg/part_poses.json \
+  --output-json outputs/axis_ablation/refrigerator039/joint_inference.json \
+  --mujoco-prior off \
+  --rotation-threshold-rad 0.90 \
+  --no-track-translation-axis
+```
+
+The repository helper `scripts/summarize_axis_ablation.py` compares the SE(3)
+pose-axis variant against the default track-displacement axis over a batch and
+writes `axis_ablation_summary.md/json` plus `axis_ablation_per_joint.tsv`.
+
+To compare the old pose-gated type selection with the default track-model-first
+selection, reuse existing `part_poses.json` / `part_tracks.json` artifacts:
+
+```bash
+PYTHONPATH=src python3 scripts/summarize_joint_type_ablation.py \
+  --batch-config configs/batch_lightwheel_refrigerators_mjcf.tsv \
+  --optimized-root outputs/recordings_refrigerators_staged_dense_mps \
+  --output-dir outputs/feedforward_articulation/lightwheel_refrigerators_view1_dooropen_upY/_evaluation/type_selection_ablation \
+  --rotation-threshold-rad 0.90
+```
+
+This writes `joint_type_ablation_summary.md/json`,
+`joint_type_ablation_per_object.tsv`, and `joint_type_ablation_per_joint.tsv`.
+On the dense refrigerator batch, both variants currently produce the same
+100.0% type accuracy because every decisive residual is already allowed by the
+old pose candidate gate; the new mode removes that future failure mode without a
+measurable runtime cost.
 
 Use `--dynamics-backend mujoco` or `--dynamics-backend mjx` to enable the
 optional Stage 4 dynamics fit. Override its preset with

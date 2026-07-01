@@ -236,6 +236,12 @@ class MuJoCoRecordConfig:
     auto_initial_qvel_min_abs: float = 1.0
     auto_initial_qvel_max_abs: float = 8.0
     initial_joint_qvel: float = 0.0
+    staged_initial_qvel: bool = False
+    staged_primary_tokens: tuple[str, ...] = ("door",)
+    staged_secondary_tokens: tuple[str, ...] = ("drawer", "slide")
+    staged_secondary_count_min: int = 1
+    staged_secondary_count_max: int = 2
+    staged_secondary_start_s: float = 1.2
     kick_force: float = 0.0
     kick_start_s: float = 0.0
     kick_duration_s: float = 0.0
@@ -348,6 +354,10 @@ class MuJoCoEpisodeRecorder:
             raise ValueError("mask_format must be 'pgm' or 'png'")
         if self.config.all_joints and self.config.control_mode != "free":
             raise ValueError("all_joints requires control_mode='free'")
+        if self.config.staged_initial_qvel and self.config.control_mode != "free":
+            raise ValueError("staged_initial_qvel requires control_mode='free'")
+        if self.config.staged_initial_qvel and (self.config.joint_name is not None or self.config.joint_id is not None):
+            raise ValueError("staged_initial_qvel cannot be combined with joint_name/joint_id")
         if self.config.all_joints and (self.config.joint_name is not None or self.config.joint_id is not None):
             raise ValueError("all_joints cannot be combined with joint_name/joint_id")
         if self.config.joint_name is not None and self.config.joint_id is not None:
@@ -393,6 +403,7 @@ class MuJoCoEpisodeRecorder:
         for index, (joint_id, qpos_adr, dof_adr) in enumerate(controlled):
             if self.config.control_mode == "free":
                 self._initialize_free_joint_state(
+                    mujoco,
                     model,
                     data,
                     joint_id,
@@ -467,6 +478,8 @@ class MuJoCoEpisodeRecorder:
         previous_target = joint_limits[0]
         previous_tracking_force = 0.0
         joint_names = [self._joint_name(mujoco, model, joint_id) for joint_id, _, _ in controlled]
+        staged_secondary_joints = self._select_staged_secondary_joints(mujoco, model, controlled, rng)
+        staged_secondary_triggered = False
 
         try:
             for frame_index in range(self.config.frame_count):
@@ -481,6 +494,28 @@ class MuJoCoEpisodeRecorder:
                     step_forces: list[float] = []
                     step_excitation_forces: list[float] = []
                     data.qfrc_applied[:] = 0.0
+
+                    if self.config.staged_initial_qvel and not staged_secondary_triggered:
+                        if step_time_s >= float(self.config.staged_secondary_start_s):
+                            for joint_index, (joint_id, qpos_adr, dof_adr) in enumerate(controlled):
+                                if joint_id not in staged_secondary_joints:
+                                    continue
+                                lower, upper = self._joint_limits(model, joint_id)
+                                if math.isfinite(lower) and math.isfinite(upper) and upper > lower:
+                                    desired_speed = 0.25 * (upper - lower) / self.config.frame_dt
+                                else:
+                                    desired_speed = abs(float(self.config.initial_joint_qvel))
+                                data.qvel[dof_adr] = self._free_initial_qvel(
+                                    model,
+                                    data,
+                                    joint_id,
+                                    qpos_adr,
+                                    joint_index,
+                                    desired_speed,
+                                    lower,
+                                    upper,
+                                )
+                            staged_secondary_triggered = True
 
                     kick_force = 0.0
                     if self.config.control_mode != "free" and self.config.kick_duration_s > 0.0:
@@ -824,6 +859,17 @@ class MuJoCoEpisodeRecorder:
                 "auto_initial_qvel_min_abs": float(self.config.auto_initial_qvel_min_abs),
                 "auto_initial_qvel_max_abs": float(self.config.auto_initial_qvel_max_abs),
                 "initial_joint_qvel": float(self.config.initial_joint_qvel),
+                "staged_initial_qvel": {
+                    "enabled": bool(self.config.staged_initial_qvel),
+                    "primary_tokens": list(self.config.staged_primary_tokens),
+                    "secondary_tokens": list(self.config.staged_secondary_tokens),
+                    "secondary_count_min": int(self.config.staged_secondary_count_min),
+                    "secondary_count_max": int(self.config.staged_secondary_count_max),
+                    "secondary_start_s": float(self.config.staged_secondary_start_s),
+                    "selected_secondary_joints": [
+                        self._joint_name(mujoco, model, joint_id) for joint_id in staged_secondary_joints
+                    ],
+                },
                 "kick": {
                     "force": float(self.config.kick_force),
                     "start_s": float(self.config.kick_start_s),
@@ -926,6 +972,7 @@ class MuJoCoEpisodeRecorder:
 
     def _initialize_free_joint_state(
         self,
+        mujoco: Any,
         model: Any,
         data: Any,
         joint_id: int,
@@ -964,36 +1011,79 @@ class MuJoCoEpisodeRecorder:
                 data.qpos[qpos_adr] = min(max(rest_q, min_q), max_q)
 
         desired_speed = 0.25 * span / self.config.frame_dt
-        if forced_response:
+        if self.config.staged_initial_qvel:
+            if self._joint_matches_tokens(mujoco, model, joint_id, self.config.staged_primary_tokens):
+                data.qvel[dof_adr] = self._free_initial_qvel(
+                    model,
+                    data,
+                    joint_id,
+                    qpos_adr,
+                    joint_index,
+                    desired_speed,
+                    lower,
+                    upper,
+                )
+            else:
+                data.qvel[dof_adr] = 0.0
+        elif forced_response:
             data.qvel[dof_adr] = float(self.config.initial_joint_qvel)
         elif self.config.auto_initial_qvel_from_limits:
-            q0 = float(data.qpos[qpos_adr])
-            qref = float(model.qpos0[qpos_adr])
-            ref_room_upper = max(0.0, upper - qref)
-            ref_room_lower = max(0.0, qref - lower)
-
-            if self.config.auto_initial_qvel_direction_mode == "toward-upper":
-                direction = 1.0
-            elif self.config.auto_initial_qvel_direction_mode == "toward-lower":
-                direction = -1.0
-            else:
-                direction = 1.0 if ref_room_upper > ref_room_lower else -1.0
-            room = max(0.0, (upper - q0) if direction > 0.0 else (q0 - lower))
-
-            effective_min_abs = min(
-                float(self.config.auto_initial_qvel_min_abs),
-                float(self.config.auto_initial_qvel_max_abs),
+            data.qvel[dof_adr] = self._free_initial_qvel(
+                model,
+                data,
+                joint_id,
+                qpos_adr,
+                joint_index,
+                desired_speed,
+                lower,
+                upper,
             )
-            base_speed = max(desired_speed, effective_min_abs)
-            room_ratio = room / span if span > 1e-9 else 0.0
-            speed = base_speed * (0.25 + 0.75 * room_ratio)
-            speed = min(speed, float(self.config.auto_initial_qvel_max_abs))
-            data.qvel[dof_adr] = direction * speed
         elif self.config.initial_joint_qvel != 0.0:
             data.qvel[dof_adr] = float(self.config.initial_joint_qvel)
         else:
             direction = 1.0 if (joint_index % 2 == 0) else -1.0
             data.qvel[dof_adr] = direction * desired_speed
+
+    def _free_initial_qvel(
+        self,
+        model: Any,
+        data: Any,
+        joint_id: int,
+        qpos_adr: int,
+        joint_index: int,
+        desired_speed: float,
+        lower: float,
+        upper: float,
+    ) -> float:
+        if not self.config.auto_initial_qvel_from_limits:
+            if self.config.initial_joint_qvel != 0.0:
+                return float(self.config.initial_joint_qvel)
+            direction = 1.0 if (joint_index % 2 == 0) else -1.0
+            return direction * float(desired_speed)
+
+        q0 = float(data.qpos[qpos_adr])
+        qref = float(model.qpos0[qpos_adr])
+        ref_room_upper = max(0.0, upper - qref)
+        ref_room_lower = max(0.0, qref - lower)
+
+        if self.config.auto_initial_qvel_direction_mode == "toward-upper":
+            direction = 1.0
+        elif self.config.auto_initial_qvel_direction_mode == "toward-lower":
+            direction = -1.0
+        else:
+            direction = 1.0 if ref_room_upper > ref_room_lower else -1.0
+        room = max(0.0, (upper - q0) if direction > 0.0 else (q0 - lower))
+
+        effective_min_abs = min(
+            float(self.config.auto_initial_qvel_min_abs),
+            float(self.config.auto_initial_qvel_max_abs),
+        )
+        base_speed = max(float(desired_speed), effective_min_abs)
+        span = upper - lower
+        room_ratio = room / span if span > 1e-9 else 0.0
+        speed = base_speed * (0.25 + 0.75 * room_ratio)
+        speed = min(speed, float(self.config.auto_initial_qvel_max_abs))
+        return direction * speed
 
     def _open_video_writer(self, output_dir: Path, fps: float, filename: str):
         try:
@@ -1107,7 +1197,7 @@ class MuJoCoEpisodeRecorder:
     def _select_controlled_joints(self, mujoco, model) -> list[tuple[int, int, int]]:
         allowed = {int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE)}
 
-        if self.config.all_joints:
+        if self.config.all_joints or self.config.staged_initial_qvel:
             joint_ids = [jid for jid in range(model.njnt) if int(model.jnt_type[jid]) in allowed]
             if not joint_ids:
                 raise ValueError("No hinge/slide joint found in model")
@@ -1118,6 +1208,36 @@ class MuJoCoEpisodeRecorder:
 
         joint_id = self._resolve_joint_id(mujoco, model)
         return [(joint_id, int(model.jnt_qposadr[joint_id]), int(model.jnt_dofadr[joint_id]))]
+
+    def _select_staged_secondary_joints(
+        self,
+        mujoco,
+        model,
+        controlled: list[tuple[int, int, int]],
+        rng: random.Random,
+    ) -> set[int]:
+        if not self.config.staged_initial_qvel:
+            return set()
+        candidates = [
+            joint_id
+            for joint_id, _qpos_adr, _dof_adr in controlled
+            if self._joint_matches_tokens(mujoco, model, joint_id, self.config.staged_secondary_tokens)
+        ]
+        if not candidates:
+            return set()
+        min_count = max(0, int(self.config.staged_secondary_count_min))
+        max_count = max(min_count, int(self.config.staged_secondary_count_max))
+        count = min(len(candidates), rng.randint(min_count, max_count) if max_count > 0 else 0)
+        if count <= 0:
+            return set()
+        return set(rng.sample(candidates, count))
+
+    def _joint_matches_tokens(self, mujoco, model, joint_id: int, tokens: tuple[str, ...]) -> bool:
+        if not tokens:
+            return False
+        body_id = int(model.jnt_bodyid[joint_id])
+        text = f"{self._joint_name(mujoco, model, joint_id)} {self._body_name(mujoco, model, body_id)}".lower()
+        return any(str(token).lower() in text for token in tokens)
 
     def _resolve_joint_id(self, mujoco, model) -> int:
         allowed = {int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE)}

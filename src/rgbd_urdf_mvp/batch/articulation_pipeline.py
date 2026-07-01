@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 import subprocess
 import sys
 import threading
+import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -108,6 +110,8 @@ class ArticulationBatchConfig:
     fuse_pixel_stride: int = 8
     fuse_voxel_size_m: float = 0.02
     min_tracks_per_part: int = 4
+    joint_rotation_threshold_rad: float | None = None
+    joint_translation_threshold_m: float | None = None
     mujoco_prior_mode: str = "off"
     generate_viewer: bool = True
     dynamics_backend: str = "off"
@@ -270,6 +274,7 @@ class ArticulationBatchRunner:
         self._dynamics_semaphore = threading.Semaphore(self._dynamics_jobs)
 
     def run(self) -> dict[str, Any]:
+        batch_started = time.perf_counter()
         specs = parse_batch_manifest(self._manifest_path)
         total = len(specs)
         failures: list[str] = []
@@ -289,14 +294,19 @@ class ArticulationBatchRunner:
                     skipped += 1
                 else:
                     completed += 1
-            return {
+            result_payload = {
                 "manifest_path": str(self._manifest_path),
                 "objects_total": len(specs),
                 "objects_completed": completed,
                 "objects_skipped": skipped,
                 "objects_failed": failures,
                 "jobs": self.config.jobs,
+                "tracking_jobs": self._tracking_jobs,
+                "dynamics_jobs": self._dynamics_jobs,
+                "wall_clock_s": time.perf_counter() - batch_started,
             }
+            self._write_batch_timing(result_payload)
+            return result_payload
 
         self._batch_log_dir.mkdir(parents=True, exist_ok=True)
         self._console(
@@ -333,16 +343,42 @@ class ArticulationBatchRunner:
                     )
 
         if failures:
+            self._write_batch_timing(
+                {
+                    "manifest_path": str(self._manifest_path),
+                    "objects_total": len(specs),
+                    "objects_completed": completed,
+                    "objects_skipped": skipped,
+                    "objects_failed": failures,
+                    "jobs": self.config.jobs,
+                    "tracking_jobs": self._tracking_jobs,
+                    "dynamics_jobs": self._dynamics_jobs,
+                    "batch_log_dir": str(self._batch_log_dir),
+                    "wall_clock_s": time.perf_counter() - batch_started,
+                    "status": "failed",
+                }
+            )
             raise RuntimeError(f"Batch pipeline finished with failures: {' '.join(failures)}")
-        return {
+        result_payload = {
             "manifest_path": str(self._manifest_path),
             "objects_total": len(specs),
             "objects_completed": completed,
             "objects_skipped": skipped,
             "objects_failed": failures,
             "jobs": self.config.jobs,
+            "tracking_jobs": self._tracking_jobs,
+            "dynamics_jobs": self._dynamics_jobs,
             "batch_log_dir": str(self._batch_log_dir),
+            "wall_clock_s": time.perf_counter() - batch_started,
+            "status": "completed",
         }
+        self._write_batch_timing(result_payload)
+        return result_payload
+
+    def _write_batch_timing(self, payload: dict[str, Any]) -> None:
+        self._batch_log_dir.mkdir(parents=True, exist_ok=True)
+        timing_path = self._batch_log_dir / "_batch_timing.json"
+        timing_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     def _process_object_with_log(self, spec: BatchObjectSpec, index: int, total: int, log_path: Path) -> str:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -384,15 +420,18 @@ class ArticulationBatchRunner:
             )
         else:
             self._announce(spec.object_id, index, total, f"record-mujoco joint={joint_name}", stream)
+            record_template = self._resolve_record_config_path(spec.category)
+            record_overrides: dict[str, Any] = {
+                "model": model_path,
+                "category": spec.category,
+                "object-id": spec.object_id,
+                "output-dir": self._output_root,
+            }
+            if not record_template_uses_multi_joint(record_template):
+                record_overrides["joint-name"] = joint_name
             record_argv = build_cli_argv_from_template(
-                self._resolve_record_config_path(spec.category),
-                {
-                    "model": model_path,
-                    "category": spec.category,
-                    "object-id": spec.object_id,
-                    "output-dir": self._output_root,
-                    "joint-name": joint_name,
-                },
+                record_template,
+                record_overrides,
             )
             self._run_cli(record_argv, stream)
 
@@ -489,17 +528,19 @@ class ArticulationBatchRunner:
             )
         else:
             self._announce(spec.object_id, index, total, "infer-joints", stream)
-            self._run_cli(
-                [
-                    "infer-joints",
-                    str(artifacts.poses_json),
-                    "--output-json",
-                    str(artifacts.joints_json),
-                    "--mujoco-prior",
-                    self.config.mujoco_prior_mode,
-                ],
-                stream,
-            )
+            infer_argv = [
+                "infer-joints",
+                str(artifacts.poses_json),
+                "--output-json",
+                str(artifacts.joints_json),
+                "--mujoco-prior",
+                self.config.mujoco_prior_mode,
+            ]
+            if self.config.joint_rotation_threshold_rad is not None:
+                infer_argv.extend(["--rotation-threshold-rad", str(float(self.config.joint_rotation_threshold_rad))])
+            if self.config.joint_translation_threshold_m is not None:
+                infer_argv.extend(["--translation-threshold-m", str(float(self.config.joint_translation_threshold_m))])
+            self._run_cli(infer_argv, stream)
 
         if self.config.dynamics_backend != "off":
             export_ready = artifacts.articulation_artifact_json.exists() and artifacts.mjcf_xml.exists()
@@ -713,15 +754,37 @@ class ArticulationBatchRunner:
 
     def _run_cli(self, argv: list[str], stream: TextIO) -> None:
         command = [sys.executable, "-m", "rgbd_urdf_mvp", *argv]
-        subprocess.run(
-            command,
-            cwd=PROJECT_ROOT,
-            env=self._subprocess_env(),
-            stdout=stream,
-            stderr=stream,
-            text=True,
-            check=True,
-        )
+        started = time.perf_counter()
+        status = "completed"
+        try:
+            subprocess.run(
+                command,
+                cwd=PROJECT_ROOT,
+                env=self._subprocess_env(),
+                stdout=stream,
+                stderr=stream,
+                text=True,
+                check=True,
+            )
+        except Exception:
+            status = "failed"
+            raise
+        finally:
+            elapsed_s = time.perf_counter() - started
+            stream.write(
+                json.dumps(
+                    {
+                        "event": "stage_timing",
+                        "stage": argv[0] if argv else "",
+                        "elapsed_s": elapsed_s,
+                        "status": status,
+                        "command": command,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            stream.flush()
 
     def _run_module(self, module: str, argv: list[str], stream: TextIO) -> None:
         command = [sys.executable, "-m", module, *argv]
@@ -842,6 +905,20 @@ def build_cli_argv_from_template(config_path: Path, overrides: Mapping[str, Any]
     merged_args.update(overrides)
     payload["args"] = merged_args
     return config_to_argv(payload, build_parser())
+
+
+def record_template_uses_multi_joint(config_path: Path) -> bool:
+    payload = load_command_config(resolve_project_path(config_path))
+    base_args = payload.get("args", {})
+    if base_args is None:
+        base_args = {}
+    if not isinstance(base_args, dict):
+        raise ValueError(f"Config field 'args' must be a mapping in {config_path}")
+    merged_args = dict(base_args)
+    for key, value in payload.items():
+        if key not in {"command", "args", "description"}:
+            merged_args.setdefault(key, value)
+    return bool(merged_args.get("all-joints") or merged_args.get("all_joints") or merged_args.get("staged-initial-qvel") or merged_args.get("staged_initial_qvel"))
 
 
 def infer_joint_name(category: str, model_xml: Path, requested_joint_name: str) -> str:

@@ -108,6 +108,18 @@ def register(subparsers: Any) -> None:
         help="Minimum visible 3D tracks required for track-based part pose estimation",
     )
     batch_parser.add_argument(
+        "--joint-rotation-threshold-rad",
+        type=float,
+        default=None,
+        help="Optional rotation range threshold passed to infer-joints; defaults to infer-joints' built-in value.",
+    )
+    batch_parser.add_argument(
+        "--joint-translation-threshold-m",
+        type=float,
+        default=None,
+        help="Optional translation range threshold passed to infer-joints; defaults to infer-joints' built-in value.",
+    )
+    batch_parser.add_argument(
         "--mujoco-prior",
         choices=["auto", "off", "required"],
         default="off",
