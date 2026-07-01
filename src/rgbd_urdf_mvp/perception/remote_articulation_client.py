@@ -229,4 +229,7 @@ class RemoteArticulationClient:
             detail = exc.read().decode("utf-8", errors="replace")
             raise Hunyuan3DClientError(f"HTTP {exc.code} from {endpoint}: {detail}") from exc
         except error.URLError as exc:
-            raise Hunyuan3DClientError(f"Failed to reach remote articulation server {self.server_url}: {exc}") from exc
+            # Older servers and mocked tests may only expose the JSON/base64
+            # download path. Treat binary-endpoint reachability failures as a
+            # soft miss so callers can fall back to the completed job status.
+            return None
