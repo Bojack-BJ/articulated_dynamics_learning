@@ -5,6 +5,289 @@ from typing import Any
 
 
 def register(subparsers: Any) -> None:
+    segment_masks_parser = subparsers.add_parser(
+        "segment-episode-masks",
+        help="Run a mask provider over an episode and write object/part masks back into episode.json",
+    )
+    segment_masks_parser.add_argument("episode", type=Path, help="Path to episode.json")
+    segment_masks_parser.add_argument(
+        "--provider",
+        choices=["mask-dir", "external-command", "sam2", "sam3"],
+        default="mask-dir",
+        help="Mask provider backend. Use external-command for SAM2/SAM3/PartSAM wrappers.",
+    )
+    segment_masks_parser.add_argument(
+        "--mask-kind",
+        choices=["object", "part"],
+        default="object",
+        help="Write binary object masks or indexed part masks",
+    )
+    segment_masks_parser.add_argument("--mask-dir", type=Path, default=None, help="Directory of precomputed masks")
+    segment_masks_parser.add_argument(
+        "--command",
+        dest="provider_command",
+        default=None,
+        help=(
+            "External command template. Available fields: {rgb_path}, {output_mask_path}, "
+            "{frame_index}, {view_index}."
+        ),
+    )
+    segment_masks_parser.add_argument(
+        "--sam2-root",
+        type=Path,
+        default=Path("sam2"),
+        help="Path to the SAM2 repository checkout used for native --provider sam2",
+    )
+    segment_masks_parser.add_argument(
+        "--sam2-config",
+        default="configs/sam2.1/sam2.1_hiera_t.yaml",
+        help="SAM2 Hydra model config name",
+    )
+    segment_masks_parser.add_argument(
+        "--sam2-checkpoint",
+        type=Path,
+        default=None,
+        help="Path to a SAM2 checkpoint .pt file",
+    )
+    segment_masks_parser.add_argument(
+        "--sam2-device",
+        choices=["auto", "mps", "cpu", "cuda"],
+        default="auto",
+        help="Device for native SAM2. auto prefers MPS, then CUDA, then CPU.",
+    )
+    segment_masks_parser.add_argument(
+        "--sam2-prompt-mode",
+        choices=["full-image-box", "center-box", "box", "auto-masks"],
+        default="full-image-box",
+        help="Prompt strategy for native SAM2 object masks",
+    )
+    segment_masks_parser.add_argument(
+        "--sam2-box-xyxy",
+        type=float,
+        nargs=4,
+        default=None,
+        metavar=("X1", "Y1", "X2", "Y2"),
+        help="Explicit SAM2 box prompt when --sam2-prompt-mode box",
+    )
+    segment_masks_parser.add_argument(
+        "--sam2-center-box-scale",
+        type=float,
+        default=0.75,
+        help="Image-relative box size for --sam2-prompt-mode center-box",
+    )
+    segment_masks_parser.add_argument(
+        "--sam2-single-mask",
+        action="store_true",
+        help="Disable SAM2 multimask output for prompted modes",
+    )
+    segment_masks_parser.add_argument(
+        "--sam2-mask-selection",
+        choices=["best-iou", "smallest", "largest", "index"],
+        default="best-iou",
+        help="How to select one SAM2 mask when a prompt returns multiple candidates",
+    )
+    segment_masks_parser.add_argument(
+        "--sam2-mask-index",
+        type=int,
+        default=None,
+        help="Explicit candidate index when --sam2-mask-selection index",
+    )
+    segment_masks_parser.add_argument("--sam3-checkpoint", type=Path, default=None, help="Path to a SAM3 checkpoint .pt file")
+    segment_masks_parser.add_argument(
+        "--sam3-device",
+        choices=["auto", "mps", "cpu", "cuda"],
+        default="auto",
+        help="Device for native SAM3. auto prefers MPS, then CUDA, then CPU.",
+    )
+    segment_masks_parser.add_argument(
+        "--sam3-prompt-mode",
+        choices=["full-image-box", "center-box", "box"],
+        default="full-image-box",
+        help="Prompt strategy for native SAM3 object masks",
+    )
+    segment_masks_parser.add_argument(
+        "--sam3-box-xyxy",
+        type=float,
+        nargs=4,
+        default=None,
+        metavar=("X1", "Y1", "X2", "Y2"),
+        help="Explicit SAM3 box prompt when --sam3-prompt-mode box",
+    )
+    segment_masks_parser.add_argument(
+        "--sam3-center-box-scale",
+        type=float,
+        default=0.75,
+        help="Image-relative box size for --sam3-prompt-mode center-box",
+    )
+    segment_masks_parser.add_argument(
+        "--sam3-mask-selection",
+        choices=["best-score", "smallest", "largest", "index"],
+        default="largest",
+        help="How to select one SAM3 mask when a prompt returns multiple candidates",
+    )
+    segment_masks_parser.add_argument("--sam3-mask-index", type=int, default=None)
+    segment_masks_parser.add_argument("--sam3-conf", type=float, default=0.05, help="SAM3 confidence threshold")
+    segment_masks_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Mask artifact directory (defaults to <episode_dir>/assets/masks/<provider>)",
+    )
+    segment_masks_parser.add_argument(
+        "--output-episode",
+        type=Path,
+        default=None,
+        help="Where to write the updated episode JSON (defaults to in-place)",
+    )
+    segment_masks_parser.add_argument("--frame-stride", type=int, default=1, help="Process every Nth frame")
+    segment_masks_parser.add_argument("--start-frame", type=int, default=0, help="First frame index to process")
+    segment_masks_parser.add_argument("--max-frames", type=int, default=None, help="Maximum processed frames")
+    segment_masks_parser.add_argument("--view-indices", type=int, nargs="+", default=None, help="Views to process")
+    segment_masks_parser.add_argument(
+        "--threshold",
+        type=int,
+        default=0,
+        help="Optional threshold to binarize provider masks before writing/evaluating",
+    )
+    segment_masks_parser.add_argument("--force", action="store_true", help="Regenerate masks that already exist")
+
+    segment_masks_batch_parser = subparsers.add_parser(
+        "segment-episode-masks-batch",
+        help="Batch run a mask provider over episode.json recordings",
+    )
+    segment_masks_batch_parser.add_argument(
+        "manifest",
+        type=Path,
+        help="TSV with episode_path and optional object_id/output_episode/output_dir/provider override columns",
+    )
+    segment_masks_batch_parser.add_argument("--jobs", type=int, default=1, help="Parallel segmentation jobs")
+    segment_masks_batch_parser.add_argument(
+        "--provider",
+        choices=["mask-dir", "external-command", "sam2", "sam3"],
+        default="sam2",
+        help="Default mask provider backend",
+    )
+    segment_masks_batch_parser.add_argument("--output-root", type=Path, default=None)
+    segment_masks_batch_parser.add_argument("--sam2-root", type=Path, default=Path("sam2"))
+    segment_masks_batch_parser.add_argument("--sam2-config", default="configs/sam2.1/sam2.1_hiera_t.yaml")
+    segment_masks_batch_parser.add_argument("--sam2-checkpoint", type=Path, default=None)
+    segment_masks_batch_parser.add_argument(
+        "--sam2-device",
+        choices=["auto", "mps", "cpu", "cuda"],
+        default="auto",
+    )
+    segment_masks_batch_parser.add_argument(
+        "--sam2-prompt-mode",
+        choices=["full-image-box", "center-box", "box", "auto-masks"],
+        default="full-image-box",
+    )
+    segment_masks_batch_parser.add_argument("--sam2-box-xyxy", type=float, nargs=4, default=None)
+    segment_masks_batch_parser.add_argument("--sam2-center-box-scale", type=float, default=0.75)
+    segment_masks_batch_parser.add_argument("--sam2-single-mask", action="store_true")
+    segment_masks_batch_parser.add_argument(
+        "--sam2-mask-selection",
+        choices=["best-iou", "smallest", "largest", "index"],
+        default="best-iou",
+    )
+    segment_masks_batch_parser.add_argument("--sam2-mask-index", type=int, default=None)
+    segment_masks_batch_parser.add_argument("--sam3-checkpoint", type=Path, default=None)
+    segment_masks_batch_parser.add_argument(
+        "--sam3-device",
+        choices=["auto", "mps", "cpu", "cuda"],
+        default="auto",
+    )
+    segment_masks_batch_parser.add_argument(
+        "--sam3-prompt-mode",
+        choices=["full-image-box", "center-box", "box"],
+        default="full-image-box",
+    )
+    segment_masks_batch_parser.add_argument("--sam3-box-xyxy", type=float, nargs=4, default=None)
+    segment_masks_batch_parser.add_argument("--sam3-center-box-scale", type=float, default=0.75)
+    segment_masks_batch_parser.add_argument(
+        "--sam3-mask-selection",
+        choices=["best-score", "smallest", "largest", "index"],
+        default="largest",
+    )
+    segment_masks_batch_parser.add_argument("--sam3-mask-index", type=int, default=None)
+    segment_masks_batch_parser.add_argument("--sam3-conf", type=float, default=0.05)
+    segment_masks_batch_parser.add_argument("--mask-kind", choices=["object", "part"], default="object")
+    segment_masks_batch_parser.add_argument("--frame-stride", type=int, default=1)
+    segment_masks_batch_parser.add_argument("--start-frame", type=int, default=0)
+    segment_masks_batch_parser.add_argument("--max-frames", type=int, default=None)
+    segment_masks_batch_parser.add_argument("--view-indices", type=int, nargs="+", default=None)
+    segment_masks_batch_parser.add_argument("--threshold", type=int, default=0)
+    segment_masks_batch_parser.add_argument("--force", action="store_true")
+
+    propagate_masks_parser = subparsers.add_parser(
+        "propagate-episode-masks",
+        help="Propagate an object or indexed part mask from one reference frame through an episode using CoTracker",
+    )
+    propagate_masks_parser.add_argument("episode", type=Path, help="Episode containing a reference object/part mask")
+    propagate_masks_parser.add_argument("--output-episode", type=Path, default=None)
+    propagate_masks_parser.add_argument("--output-dir", type=Path, default=None)
+    propagate_masks_parser.add_argument(
+        "--backend",
+        choices=["sam2-video", "cotracker-sparse"],
+        default="sam2-video",
+        help="Dense SAM2 video propagation is the default; CoTracker sparse propagation is a debug fallback.",
+    )
+    propagate_masks_parser.add_argument("--mask-kind", choices=["object", "part"], default="object")
+    propagate_masks_parser.add_argument("--sam2-root", type=Path, default=Path("sam2"))
+    propagate_masks_parser.add_argument("--sam2-config", default="configs/sam2.1/sam2.1_hiera_t.yaml")
+    propagate_masks_parser.add_argument("--sam2-checkpoint", type=Path, default=None)
+    propagate_masks_parser.add_argument(
+        "--sam2-device",
+        choices=["auto", "mps", "cpu", "cuda"],
+        default="auto",
+    )
+    propagate_masks_parser.add_argument(
+        "--sam2-part-mode",
+        choices=["independent", "joint"],
+        default="independent",
+        help=(
+            "For indexed part masks, propagate each part independently before merging logits. "
+            "Use joint to keep SAM2's native multi-object competition."
+        ),
+    )
+    propagate_masks_parser.add_argument(
+        "--sam2-offload-video-to-cpu",
+        action="store_true",
+        help="Save accelerator memory by keeping loaded video frames on CPU during SAM2 propagation",
+    )
+    propagate_masks_parser.add_argument(
+        "--sam2-offload-state-to-cpu",
+        action="store_true",
+        help="Save accelerator memory by keeping SAM2 state on CPU; slower but useful for long videos",
+    )
+    propagate_masks_parser.add_argument("--reference-frame", type=int, default=0)
+    propagate_masks_parser.add_argument("--frame-stride", type=int, default=1)
+    propagate_masks_parser.add_argument("--view-indices", type=int, nargs="+", default=None)
+    propagate_masks_parser.add_argument("--device", choices=["auto", "mps", "cpu", "cuda"], default="auto")
+    propagate_masks_parser.add_argument("--cotracker-repo", type=Path, default=None)
+    propagate_masks_parser.add_argument("--cotracker-checkpoint", type=Path, default=None)
+    propagate_masks_parser.add_argument("--cotracker-model", default="cotracker3_offline")
+    propagate_masks_parser.add_argument("--seed-stride-px", type=int, default=12)
+    propagate_masks_parser.add_argument("--max-tracks-per-view", type=int, default=512)
+    propagate_masks_parser.add_argument("--visibility-threshold", type=float, default=0.5)
+    propagate_masks_parser.add_argument("--mask-radius-px", type=int, default=8)
+    propagate_masks_parser.add_argument("--threshold", type=int, default=0)
+    propagate_masks_parser.add_argument("--force", action="store_true")
+
+    evaluate_masks_parser = subparsers.add_parser(
+        "evaluate-episode-masks",
+        help="Compare predicted episode masks against reference masks with IoU/precision/recall",
+    )
+    evaluate_masks_parser.add_argument("predicted_episode", type=Path, help="Episode containing predicted masks")
+    evaluate_masks_parser.add_argument("reference_episode", type=Path, help="Episode containing reference masks")
+    evaluate_masks_parser.add_argument(
+        "--mask-kind",
+        choices=["object", "part"],
+        default="object",
+        help="Evaluate object masks or indexed part masks as foreground",
+    )
+    evaluate_masks_parser.add_argument("--output-json", type=Path, default=None, help="Where to write metrics")
+    evaluate_masks_parser.add_argument("--threshold", type=int, default=0, help="Foreground threshold")
+
     # 4D pointcloud fusion and inspection.
     fuse_parser = subparsers.add_parser(
         "fuse-pointcloud",
@@ -230,6 +513,42 @@ def register(subparsers: Any) -> None:
         type=float,
         default=0.02,
         help="Minimum translation range required to classify a moving part as prismatic when rotation is small",
+    )
+    joint_parser.add_argument(
+        "--no-track-residual-type",
+        action="store_true",
+        help="Disable 3D track replay residual comparison for revolute/prismatic type selection",
+    )
+    joint_parser.add_argument(
+        "--track-residual-requires-pose-candidate",
+        action="store_true",
+        help=(
+            "Require the pose-derived rotation/translation threshold candidate before applying a track-residual "
+            "type decision. This reproduces the older pose-gated behavior."
+        ),
+    )
+    joint_parser.add_argument(
+        "--no-track-translation-axis",
+        action="store_true",
+        help="Disable prismatic axis estimation from 3D track endpoint displacement and use SE(3) pose translations only",
+    )
+    joint_parser.add_argument(
+        "--track-residual-decision-ratio",
+        type=float,
+        default=0.85,
+        help="Apply track-residual type decision when best RMSE / other RMSE is at or below this ratio",
+    )
+    joint_parser.add_argument(
+        "--min-track-residual-samples",
+        type=int,
+        default=20,
+        help="Minimum 3D track samples required before track residual can override threshold-priority type selection",
+    )
+    joint_parser.add_argument(
+        "--min-track-residual-tracks",
+        type=int,
+        default=12,
+        help="Minimum distinct tracks required before track residual can override threshold-priority type selection",
     )
     joint_parser.add_argument(
         "--mujoco-prior",

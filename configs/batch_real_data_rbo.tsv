@@ -1,0 +1,13 @@
+input_dir	object_id	category	output_dir	target_fps	max_frames
+../real_data/cabinet01_o	cabinet01_o	door	../outputs/real_recordings/cabinet01_o	20	120
+../real_data/cabinet02_o	cabinet02_o	door	../outputs/real_recordings/cabinet02_o	20	120
+../real_data/cardboardbox01_o	cardboardbox01_o	door	../outputs/real_recordings/cardboardbox01_o	20	120
+../real_data/cardboardbox02_o	cardboardbox02_o	door	../outputs/real_recordings/cardboardbox02_o	20	120
+../real_data/clamp01_o	clamp01_o	door	../outputs/real_recordings/clamp01_o	20	120
+../real_data/clamp02_o	clamp02_o	door	../outputs/real_recordings/clamp02_o	20	120
+../real_data/foldingrule01_o	foldingrule01_o	door	../outputs/real_recordings/foldingrule01_o	20	120
+../real_data/foldingrule02_o	foldingrule02_o	door	../outputs/real_recordings/foldingrule02_o	20	120
+../real_data/globe01_o	globe01_o	door	../outputs/real_recordings/globe01_o	20	120
+../real_data/globe02_o	globe02_o	door	../outputs/real_recordings/globe02_o	20	120
+../real_data/microwave01_o	microwave01_o	microwave	../outputs/real_recordings/microwave01_o	20	120
+../real_data/microwave02_o	microwave02_o	microwave	../outputs/real_recordings/microwave02_o	20	120

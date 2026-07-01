@@ -25,6 +25,12 @@ def register(subparsers: Any) -> None:
     import_rbo_parser.add_argument("--start-frame", type=int, default=0, help="First RGB frame index to import")
     import_rbo_parser.add_argument("--max-frames", type=int, default=None, help="Maximum number of frames to import")
     import_rbo_parser.add_argument(
+        "--target-fps",
+        type=float,
+        default=None,
+        help="Resample imported RGB-D frames onto this nominal frame rate before writing episode timestamps",
+    )
+    import_rbo_parser.add_argument(
         "--max-sync-delta-s",
         type=float,
         default=0.05,
@@ -51,6 +57,39 @@ def register(subparsers: Any) -> None:
     import_rbo_parser.add_argument("--min-depth-m", type=float, default=0.05, help="Minimum valid depth in meters")
     import_rbo_parser.add_argument("--max-depth-m", type=float, default=10.0, help="Maximum valid depth in meters")
     import_rbo_parser.add_argument("--force", action="store_true", help="Allow writing into a non-empty output directory")
+
+    import_rbo_batch_parser = subparsers.add_parser(
+        "import-rbo-recordings-batch",
+        help="Batch convert RBO/ROSbag-like RGB-D folder exports into episode.json recordings",
+    )
+    import_rbo_batch_parser.add_argument(
+        "manifest",
+        type=Path,
+        help="TSV with input_dir and optional object_id/category/output_dir/import override columns",
+    )
+    import_rbo_batch_parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("outputs") / "real_recordings",
+        help="Default root for converted recordings",
+    )
+    import_rbo_batch_parser.add_argument("--jobs", type=int, default=1, help="Parallel import jobs")
+    import_rbo_batch_parser.add_argument("--frame-stride", type=int, default=1, help="Default import stride")
+    import_rbo_batch_parser.add_argument("--start-frame", type=int, default=0, help="Default first RGB frame index")
+    import_rbo_batch_parser.add_argument("--max-frames", type=int, default=None, help="Default maximum imported frames")
+    import_rbo_batch_parser.add_argument("--target-fps", type=float, default=None, help="Default target episode fps")
+    import_rbo_batch_parser.add_argument("--max-sync-delta-s", type=float, default=0.05)
+    import_rbo_batch_parser.add_argument(
+        "--mask-mode",
+        choices=["none", "depth-near"],
+        default="none",
+        help="Default optional heuristic object-mask generation mode",
+    )
+    import_rbo_batch_parser.add_argument("--mask-depth-percentile", type=float, default=35.0)
+    import_rbo_batch_parser.add_argument("--mask-depth-margin-m", type=float, default=0.15)
+    import_rbo_batch_parser.add_argument("--min-depth-m", type=float, default=0.05)
+    import_rbo_batch_parser.add_argument("--max-depth-m", type=float, default=10.0)
+    import_rbo_batch_parser.add_argument("--force", action="store_true")
 
     # MuJoCo recording and mask generation.
     render_masks_parser = subparsers.add_parser(
@@ -277,6 +316,44 @@ def register(subparsers: Any) -> None:
         type=float,
         default=0.0,
         help="Initial joint velocity for the selected hinge/slide DOF",
+    )
+    record_parser.add_argument(
+        "--staged-initial-qvel",
+        action="store_true",
+        help=(
+            "In free mode, drive multiple joints in stages: primary token-matched joints at t=0, "
+            "then a sampled subset of secondary token-matched joints later"
+        ),
+    )
+    record_parser.add_argument(
+        "--staged-primary-tokens",
+        nargs="+",
+        default=("door",),
+        help="Joint/body name tokens for joints opened at t=0 in --staged-initial-qvel mode",
+    )
+    record_parser.add_argument(
+        "--staged-secondary-tokens",
+        nargs="+",
+        default=("drawer", "slide"),
+        help="Joint/body name tokens for delayed joints in --staged-initial-qvel mode",
+    )
+    record_parser.add_argument(
+        "--staged-secondary-count-min",
+        type=int,
+        default=1,
+        help="Minimum number of delayed secondary joints to sample",
+    )
+    record_parser.add_argument(
+        "--staged-secondary-count-max",
+        type=int,
+        default=2,
+        help="Maximum number of delayed secondary joints to sample",
+    )
+    record_parser.add_argument(
+        "--staged-secondary-start-s",
+        type=float,
+        default=1.2,
+        help="Simulation time when delayed secondary joints receive their initial qvel",
     )
     record_parser.add_argument(
         "--kick-force",

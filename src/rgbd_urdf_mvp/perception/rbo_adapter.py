@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import re
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,7 @@ class RBORecordingImportConfig:
     frame_stride: int = 1
     start_frame: int = 0
     max_frames: int | None = None
+    target_fps: float | None = None
     max_sync_delta_s: float = 0.05
     mask_mode: str = "none"
     mask_depth_percentile: float = 35.0
@@ -40,9 +43,33 @@ class _TimedPath:
 
 
 @dataclass(frozen=True, slots=True)
+class _SelectedFrame:
+    source: _TimedPath
+    timestamp_s: float
+
+
+@dataclass(frozen=True, slots=True)
 class _JointState:
     timestamp_s: float
     positions: dict[str, float]
+
+
+@dataclass(slots=True)
+class RBORecordingBatchConfig:
+    manifest_path: Path
+    output_root: Path
+    jobs: int = 1
+    frame_stride: int = 1
+    start_frame: int = 0
+    max_frames: int | None = None
+    target_fps: float | None = None
+    max_sync_delta_s: float = 0.05
+    mask_mode: str = "none"
+    mask_depth_percentile: float = 35.0
+    mask_depth_margin_m: float = 0.15
+    min_depth_m: float = 0.05
+    max_depth_m: float = 10.0
+    force: bool = False
 
 
 class RBORecordingImporter:
@@ -68,17 +95,15 @@ class RBORecordingImporter:
 
         intrinsics = _read_camera_intrinsics(input_dir / "camera_depth_registered_camera_info.csv")
         joint_states = _read_joint_states(_find_joint_state_csv(input_dir))
-        selected = rgb_frames[config.start_frame :: max(1, config.frame_stride)]
-        if config.max_frames is not None:
-            selected = selected[: max(0, int(config.max_frames))]
+        selected = _select_rgb_frames(rgb_frames, config)
 
         object_id = config.object_id or input_dir.name
         category = _infer_category(input_dir.name, config.category)
         frames: list[FrameObservation] = []
-        base_time = selected[0].timestamp_s if selected else 0.0
         sync_deltas: list[float] = []
 
-        for output_index, rgb in enumerate(selected):
+        for output_index, selected_rgb in enumerate(selected):
+            rgb = selected_rgb.source
             depth, depth_delta = _nearest(rgb.timestamp_s, depth_frames)
             if depth_delta > config.max_sync_delta_s:
                 continue
@@ -109,6 +134,7 @@ class RBORecordingImporter:
 
             joint_state, _joint_delta = _nearest_joint_state(rgb.timestamp_s, joint_states)
             action_log: dict[str, Any] = {}
+            action_log["source_timestamp_s"] = float(rgb.timestamp_s)
             joint_position_hint = None
             if joint_state is not None:
                 action_log["joint_positions"] = joint_state.positions
@@ -117,7 +143,7 @@ class RBORecordingImporter:
 
             frames.append(
                 FrameObservation(
-                    timestamp_s=rgb.timestamp_s - base_time,
+                    timestamp_s=float(selected_rgb.timestamp_s),
                     rgb_path=_rel(rgb_out, output_dir),
                     depth_path=_rel(depth_out, output_dir),
                     mask_path=mask_rel,
@@ -145,8 +171,12 @@ class RBORecordingImporter:
                 "camera_pose_source": "identity_camera_frame",
                 "depth_units": "meters_to_uint16_millimeters",
                 "mask_mode": config.mask_mode,
+                "target_fps": config.target_fps,
                 "rgb_frame_count": len(rgb_frames),
                 "depth_frame_count": len(depth_frames),
+                "candidate_rgb_frame_count": len(
+                    rgb_frames[config.start_frame :: max(1, config.frame_stride)]
+                ),
                 "imported_frame_count": len(frames),
                 "max_rgb_depth_sync_delta_s": max(sync_deltas) if sync_deltas else None,
                 "joint_state_csv": str(_find_joint_state_csv(input_dir)) if _find_joint_state_csv(input_dir) else None,
@@ -155,6 +185,182 @@ class RBORecordingImporter:
         episode_path = output_dir / "episode.json"
         save_json(episode.to_dict(), episode_path)
         return episode_path
+
+
+class RBORecordingBatchImporter:
+    def __init__(self, config: RBORecordingBatchConfig) -> None:
+        self.config = config
+        self._console_lock = threading.Lock()
+
+    def run(self) -> dict[str, Any]:
+        specs = _read_rbo_batch_manifest(self.config.manifest_path)
+        output_root = self.config.output_root.expanduser().resolve()
+        output_root.mkdir(parents=True, exist_ok=True)
+        successes: list[dict[str, str]] = []
+        failures: list[dict[str, str]] = []
+
+        def process(spec: dict[str, str]) -> dict[str, str]:
+            input_dir = Path(spec["input_dir"]).expanduser()
+            if not input_dir.is_absolute():
+                input_dir = (self.config.manifest_path.parent / input_dir).resolve()
+            object_id = spec.get("object_id") or input_dir.name
+            output_dir = _optional_path(spec.get("output_dir"))
+            if output_dir is None:
+                output_dir = output_root / object_id
+            elif not output_dir.is_absolute():
+                output_dir = (self.config.manifest_path.parent / output_dir).resolve()
+            episode_path = RBORecordingImporter().import_recording(
+                RBORecordingImportConfig(
+                    input_dir=input_dir,
+                    output_dir=output_dir,
+                    object_id=object_id,
+                    category=spec.get("category") or None,
+                    frame_stride=_int_value(spec, "frame_stride", self.config.frame_stride),
+                    start_frame=_int_value(spec, "start_frame", self.config.start_frame),
+                    max_frames=_optional_int_value(spec, "max_frames", self.config.max_frames),
+                    target_fps=_optional_float_value(spec, "target_fps", self.config.target_fps),
+                    max_sync_delta_s=_float_value(spec, "max_sync_delta_s", self.config.max_sync_delta_s),
+                    mask_mode=spec.get("mask_mode") or self.config.mask_mode,
+                    mask_depth_percentile=_float_value(
+                        spec,
+                        "mask_depth_percentile",
+                        self.config.mask_depth_percentile,
+                    ),
+                    mask_depth_margin_m=_float_value(
+                        spec,
+                        "mask_depth_margin_m",
+                        self.config.mask_depth_margin_m,
+                    ),
+                    min_depth_m=_float_value(spec, "min_depth_m", self.config.min_depth_m),
+                    max_depth_m=_float_value(spec, "max_depth_m", self.config.max_depth_m),
+                    force=bool(self.config.force),
+                )
+            )
+            return {"object_id": object_id, "episode_path": str(episode_path)}
+
+        jobs = max(1, int(self.config.jobs))
+        if jobs == 1:
+            for spec in specs:
+                try:
+                    result = process(spec)
+                    successes.append(result)
+                    self._console(f"[{len(successes) + len(failures)}/{len(specs)}] imported {result['object_id']}")
+                except Exception as exc:
+                    failures.append({"input_dir": spec.get("input_dir", ""), "error": str(exc)})
+        else:
+            with ThreadPoolExecutor(max_workers=jobs) as executor:
+                future_map = {executor.submit(process, spec): spec for spec in specs}
+                for future in as_completed(future_map):
+                    spec = future_map[future]
+                    try:
+                        result = future.result()
+                        successes.append(result)
+                        self._console(f"[{len(successes) + len(failures)}/{len(specs)}] imported {result['object_id']}")
+                    except Exception as exc:
+                        failures.append({"input_dir": spec.get("input_dir", ""), "error": str(exc)})
+
+        manifest_out = output_root / "imported_rbo_episodes.tsv"
+        _write_imported_manifest(successes, manifest_out)
+        if failures:
+            raise RuntimeError(f"RBO batch import finished with failures: {failures}")
+        return {
+            "manifest_path": str(self.config.manifest_path.expanduser().resolve()),
+            "output_root": str(output_root),
+            "imported": len(successes),
+            "episodes_manifest": str(manifest_out),
+            "episodes": successes,
+        }
+
+    def _console(self, message: str) -> None:
+        with self._console_lock:
+            print(message)
+
+
+def _select_rgb_frames(rgb_frames: list[_TimedPath], config: RBORecordingImportConfig) -> list[_SelectedFrame]:
+    candidates = rgb_frames[max(0, int(config.start_frame)) :: max(1, int(config.frame_stride))]
+    if not candidates:
+        return []
+    if config.target_fps is None:
+        base_time = candidates[0].timestamp_s
+        selected = [
+            _SelectedFrame(source=item, timestamp_s=float(item.timestamp_s - base_time))
+            for item in candidates
+        ]
+        if config.max_frames is not None:
+            selected = selected[: max(0, int(config.max_frames))]
+        return selected
+
+    fps = float(config.target_fps)
+    if fps <= 0.0:
+        raise ValueError("target_fps must be positive when provided.")
+    base_time = candidates[0].timestamp_s
+    end_time = candidates[-1].timestamp_s
+    dt = 1.0 / fps
+    target_count = max(1, int((end_time - base_time) / dt) + 1)
+    selected: list[_SelectedFrame] = []
+    used_paths: set[Path] = set()
+    for target_index in range(target_count):
+        if config.max_frames is not None and len(selected) >= int(config.max_frames):
+            break
+        target_time = base_time + target_index * dt
+        nearest = min(candidates, key=lambda item: abs(item.timestamp_s - target_time))
+        if nearest.path in used_paths:
+            continue
+        used_paths.add(nearest.path)
+        selected.append(_SelectedFrame(source=nearest, timestamp_s=float(target_index * dt)))
+    return selected
+
+
+def _read_rbo_batch_manifest(path: Path) -> list[dict[str, str]]:
+    manifest_path = path.expanduser().resolve()
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"RBO batch manifest not found: {manifest_path}")
+    with manifest_path.open(newline="", encoding="utf-8") as handle:
+        rows = [
+            {str(key): str(value).strip() for key, value in row.items() if key is not None and value is not None}
+            for row in csv.DictReader(
+                (line for line in handle if line.strip() and not line.lstrip().startswith("#")),
+                delimiter="\t",
+            )
+        ]
+    if not rows:
+        raise ValueError(f"RBO batch manifest is empty: {manifest_path}")
+    for row in rows:
+        if not row.get("input_dir"):
+            raise ValueError("RBO batch manifest must include an input_dir column.")
+    return rows
+
+
+def _write_imported_manifest(rows: list[dict[str, str]], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["object_id", "episode_path"], delimiter="\t")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _optional_path(raw: str | None) -> Path | None:
+    return None if raw in (None, "") else Path(raw)
+
+
+def _int_value(row: dict[str, str], key: str, default: int) -> int:
+    raw = row.get(key)
+    return int(default if raw in (None, "") else raw)
+
+
+def _optional_int_value(row: dict[str, str], key: str, default: int | None) -> int | None:
+    raw = row.get(key)
+    return default if raw in (None, "") else int(raw)
+
+
+def _float_value(row: dict[str, str], key: str, default: float) -> float:
+    raw = row.get(key)
+    return float(default if raw in (None, "") else raw)
+
+
+def _optional_float_value(row: dict[str, str], key: str, default: float | None) -> float | None:
+    raw = row.get(key)
+    return default if raw in (None, "") else float(raw)
 
 
 def _list_timed_files(directory: Path, pattern: str) -> list[_TimedPath]:

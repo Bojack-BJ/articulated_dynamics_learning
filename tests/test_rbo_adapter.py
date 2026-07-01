@@ -66,6 +66,51 @@ class RBORecordingImporterTest(unittest.TestCase):
         self.assertEqual(args.mask_mode, "depth-near")
         self.assertEqual(args.max_frames, 10)
 
+    def test_import_resamples_to_target_fps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "microwave02_o"
+            (source / "camera_rgb").mkdir(parents=True)
+            (source / "camera_depth_registered").mkdir(parents=True)
+            _write_camera_info(source / "camera_depth_registered_camera_info.csv")
+            _write_joint_states(source / "microwave_joint_states.csv")
+            for index, timestamp in enumerate([100.00, 100.03, 100.09, 100.15]):
+                _write_rgb(source / "camera_rgb" / f"{index:06d}-{timestamp:.3f}.png")
+                np.savetxt(
+                    source / "camera_depth_registered" / f"{index:06d}-{timestamp:.3f}.txt",
+                    np.full((4, 4), 1.2),
+                )
+
+            episode_path = RBORecordingImporter().import_recording(
+                RBORecordingImportConfig(
+                    input_dir=source,
+                    output_dir=root / "out",
+                    target_fps=10.0,
+                    max_sync_delta_s=0.01,
+                )
+            )
+
+            payload = json.loads(episode_path.read_text(encoding="utf-8"))
+            self.assertEqual([frame["timestamp_s"] for frame in payload["frames"]], [0.0, 0.1])
+            self.assertEqual(payload["metadata"]["target_fps"], 10.0)
+
+    def test_cli_parser_accepts_import_rbo_batch(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "import-rbo-recordings-batch",
+                "configs/real_data.tsv",
+                "--output-root",
+                "outputs/real_recordings",
+                "--target-fps",
+                "20",
+                "--jobs",
+                "2",
+            ]
+        )
+        self.assertEqual(args.command, "import-rbo-recordings-batch")
+        self.assertEqual(args.target_fps, 20.0)
+        self.assertEqual(args.jobs, 2)
+
 
 def _write_camera_info(path: Path) -> None:
     fieldnames = ["field.P0", "field.P2", "field.P5", "field.P6", "field.K0", "field.K2", "field.K4", "field.K5"]
