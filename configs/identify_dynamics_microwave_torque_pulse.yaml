@@ -1,0 +1,13 @@
+command: identify-dynamics
+args:
+  episode: outputs/recordings/microwave011_torque_pulse/episode.json
+  articulation_artifact: outputs/recordings/microwave011_torque_pulse/pointcloud_4d_partseg/inferred_articulation/articulation_artifact.json
+  mjcf: outputs/recordings/microwave011_torque_pulse/pointcloud_4d_partseg/inferred_articulation/urdf/microwave011_torque_pulse.mjcf.xml
+  output-dir: outputs/recordings/microwave011_torque_pulse/pointcloud_4d_partseg/dynamics_identification_zero_g
+  max-iterations: 12
+  learning-rate: 0.2
+  q-weight: 1.0
+  qdot-weight: 0.05
+  prior-weight: 0.0
+  gravity-mode: zero
+  render-gl-backend: none

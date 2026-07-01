@@ -21,6 +21,10 @@ Replace `CategoryPriorParticulateAdapter` with:
 - post-processing into a legal kinematic tree
 - part segmentation and joint candidate cleanup
 
+The project now includes a submodule-backed PARTICULATE adapter for this path.
+See [particulate-integration.md](particulate-integration.md) for the Hunyuan3D
+mesh -> PARTICULATE -> tracking-comparison workflow.
+
 ## Temporal Refit
 
 Replace `SlidingWindowRefitter` with:

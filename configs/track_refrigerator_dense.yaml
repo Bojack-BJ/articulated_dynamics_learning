@@ -1,0 +1,10 @@
+command: track-part-pixels
+args:
+  cotracker-repo: ./co-tracker
+  cotracker-checkpoint: ./co-tracker/ckpt/scaled_offline.pth
+  device: auto
+  reference-frame: 0
+  frame-stride: 4
+  seed-stride-px: 8
+  max-tracks-per-part-view: 256
+  visibility-threshold: 0.5

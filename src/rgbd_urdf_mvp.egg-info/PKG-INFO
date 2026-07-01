@@ -17,6 +17,12 @@ Requires-Dist: torch>=2.1; extra == "tracking"
 Requires-Dist: torchvision>=0.16; extra == "tracking"
 Requires-Dist: pillow>=10.0.0; extra == "tracking"
 Requires-Dist: numpy>=1.26; extra == "tracking"
+Provides-Extra: mjx
+Requires-Dist: jax>=0.4.30; extra == "mjx"
+Requires-Dist: mujoco-mjx>=3.3.0; extra == "mjx"
+Provides-Extra: remote-server
+Requires-Dist: fastapi>=0.110; extra == "remote-server"
+Requires-Dist: uvicorn>=0.29; extra == "remote-server"
 
 # Articulated Dynamics Learning From RGB-D
 
@@ -35,12 +41,14 @@ The current code is scaffold-first. It is meant to keep the full contract execut
 - End-to-end model-to-joint-inference tutorial: [docs/end-to-end-articulation.md](docs/end-to-end-articulation.md)
 - MuJoCo recording and USD-to-MJCF conversion: [docs/mujoco-recording.md](docs/mujoco-recording.md)
 - RGB-D fusion, part segmentation, and viewer workflow: [docs/pointcloud.md](docs/pointcloud.md)
+- Dynamics identification and Lagrangian-network handoff: [docs/dynamics-identification.md](docs/dynamics-identification.md)
+- MuJoCo MJX setup for differentiable rollouts: [docs/mjx-setup.md](docs/mjx-setup.md)
 - Remote 3D generation client/server setup: [docs/remote-generation.md](docs/remote-generation.md)
 - Research-stack replacement points: [docs/research-stack.md](docs/research-stack.md)
 
 ## Installation
 
-Clone the repository with the Hunyuan3D server submodule:
+Clone the repository with submodules:
 
 ```bash
 git clone --recurse-submodules git@github.com:Bojack-BJ/articulated_dynamics_learning.git
@@ -68,19 +76,65 @@ Optional CoTracker support for track-based part trajectories:
 python -m pip install -e ".[tracking]"
 ```
 
-On Mac, the tracking command defaults to `--device auto`, which uses PyTorch
-MPS when available and CPU otherwise. CUDA is never selected unless
-`--device cuda` is passed explicitly. You can either let `torch.hub` download
-CoTracker on the first run, or use a local checkout:
+Optional MuJoCo MJX support for differentiable JAX rollouts:
 
 ```bash
-git clone https://github.com/facebookresearch/co-tracker.git ../co-tracker
+python -m pip install -e ".[mjx]"
+PYTHONPATH=src python -m rgbd_urdf_mvp probe-mjx
+```
 
-PYTHONPATH=src python -m rgbd_urdf_mvp track-part-pixels \
+Optional Apple Metal backend for MJX on macOS:
+
+```bash
+python -m pip install jax-metal
+PYTHONPATH=src python -m rgbd_urdf_mvp probe-mjx --jax-platform metal --enable-pjrt-compatibility --no-rollout-test
+```
+
+The project keeps `probe-mjx` and `identify-dynamics-mjx` on `cpu` by default
+even when `jax-metal` is installed. Request Metal explicitly with
+`--jax-platform metal`.
+
+After the MJX probe is green, the parallel autodiff optimizer is:
+
+```bash
+PYTHONPATH=src python -m rgbd_urdf_mvp identify-dynamics-mjx \
+  outputs/recordings/$OBJECT_ID/episode.json \
+  outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/articulation_artifact.json \
+  outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/urdf/$OBJECT_ID.mjcf.xml \
+  --jax-platform metal \
+  --enable-pjrt-compatibility
+```
+
+On Mac, the tracking command defaults to `--device auto`, which uses PyTorch
+MPS when available and CPU otherwise. CUDA is never selected unless
+`--device cuda` is passed explicitly.
+
+To inspect local PyTorch MPS detection and optionally try a real MPS tensor,
+use:
+
+```bash
+PYTHONPATH=src python -m rgbd_urdf_mvp probe-torch-mps
+PYTHONPATH=src python -m rgbd_urdf_mvp probe-torch-mps --unsafe-force-mps
+```
+
+If you do not want `torch.hub` to download weights automatically, place the
+checkpoint at `co-tracker/ckpt/scaled_offline.pth` and pass it explicitly:
+
+```bash
+TORCH_HOME="$PWD/.cache/torch" PYTHONPATH=src python -m rgbd_urdf_mvp track-part-pixels \
   outputs/recordings/microwave011/episode.json \
-  --cotracker-repo ../co-tracker \
+  --cotracker-repo ./co-tracker \
+  --cotracker-checkpoint ./co-tracker/ckpt/scaled_offline.pth \
+  --frame-stride 4 \
   --device auto
 ```
+
+If the episode was recorded at `60 Hz`, `--frame-stride 4` tracks every fourth
+frame and reduces the effective tracking rate to roughly `15 Hz` without
+re-recording the episode.
+
+`track-part-pixels` now prints progress to `stderr`. Pass `--no-progress` if
+you want completely quiet terminal output.
 
 Run the smoke tests:
 
@@ -88,9 +142,29 @@ Run the smoke tests:
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-The `Hunyuan3D-2/` directory is a submodule pointing to this project's fork of
-the Hunyuan3D sample server. On the remote GPU machine, install that server in
-its own environment:
+For large MuJoCo triview recordings, the default YAML presets now use
+`png` assets and skip duplicated raw `assets/concat/` frames. To compact an
+older recording in place and drop `assets/concat/`, run:
+
+```bash
+PYTHONPATH=src python -m rgbd_urdf_mvp compact-mujoco-recording \
+  outputs/recordings/<object-id>/episode.json
+```
+
+To transcode an older recording from `ppm/pgm` assets to `png` and rewrite the
+episode manifest, run:
+
+```bash
+PYTHONPATH=src python -m rgbd_urdf_mvp repack-mujoco-recording \
+  outputs/recordings/<object-id>/episode.json
+```
+
+The repository includes these submodules:
+
+- `Hunyuan3D-2/`: this project's fork of the Hunyuan3D sample server
+- `co-tracker/`: the official CoTracker repository used by the track-based part trajectory path
+
+On the remote GPU machine, install `Hunyuan3D-2/` in its own environment:
 
 ```bash
 cd Hunyuan3D-2
@@ -231,6 +305,50 @@ args:
   part-segmentation-masks: true
 ```
 
+For batch articulation runs, the readable path is now the Python command:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch \
+  configs/batch_lightwheel_microwaves.tsv \
+  --resume \
+  --jobs 2
+```
+
+The shell wrapper still exists for convenience:
+
+```bash
+bash scripts/run_articulation_pipeline.sh --resume --jobs 2 configs/batch_lightwheel_microwaves.tsv
+```
+
+The batch runner reads stage templates from config files instead of hardcoded
+shell arrays:
+
+- `configs/record_microwave.yaml`
+- `configs/record_refrigerator.yaml`
+- `configs/record_hinge.yaml`
+- `configs/record_drawer.yaml`
+- `configs/track_default.yaml`
+- `configs/identify_dynamics_default.yaml`
+- `configs/identify_dynamics_mjx_default.yaml`
+
+To append optional Stage 4 dynamics identification to the batch pipeline:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch \
+  configs/batch_lightwheel_microwaves.tsv \
+  --resume \
+  --jobs 2 \
+  --dynamics-backend mjx \
+  --dynamics-jax-platform metal \
+  --dynamics-enable-pjrt-compatibility
+```
+
+On Apple Silicon, the CoTracker stage is usually throughput-limited by a single
+MPS device. The batch runner therefore defaults to `--tracking-jobs 1` for
+`auto`, `mps`, and `cuda`, even when `--jobs` is larger. Override it only if
+you have measured that multiple simultaneous tracking workers are actually
+faster on your machine.
+
 Then run it directly:
 
 ```bash
@@ -289,6 +407,10 @@ The package root keeps a small number of top-level entry points:
 - Per-part 6D pose estimation from 4D pointclouds
 - Joint type/axis/pivot inference from pose tracks
 - Inferred-articulation export back into URDF/MJCF
+- First-pass dynamics identification with pointcloud-sized inertial
+  initialization, trajectory error metrics, and optional rollout comparison
+  videos
+- MJX autodiff dynamics-identification scaffold on CPU
 - YAML/JSON driven CLI config expansion for long commands
 
 ## What Is Still Placeholder
@@ -296,4 +418,4 @@ The package root keeps a small number of top-level entry points:
 - Real RGB-D generative reconstruction
 - Real PARTICULATE invocation
 - Dense joint-aware RGB-D alignment
-- Full dynamics identification and contact modeling
+- Contact-rich dynamics identification

@@ -25,10 +25,10 @@ OBJECT_ID=refrigerator031_e2e
 CATEGORY=refrigerator
 ```
 
-If you start from a USD asset, convert it first:
+If you start from a USD asset, convert one model first:
 
 ```bash
-PYTHONPATH=src python3 -m rgbd_urdf_mvp.usd_to_mjcf \
+PYTHONPATH=src python3 -m rgbd_urdf_mvp.sim.usd_to_mjcf \
   Lightwheel/Refrigerator031/Refrigerator031.usd \
   --category refrigerator
 ```
@@ -38,6 +38,28 @@ Then point `MODEL_XML` at the generated MJCF file:
 ```bash
 MODEL_XML=examples/mujoco_models/Refrigerator031.xml
 ```
+
+For many USD assets, use the batch converter with the same four-column manifest
+format used by the articulation batch runner:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp convert-usd-mjcf-batch \
+  configs/batch_usd_objects_example.tsv \
+  --output-dir examples/mujoco_models \
+  --converted-manifest configs/batch_usd_objects_converted.tsv \
+  --jobs 2
+```
+
+The generated manifest replaces USD paths with generated MJCF XML paths, so it
+can be passed directly to the full batch pipeline:
+
+```bash
+bash scripts/run_articulation_pipeline.sh --resume configs/batch_usd_objects_converted.tsv
+```
+
+The full batch pipeline also accepts `.usd`, `.usda`, and `.usdc` paths directly
+in the manifest and will convert missing MJCF files automatically before
+`record-mujoco`.
 
 ## 2. Record RGB-D With Object And Part Masks
 
@@ -247,7 +269,8 @@ Once the kinematic structure is fixed, fit a first-pass dynamic model:
 PYTHONPATH=src python3 -m rgbd_urdf_mvp identify-dynamics \
   "outputs/recordings/$OBJECT_ID/episode.json" \
   "outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/articulation_artifact.json" \
-  "outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/urdf/$OBJECT_ID.mjcf.xml"
+  "outputs/recordings/$OBJECT_ID/pointcloud_4d_partseg/inferred_articulation/urdf/$OBJECT_ID.mjcf.xml" \
+  --render-gl-backend cgl
 ```
 
 This writes:
@@ -256,6 +279,8 @@ This writes:
 outputs/recordings/<object-id>/pointcloud_4d_partseg/inferred_articulation/urdf/dynamics_identification/
   dynamics_identification.json
   <object-id>.mjcf.identified.xml
+  simulated_view_<view-index>.mp4
+  comparison_view_<view-index>.mp4
 ```
 
 The current optimizer fits:
@@ -266,6 +291,23 @@ The current optimizer fits:
 
 against the observed joint trajectory from the articulation artifact.
 
+The exported MJCF gets its initial inertial values from the same collision
+proxies used for the URDF. In the current pointcloud path those proxies are
+sized from each part's reference-frame fused pointcloud, not from a fixed
+placeholder cube. Check `urdf/articulation.json` and look for
+`metadata.source = "pointcloud-reference-bounds"` to confirm this path was used.
+
+Dynamics rollout contacts are disabled by default because these inferred
+proxy boxes are coarse and may overlap around the joint. The identified MJCF
+therefore writes `contype="0"` and `conaffinity="0"` on geoms. Add
+`--enable-contact` only after the proxies are accurate enough for contact-rich
+system identification.
+
+Use `--render-gl-backend cgl` on macOS to save rollout videos from a normal
+local GUI terminal. Use `--render-gl-backend glfw` if CGL fails, and
+`--render-gl-backend none` for batch/headless runs. The comparison video places
+the original RGB view on the left and the optimized MuJoCo rollout on the right.
+
 ## 10. Batch Pipeline Runner
 
 For multiple simulated objects, use:
@@ -275,6 +317,7 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch configs/batch_obj
 PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch --resume configs/batch_objects_example.tsv
 PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch --skip-existing configs/batch_objects_example.tsv
 PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch --jobs 4 configs/batch_objects_example.tsv
+PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch --resume --jobs 2 --dynamics-backend mjx --dynamics-jax-platform metal --dynamics-enable-pjrt-compatibility configs/batch_objects_example.tsv
 ```
 
 The thin shell wrapper calls the same Python runner:
@@ -297,6 +340,8 @@ The runner executes:
 4. `estimate-part-poses --method tracks`
 5. `infer-joints`
 6. `visualize-pointcloud`
+7. optional `export-inferred-articulation`
+8. optional `identify-dynamics` or `identify-dynamics-mjx`
 
 The heavy stage parameters now come from YAML templates:
 
@@ -312,10 +357,93 @@ The corresponding templates live in:
 - `configs/record_hinge.yaml`
 - `configs/record_drawer.yaml`
 - `configs/track_default.yaml`
+- `configs/track_refrigerator_dense.yaml`
+- `configs/identify_dynamics_default.yaml`
+- `configs/identify_dynamics_mjx_default.yaml`
 
 Use `--record-config path/to/template.yaml` or `--track-config path/to/template.yaml`
 when you want one batch run to use a different preset without editing the
 defaults.
+
+For refrigerator batches with drawers/freezers, prefer the dense tracking preset:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp run-articulation-batch \
+  configs/batch_lightwheel_refrigerators_mjcf.tsv \
+  --output-root outputs/recordings_refrigerators_staged_dense_mps \
+  --record-config configs/record_refrigerator_staged.yaml \
+  --track-config configs/track_refrigerator_dense.yaml \
+  --track-device mps \
+  --tracking-jobs 1 \
+  --mujoco-prior off \
+  --joint-rotation-threshold-rad 0.90
+```
+
+The dense preset uses `seed-stride-px: 8` and
+`max-tracks-per-part-view: 256`. This is intentionally heavier than the default
+because sliding freezer/drawer parts can occupy small visible regions. With only
+a few tracks, the full SE(3) pose fit can explain translation as apparent
+rotation and later misclassify a prismatic joint as revolute.
+
+`infer-joints` now also records `metrics.track_model_comparison` when the input
+`part_poses.json` was estimated from `part_tracks.json`. The comparison replays
+the same 3D tracks under revolute and prismatic candidates and reports both
+RMSEs. It is guarded by minimum distinct tracks and samples. When the residual
+comparison is decisive, it now chooses the joint type directly before falling
+back to pose-derived rotation/translation thresholds. This avoids a hard
+dependency on potentially noisy full-SE(3) pose deltas for sliding parts. Disable
+this diagnostic with `--no-track-residual-type` when you need pure
+pose-threshold behavior, or pass `--track-residual-requires-pose-candidate` to
+reproduce the older pose-gated residual behavior.
+
+For prismatic parts, `infer-joints` also prefers a track-endpoint centroid
+displacement axis when enough tracks are available. This is more robust than
+reading the axis from full SE(3) part poses: small sliding parts can have enough
+tracks to show clean translation while the rigid pose fit still reports spurious
+orientation drift. In refrigerator/freezer tests this reduced prismatic axis
+angle errors from tens of degrees to a few degrees. The prismatic axis location
+or pivot-like position remains less observable from motion alone than a revolute
+hinge pivot; interpret prismatic position/RMSE separately from revolute pivot
+error and prefer axis direction plus q replay error when diagnosing drawer
+motion.
+
+To reproduce the ablation, disable the track-displacement prismatic axis and
+keep everything else fixed:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp infer-joints \
+  outputs/recordings_refrigerators_staged_dense_mps/refrigerator039/pointcloud_4d_partseg/part_poses.json \
+  --output-json outputs/axis_ablation/refrigerator039/joint_inference.json \
+  --mujoco-prior off \
+  --rotation-threshold-rad 0.90 \
+  --no-track-translation-axis
+```
+
+The repository helper `scripts/summarize_axis_ablation.py` compares the SE(3)
+pose-axis variant against the default track-displacement axis over a batch and
+writes `axis_ablation_summary.md/json` plus `axis_ablation_per_joint.tsv`.
+
+To compare the old pose-gated type selection with the default track-model-first
+selection, reuse existing `part_poses.json` / `part_tracks.json` artifacts:
+
+```bash
+PYTHONPATH=src python3 scripts/summarize_joint_type_ablation.py \
+  --batch-config configs/batch_lightwheel_refrigerators_mjcf.tsv \
+  --optimized-root outputs/recordings_refrigerators_staged_dense_mps \
+  --output-dir outputs/feedforward_articulation/lightwheel_refrigerators_view1_dooropen_upY/_evaluation/type_selection_ablation \
+  --rotation-threshold-rad 0.90
+```
+
+This writes `joint_type_ablation_summary.md/json`,
+`joint_type_ablation_per_object.tsv`, and `joint_type_ablation_per_joint.tsv`.
+On the dense refrigerator batch, both variants currently produce the same
+100.0% type accuracy because every decisive residual is already allowed by the
+old pose candidate gate; the new mode removes that future failure mode without a
+measurable runtime cost.
+
+Use `--dynamics-backend mujoco` or `--dynamics-backend mjx` to enable the
+optional Stage 4 dynamics fit. Override its preset with
+`--dynamics-config path/to/template.yaml` when needed.
 
 Batch recovery flags:
 

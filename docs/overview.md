@@ -17,11 +17,12 @@ The implementation is scaffold-first. It defines the artifact contracts, keeps c
 - Generation-first reconstruction scaffold with low-support cleanup
 - Single-DOF articulation init with `door -> revolute` and `drawer -> prismatic`
 - Sliding-window temporal refit with smoothed `q` and derived `qdot`
-- URDF export with visual meshes, collision box proxies, nominal inertial placeholders, and an MJCF stub
+- URDF export with visual meshes, collision box proxies, pointcloud-sized inertial initialization, and an MJCF stub
 - MuJoCo recording utilities
 - Multi-view RGB-D fusion into time-indexed 4D point clouds
 - MuJoCo-prior part masks and part-labeled pointcloud export
 - HTML pointcloud viewer
+- First-pass MuJoCo/MJX dynamics identification with rollout error metrics
 - Unit tests for schema loading, temporal smoothing, recording/parser behavior, fusion, and visualization
 
 ## Current Placeholders

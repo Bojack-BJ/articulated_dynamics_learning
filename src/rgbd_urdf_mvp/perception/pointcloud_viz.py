@@ -805,6 +805,11 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
         <div class="value" id="pitchValue"></div>
       </div>
       <div class="control-group">
+        <label for="rollSlider">Roll</label>
+        <input id="rollSlider" type="range" min="-180" max="180" step="1" value="0" />
+        <div class="value" id="rollValue"></div>
+      </div>
+      <div class="control-group">
         <label for="scaleSlider">Zoom</label>
         <input id="scaleSlider" type="range" min="0.5" max="4.0" step="0.05" value="1.6" />
         <div class="value" id="scaleValue"></div>
@@ -865,7 +870,7 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
       </div>
       <div class="timeline">
         <div class="status" id="status"></div>
-        <div class="status">Drag on the canvas to rotate. Scroll to zoom.</div>
+        <div class="status">Drag to yaw/pitch. Shift-drag horizontally to roll. Scroll to zoom.</div>
       </div>
     </main>
   </div>
@@ -878,6 +883,8 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
   const yawValue = document.getElementById("yawValue");
   const pitchSlider = document.getElementById("pitchSlider");
   const pitchValue = document.getElementById("pitchValue");
+  const rollSlider = document.getElementById("rollSlider");
+  const rollValue = document.getElementById("rollValue");
   const scaleSlider = document.getElementById("scaleSlider");
   const scaleValue = document.getElementById("scaleValue");
   const radiusSlider = document.getElementById("radiusSlider");
@@ -1026,12 +1033,13 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
     frameValue.textContent = `Frame ${{frameIndex}} / ${{Math.max(0, frames.length - 1)}}`;
     yawValue.textContent = `${{yawSlider.value}} deg`;
     pitchValue.textContent = `${{pitchSlider.value}} deg`;
+    rollValue.textContent = `${{rollSlider.value}} deg`;
     scaleValue.textContent = `${{Number(scaleSlider.value).toFixed(2)}}x`;
     radiusValue.textContent = `${{Number(radiusSlider.value).toFixed(2)}} px`;
     ghostValue.textContent = `${{ghostSlider.value}} frames`;
   }}
 
-  function rotate(point, yawRad, pitchRad) {{
+  function rotate(point, yawRad, pitchRad, rollRad) {{
     const x0 = point[0] - center[0];
     const y0 = point[1] - center[1];
     const z0 = point[2] - center[2];
@@ -1039,11 +1047,15 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
     const sinY = Math.sin(yawRad);
     const cosP = Math.cos(pitchRad);
     const sinP = Math.sin(pitchRad);
+    const cosR = Math.cos(rollRad);
+    const sinR = Math.sin(rollRad);
     const x1 = cosY * x0 + sinY * z0;
     const z1 = -sinY * x0 + cosY * z0;
     const y1 = cosP * y0 - sinP * z1;
     const z2 = sinP * y0 + cosP * z1;
-    return [x1, y1, z2];
+    const x2 = cosR * x1 - sinR * y1;
+    const y2 = sinR * x1 + cosR * y1;
+    return [x2, y2, z2];
   }}
 
   function project(rotated, scale) {{
@@ -1074,8 +1086,8 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
     return pointColor(zNorm, alpha);
   }}
 
-  function projectPointForMain(point, yaw, pitch, scale) {{
-    const rotated = rotate(point, yaw, pitch);
+  function projectPointForMain(point, yaw, pitch, roll, scale) {{
+    const rotated = rotate(point, yaw, pitch, roll);
     const [sx, sy, perspective] = project(rotated, scale);
     return {{ sx, sy, perspective }};
   }}
@@ -1137,16 +1149,16 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
     ];
   }}
 
-  function drawPartPosesMain(overlays, yaw, pitch, scale, radiusBase) {{
+  function drawPartPosesMain(overlays, yaw, pitch, roll, scale, radiusBase) {{
     if (!showPoses || !hasPartPoseOverlays) return;
     ctx.save();
     ctx.lineWidth = 1.35;
     for (const item of overlays) {{
       if (!isPartVisible(item.part_id)) continue;
-      const origin = projectPointForMain(item.translation || [0,0,0], yaw, pitch, scale);
+      const origin = projectPointForMain(item.translation || [0,0,0], yaw, pitch, roll, scale);
       for (const axis of poseAxes(item)) {{
-        const start = projectPointForMain(axis.start, yaw, pitch, scale);
-        const end = projectPointForMain(axis.end, yaw, pitch, scale);
+        const start = projectPointForMain(axis.start, yaw, pitch, roll, scale);
+        const end = projectPointForMain(axis.end, yaw, pitch, roll, scale);
         ctx.strokeStyle = axis.color;
         ctx.beginPath();
         ctx.moveTo(start.sx, start.sy);
@@ -1161,13 +1173,13 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
     ctx.restore();
   }}
 
-  function drawTrackFlowsMain(flows, yaw, pitch, scale, radiusBase) {{
+  function drawTrackFlowsMain(flows, yaw, pitch, roll, scale, radiusBase) {{
     if (!showFlow || !hasTrackFlows) return;
     ctx.save();
     for (const item of flows) {{
       if (!isPartVisible(item.part_id)) continue;
-      const start = projectPointForMain(item.start, yaw, pitch, scale);
-      const end = projectPointForMain(item.end, yaw, pitch, scale);
+      const start = projectPointForMain(item.start, yaw, pitch, roll, scale);
+      const end = projectPointForMain(item.end, yaw, pitch, roll, scale);
       const alpha = Math.max(0.15, Math.min(0.95, Number(item.confidence || 0.0)));
       ctx.strokeStyle = partColor(item.part_id, alpha);
       ctx.lineWidth = Math.max(0.8, radiusBase * 0.5);
@@ -1183,15 +1195,15 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
     ctx.restore();
   }}
 
-  function drawJointOverlaysMain(overlays, yaw, pitch, scale, radiusBase) {{
+  function drawJointOverlaysMain(overlays, yaw, pitch, roll, scale, radiusBase) {{
     if (!showJoints || !hasJointOverlays) return;
     ctx.save();
     ctx.lineWidth = 1.5;
     for (const item of overlays) {{
       const endpoints = jointEndpoints(item);
-      const start = projectPointForMain(endpoints.start, yaw, pitch, scale);
-      const end = projectPointForMain(endpoints.end, yaw, pitch, scale);
-      const pivot = projectPointForMain(endpoints.pivot, yaw, pitch, scale);
+      const start = projectPointForMain(endpoints.start, yaw, pitch, roll, scale);
+      const end = projectPointForMain(endpoints.end, yaw, pitch, roll, scale);
+      const pivot = projectPointForMain(endpoints.pivot, yaw, pitch, roll, scale);
       const color = partColor(item.child_part_id, 0.95);
       ctx.strokeStyle = color;
       ctx.beginPath();
@@ -1341,6 +1353,7 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
 
     const yaw = Number(yawSlider.value) * Math.PI / 180.0;
     const pitch = Number(pitchSlider.value) * Math.PI / 180.0;
+    const roll = Number(rollSlider.value) * Math.PI / 180.0;
     const scale = baseScale * Number(scaleSlider.value);
     const radiusBase = Number(radiusSlider.value);
     const ghostFrames = viewMode === "static" ? 0 : Number(ghostSlider.value);
@@ -1350,7 +1363,7 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
     if (viewMode === "static" || viewMode === "current_static") {{
       for (const point of staticPoints) {{
         if (!isPartVisible(point[3])) continue;
-        const rotated = rotate(point, yaw, pitch);
+        const rotated = rotate(point, yaw, pitch, roll);
         const [sx, sy, perspective] = project(rotated, scale);
         ctx.fillStyle = pointFill(point, 0.18);
         ctx.beginPath();
@@ -1367,7 +1380,7 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
         const ghostAlpha = offset === 0 ? 0.95 : 0.14 + 0.08 * (ghostFrames - offset);
         for (const point of frame.points) {{
           if (!isPartVisible(point[3])) continue;
-          const rotated = rotate(point, yaw, pitch);
+          const rotated = rotate(point, yaw, pitch, roll);
           const [sx, sy, perspective] = project(rotated, scale);
           ctx.fillStyle = pointFill(point, ghostAlpha);
           ctx.beginPath();
@@ -1379,7 +1392,7 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
       const frame = dynamicFrames[frameIndex] || {{points: []}};
       for (const point of frame.points) {{
         if (!isPartVisible(point[3])) continue;
-        const rotated = rotate(point, yaw, pitch);
+        const rotated = rotate(point, yaw, pitch, roll);
         const [sx, sy, perspective] = project(rotated, scale);
         ctx.fillStyle = pointFill(point, 0.95, true);
         ctx.beginPath();
@@ -1393,9 +1406,9 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
     const partPoseFrame = partPoseFrames[frameIndex] || {{items: []}};
     const trackFlowFrame = trackFlowFrames[frameIndex] || {{items: []}};
     const jointFrame = jointFrames[frameIndex] || {{items: []}};
-    drawTrackFlowsMain(trackFlowFrame.items || [], yaw, pitch, scale, radiusBase);
-    drawPartPosesMain(partPoseFrame.items || [], yaw, pitch, scale, radiusBase);
-    drawJointOverlaysMain(jointFrame.items || [], yaw, pitch, scale, radiusBase);
+    drawTrackFlowsMain(trackFlowFrame.items || [], yaw, pitch, roll, scale, radiusBase);
+    drawPartPosesMain(partPoseFrame.items || [], yaw, pitch, roll, scale, radiusBase);
+    drawJointOverlaysMain(jointFrame.items || [], yaw, pitch, roll, scale, radiusBase);
     statusEl.textContent = `time=${{formatNumber(frame.time_s)}} s | frame=${{frameIndex}} | points=${{frame.points.length}} | dynamic=${{dynamicFrame.points.length}} | flow=${{(trackFlowFrame.items || []).length}} | poses=${{(partPoseFrame.items || []).length}} | joints=${{(jointFrame.items || []).length}} | pose_src=${{meta.part_pose_estimator || "n/a"}} | mode=${{viewMode}} | color=${{colorMode}}`;
     drawProjection(projectionCanvases.front, 0, 2, "X vs Z");
     drawProjection(projectionCanvases.side, 1, 2, "Y vs Z");
@@ -1406,18 +1419,22 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
     if (name === "perspective") {{
       yawSlider.value = 35;
       pitchSlider.value = 22;
+      rollSlider.value = 0;
       scaleSlider.value = 1.6;
     }} else if (name === "front") {{
       yawSlider.value = 0;
       pitchSlider.value = 0;
+      rollSlider.value = 0;
       scaleSlider.value = 1.8;
     }} else if (name === "side") {{
       yawSlider.value = 90;
       pitchSlider.value = 0;
+      rollSlider.value = 0;
       scaleSlider.value = 1.8;
     }} else if (name === "top") {{
       yawSlider.value = 0;
       pitchSlider.value = -89;
+      rollSlider.value = 0;
       scaleSlider.value = 1.8;
     }}
     syncControls();
@@ -1451,7 +1468,7 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
     syncControls();
     render();
   }});
-  [yawSlider, pitchSlider, scaleSlider, radiusSlider, ghostSlider].forEach((el) => {{
+  [yawSlider, pitchSlider, rollSlider, scaleSlider, radiusSlider, ghostSlider].forEach((el) => {{
     el.addEventListener("input", () => {{
       syncControls();
       render();
@@ -1532,12 +1549,17 @@ def _build_html(payload: dict[str, object], config: PointCloudVisualizationConfi
       y: event.clientY,
       yaw: Number(yawSlider.value),
       pitch: Number(pitchSlider.value),
+      roll: Number(rollSlider.value),
     }};
   }});
   window.addEventListener("mousemove", (event) => {{
     if (!drag) return;
-    yawSlider.value = String(Math.max(-180, Math.min(180, drag.yaw + (event.clientX - drag.x) * 0.35)));
-    pitchSlider.value = String(Math.max(-89, Math.min(89, drag.pitch + (event.clientY - drag.y) * 0.25)));
+    if (event.shiftKey) {{
+      rollSlider.value = String(Math.max(-180, Math.min(180, drag.roll + (event.clientX - drag.x) * 0.35)));
+    }} else {{
+      yawSlider.value = String(Math.max(-180, Math.min(180, drag.yaw + (event.clientX - drag.x) * 0.35)));
+      pitchSlider.value = String(Math.max(-89, Math.min(89, drag.pitch + (event.clientY - drag.y) * 0.25)));
+    }}
     syncControls();
     render();
   }});

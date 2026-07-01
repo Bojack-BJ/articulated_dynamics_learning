@@ -40,6 +40,8 @@ class Hunyuan3DClientTests(unittest.TestCase):
                 "https://example.com",
                 "--image",
                 "input.png",
+                "--image-manifest",
+                "generation_images.json",
                 "--output",
                 "model.glb",
                 "--mode",
@@ -52,6 +54,7 @@ class Hunyuan3DClientTests(unittest.TestCase):
         self.assertEqual(args.command, "hunyuan3d-generate")
         self.assertEqual(args.server_url, "https://example.com")
         self.assertEqual(args.image, [Path("input.png")])
+        self.assertEqual(args.image_manifest, Path("generation_images.json"))
         self.assertEqual(args.output, Path("model.glb"))
         self.assertEqual(args.api_token, "secret")
 
@@ -98,6 +101,23 @@ class Hunyuan3DClientTests(unittest.TestCase):
             self.assertEqual(base64.b64decode(image_payload["front"]), b"front")
             self.assertEqual(base64.b64decode(image_payload["left"]), b"left")
             self.assertEqual(base64.b64decode(image_payload["right"]), b"right")
+
+    def test_build_generation_payload_sends_single_named_view_as_plain_image(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            front_path = Path(temp_dir) / "front.png"
+            front_path.write_bytes(b"front")
+
+            payload = build_generation_payload(
+                Hunyuan3DGenerationConfig(
+                    server_url="http://localhost",
+                    image_path=[front_path],
+                    image_views=["front"],
+                    output_path=Path(temp_dir) / "out.glb",
+                )
+            )
+
+            self.assertIsInstance(payload["image"], str)
+            self.assertEqual(base64.b64decode(payload["image"]), b"front")
 
     def test_build_generation_payload_rejects_view_count_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import random
 from pathlib import Path
 
 from rgbd_urdf_mvp.cli import build_parser
@@ -469,6 +470,14 @@ class MuJoCoRecorderTests(unittest.TestCase):
                 "0.2",
                 "--kick-duration-s",
                 "0.05",
+                "--excitation-mode",
+                "pulse",
+                "--excitation-force",
+                "-2.0",
+                "--excitation-start-s",
+                "0.1",
+                "--excitation-duration-s",
+                "0.25",
             ]
         )
         self.assertEqual(args.command, "record-mujoco")
@@ -477,6 +486,102 @@ class MuJoCoRecorderTests(unittest.TestCase):
         self.assertAlmostEqual(args.kick_force, 3.0)
         self.assertAlmostEqual(args.kick_start_s, 0.2)
         self.assertAlmostEqual(args.kick_duration_s, 0.05)
+        self.assertEqual(args.excitation_mode, "pulse")
+        self.assertAlmostEqual(args.excitation_force, -2.0)
+        self.assertAlmostEqual(args.excitation_start_s, 0.1)
+        self.assertAlmostEqual(args.excitation_duration_s, 0.25)
+
+    def test_excitation_force_profiles_are_deterministic(self) -> None:
+        recorder = MuJoCoEpisodeRecorder(
+            MuJoCoRecordConfig(
+                model_path="model.xml",
+                output_dir=Path("outputs"),
+                object_instance_id="door-forced-response",
+                category="door",
+                excitation_mode="pulse",
+                excitation_force=2.0,
+                excitation_start_s=0.1,
+                excitation_duration_s=0.2,
+            )
+        )
+        self.assertEqual(recorder._excitation_force(0.05, 0), 0.0)
+        self.assertEqual(recorder._excitation_force(0.1, 0), 2.0)
+        self.assertEqual(recorder._excitation_force(0.29, 0), 2.0)
+        self.assertEqual(recorder._excitation_force(0.31, 0), 0.0)
+
+        prbs_a = MuJoCoEpisodeRecorder(
+            MuJoCoRecordConfig(
+                model_path="model.xml",
+                output_dir=Path("outputs"),
+                object_instance_id="door-prbs-a",
+                category="door",
+                seed=7,
+                excitation_mode="prbs",
+                excitation_force=3.0,
+                excitation_start_s=0.0,
+                excitation_duration_s=1.0,
+                excitation_period_s=0.1,
+            )
+        )
+        prbs_b = MuJoCoEpisodeRecorder(
+            MuJoCoRecordConfig(
+                model_path="model.xml",
+                output_dir=Path("outputs"),
+                object_instance_id="door-prbs-b",
+                category="door",
+                seed=7,
+                excitation_mode="prbs",
+                excitation_force=3.0,
+                excitation_start_s=0.0,
+                excitation_duration_s=1.0,
+                excitation_period_s=0.1,
+            )
+        )
+        values_a = [prbs_a._excitation_force(index * 0.05, 0) for index in range(8)]
+        values_b = [prbs_b._excitation_force(index * 0.05, 0) for index in range(8)]
+        self.assertEqual(values_a, values_b)
+        self.assertTrue(all(abs(value) == 3.0 for value in values_a))
+
+    def test_forced_response_recording_respects_zero_initial_qvel(self) -> None:
+        try:
+            import mujoco  # type: ignore
+        except ImportError:
+            self.skipTest("mujoco not installed")
+
+        model_path = Path(__file__).resolve().parents[1] / "examples" / "mujoco_models" / "Microwave011.xml"
+        model = mujoco.MjModel.from_xml_path(str(model_path))
+        data = mujoco.MjData(model)
+        recorder = MuJoCoEpisodeRecorder(
+            MuJoCoRecordConfig(
+                model_path=model_path,
+                output_dir=Path("outputs"),
+                object_instance_id="microwave011-force-test",
+                category="microwave",
+                control_mode="free",
+                joint_name="microjoint",
+                initial_joint_qvel=0.0,
+                excitation_mode="pulse",
+                excitation_force=-2.0,
+                excitation_start_s=0.1,
+                excitation_duration_s=0.25,
+            )
+        )
+        joint_id = recorder._resolve_joint_id(mujoco, model)
+        qpos_adr = int(model.jnt_qposadr[joint_id])
+        dof_adr = int(model.jnt_dofadr[joint_id])
+        recorder._initialize_free_joint_state(
+            mujoco,
+            model,
+            data,
+            joint_id,
+            qpos_adr,
+            dof_adr,
+            primary_joint_id=joint_id,
+            joint_index=0,
+            rng=random.Random(0),
+        )
+        self.assertAlmostEqual(float(data.qpos[qpos_adr]), float(model.qpos0[qpos_adr]))
+        self.assertAlmostEqual(float(data.qvel[dof_adr]), 0.0)
 
 
 if __name__ == "__main__":

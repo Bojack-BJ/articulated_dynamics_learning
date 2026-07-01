@@ -1,0 +1,31 @@
+command: record-mujoco
+args:
+  model: examples/mujoco_models/Refrigerator031.xml
+  category: refrigerator
+  object-id: refrigerator031_staged
+  output-dir: outputs/recordings
+  duration-s: 4
+  fps: 60
+  control-mode: free
+  rgb-format: png
+  depth-format: png
+  mask-format: png
+  auto-initial-qvel-from-limits: true
+  auto-initial-qvel-direction-mode: away-from-qpos0
+  auto-initial-qvel-min-abs: 0.5
+  auto-initial-qvel-max-abs: 1.0
+  staged-initial-qvel: true
+  staged-primary-tokens: [door]
+  staged-secondary-tokens: [drawer, slide]
+  staged-secondary-count-min: 1
+  staged-secondary-count-max: 2
+  staged-secondary-start-s: 1.2
+  perturbation-scale: 0.0
+  video: true
+  camera-distance: 2.2
+  camera-mode: triview
+  camera-triview-spacing-deg: 90
+  lookat: [0.0, 0.0, 1.0]
+  disable-target-mesh-collision: true
+  segmentation-masks: true
+  part-segmentation-masks: true

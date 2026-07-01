@@ -1,0 +1,14 @@
+command: identify-dynamics-mjx
+args:
+  episode: outputs/recordings/microwave011/episode.json
+  articulation-artifact: outputs/recordings/microwave011/pointcloud_4d_partseg/inferred_articulation/articulation_artifact.json
+  mjcf: outputs/recordings/microwave011/pointcloud_4d_partseg/inferred_articulation/urdf/microwave011.mjcf.xml
+  output-dir: outputs/recordings/microwave011/pointcloud_4d_partseg/dynamics_identification_mjx
+  max-iterations: 25
+  learning-rate: 0.05
+  q-weight: 1.0
+  qdot-weight: 0.05
+  prior-weight: 0.02
+  jax-platform: metal
+  enable-pjrt-compatibility: true
+  render-gl-backend: cgl

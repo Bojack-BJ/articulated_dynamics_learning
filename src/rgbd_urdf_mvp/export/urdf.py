@@ -7,6 +7,7 @@ from xml.etree import ElementTree as ET
 from ..core.geometry import combine_bounds, shifted_boxes, size_from_bounds, write_obj
 from ..core.models import ArticulationArtifact, EpisodeInput, PartArtifact, PrimitiveBox, URDFPackage
 from ..core.serialization import save_json
+from ..core.xml_utils import write_xml_tree
 
 
 def _format_xyz(values: list[float]) -> str:
@@ -23,6 +24,60 @@ def _box_inertia(mass: float, size: list[float]) -> tuple[float, float, float]:
     iyy = mass * (x_len * x_len + z_len * z_len) / 12.0
     izz = mass * (x_len * x_len + y_len * y_len) / 12.0
     return ixx, iyy, izz
+
+
+def _aggregate_box_inertial(
+    boxes: list[PrimitiveBox],
+    density_kg_m3: float = 30.0,
+) -> tuple[float, list[float], tuple[float, float, float]]:
+    if not boxes:
+        mass = 0.05
+        return mass, [0.0, 0.0, 0.0], _box_inertia(mass, [0.1, 0.1, 0.1])
+
+    raw_masses = [max(0.0, density_kg_m3 * box.size[0] * box.size[1] * box.size[2]) for box in boxes]
+    total_raw_mass = sum(raw_masses)
+    if total_raw_mass <= 1e-9:
+        mass = 0.05
+        return mass, [0.0, 0.0, 0.0], _box_inertia(mass, [0.1, 0.1, 0.1])
+
+    total_mass = max(0.05, total_raw_mass)
+    mass_scale = total_mass / total_raw_mass
+    masses = [value * mass_scale for value in raw_masses]
+
+    center_of_mass = [
+        sum(mass * box.center[axis] for mass, box in zip(masses, boxes)) / total_mass
+        for axis in range(3)
+    ]
+
+    inertia_xx = 0.0
+    inertia_yy = 0.0
+    inertia_zz = 0.0
+    for mass, box in zip(masses, boxes):
+        local_ixx, local_iyy, local_izz = _box_inertia(mass, box.size)
+        dx = box.center[0] - center_of_mass[0]
+        dy = box.center[1] - center_of_mass[1]
+        dz = box.center[2] - center_of_mass[2]
+        inertia_xx += local_ixx + mass * (dy * dy + dz * dz)
+        inertia_yy += local_iyy + mass * (dx * dx + dz * dz)
+        inertia_zz += local_izz + mass * (dx * dx + dy * dy)
+
+    return total_mass, center_of_mass, (inertia_xx, inertia_yy, inertia_zz)
+
+
+def _initial_joint_damping(joint_type: str) -> float:
+    normalized = str(joint_type).strip().lower()
+    if normalized in {"revolute", "continuous"}:
+        return 0.1
+    if normalized == "prismatic":
+        return 0.1
+    return 0.0
+
+
+def _initial_joint_frictionloss(joint_type: str) -> float:
+    normalized = str(joint_type).strip().lower()
+    if normalized in {"revolute", "continuous", "prismatic"}:
+        return 0.0
+    return 0.0
 
 
 class URDFExporter:
@@ -51,9 +106,8 @@ class URDFExporter:
         for joint in articulation.joints:
             self._append_joint(robot, joint)
 
-        tree = ET.ElementTree(robot)
         urdf_path = output_path / f"{episode.object_instance_id}.urdf"
-        tree.write(urdf_path, encoding="utf-8", xml_declaration=True)
+        write_xml_tree(ET.ElementTree(robot), urdf_path)
 
         articulation_json_path = output_path / "articulation.json"
         save_json(
@@ -97,11 +151,9 @@ class URDFExporter:
 
         lower, upper = combine_bounds(local_boxes)
         bbox_size = size_from_bounds(lower, upper)
-        bbox_center = [(lo + hi) / 2.0 for lo, hi in zip(lower, upper)]
-        mass = _box_mass(bbox_size)
-        ixx, iyy, izz = _box_inertia(mass, bbox_size)
+        mass, center_of_mass, (ixx, iyy, izz) = _aggregate_box_inertial(local_boxes)
         inertial = ET.SubElement(link, "inertial")
-        ET.SubElement(inertial, "origin", xyz=_format_xyz(bbox_center), rpy="0 0 0")
+        ET.SubElement(inertial, "origin", xyz=_format_xyz(center_of_mass), rpy="0 0 0")
         ET.SubElement(inertial, "mass", value=f"{mass:.6f}")
         ET.SubElement(
             inertial,
@@ -154,7 +206,7 @@ class URDFExporter:
 
         part_map = {part.name: part for part in articulation.parts}
         if not part_map:
-            ET.ElementTree(root).write(mjcf_path, encoding="utf-8", xml_declaration=True)
+            write_xml_tree(ET.ElementTree(root), mjcf_path)
             return
 
         children_by_parent: dict[str, list] = {}
@@ -183,7 +235,7 @@ class URDFExporter:
                 depth=0,
             )
 
-        ET.ElementTree(root).write(mjcf_path, encoding="utf-8", xml_declaration=True)
+        write_xml_tree(ET.ElementTree(root), mjcf_path)
 
     def _append_mjcf_body(
         self,
@@ -209,6 +261,8 @@ class URDFExporter:
             child_body = ET.SubElement(body, "body", name=child_part.name, pos=_format_xyz(joint.origin))
             joint_type = self._mjcf_joint_type(joint.joint_type)
             if joint_type is not None:
+                damping = _initial_joint_damping(joint.joint_type)
+                frictionloss = _initial_joint_frictionloss(joint.joint_type)
                 ET.SubElement(
                     child_body,
                     "joint",
@@ -216,6 +270,8 @@ class URDFExporter:
                     type=joint_type,
                     axis=_format_xyz(joint.axis),
                     range=_format_xyz(joint.limits),
+                    damping=f"{damping:.6f}",
+                    frictionloss=f"{frictionloss:.6f}",
                 )
             self._append_mjcf_geoms(child_body, child_part, depth + 1)
             visited.add(child_part.name)
@@ -248,6 +304,8 @@ class URDFExporter:
         body = ET.SubElement(parent_body, "body", name=part.name, pos=_format_xyz(joint.origin))
         joint_type = self._mjcf_joint_type(joint.joint_type)
         if joint_type is not None:
+            damping = _initial_joint_damping(joint.joint_type)
+            frictionloss = _initial_joint_frictionloss(joint.joint_type)
             ET.SubElement(
                 body,
                 "joint",
@@ -255,6 +313,8 @@ class URDFExporter:
                 type=joint_type,
                 axis=_format_xyz(joint.axis),
                 range=_format_xyz(joint.limits),
+                damping=f"{damping:.6f}",
+                frictionloss=f"{frictionloss:.6f}",
             )
         self._append_mjcf_geoms(body, part, depth)
         visited.add(part.name)
@@ -275,6 +335,25 @@ class URDFExporter:
     def _append_mjcf_geoms(self, body: ET.Element, part: PartArtifact, depth: int) -> None:
         link_frame = list(part.canonical_pose.get("translation", [0.0, 0.0, 0.0]))
         local_boxes = shifted_boxes(part.primitive_boxes, link_frame)
+        if not local_boxes:
+            local_boxes = [
+                PrimitiveBox(
+                    name=f"{part.name}_placeholder",
+                    center=[0.0, 0.0, 0.0],
+                    size=[0.1, 0.1, 0.1],
+                    observed_ratio=0.0,
+                    generated=True,
+                )
+            ]
+        mass, center_of_mass, (ixx, iyy, izz) = _aggregate_box_inertial(local_boxes)
+        ET.SubElement(
+            body,
+            "inertial",
+            pos=_format_xyz(center_of_mass),
+            quat="1 0 0 0",
+            mass=f"{mass:.6f}",
+            diaginertia=f"{ixx:.9f} {iyy:.9f} {izz:.9f}",
+        )
         rgba = self._mjcf_rgba(part, depth)
         for box in local_boxes[:3]:
             ET.SubElement(

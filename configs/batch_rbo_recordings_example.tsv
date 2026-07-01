@@ -1,0 +1,3 @@
+# input_dir	object_id	category	output_dir	target_fps	max_frames
+real_data/microwave01_o	microwave01_o	microwave	outputs/real_recordings/microwave01_o	20	120
+real_data/microwave02_o	microwave02_o	microwave	outputs/real_recordings/microwave02_o	20	120

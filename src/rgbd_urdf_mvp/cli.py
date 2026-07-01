@@ -1,827 +1,13 @@
 from __future__ import annotations
 
-import argparse
 import json
-import os
 import sys
-from pathlib import Path
+import time
 
-from .core.categories import SUPPORTED_CATEGORIES, normalize_category
 from .core.cli_config import YAMLSubsetError, expand_config_argv
-from .pipeline import RGBDToURDFPipeline
 from .core.serialization import load_episode, load_json, validate_episode
-
-
-def build_parser() -> argparse.ArgumentParser:
-    """Build the project CLI.
-
-    The parser stays grouped by workflow so the file remains readable even
-    though the project exposes recording, pointcloud, articulation, and export
-    commands from one entry point.
-    """
-    parser = argparse.ArgumentParser(description="RGB-D to URDF MVP scaffold")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    # Episode-level schema checks.
-    validate_parser = subparsers.add_parser("validate-episode", help="Validate an episode manifest")
-    validate_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
-
-    probe_mps_parser = subparsers.add_parser(
-        "probe-torch-mps",
-        help="Print local PyTorch MPS capability diagnostics",
-    )
-    probe_mps_parser.add_argument(
-        "--no-tensor-test",
-        action="store_true",
-        help="Skip the real tensor allocation smoke test on the selected device",
-    )
-    probe_mps_parser.add_argument(
-        "--unsafe-force-mps",
-        action="store_true",
-        help="Attempt an actual MPS tensor even when torch.backends.mps.is_available() is false",
-    )
-
-    probe_mjx_parser = subparsers.add_parser(
-        "probe-mjx",
-        help="Print local JAX + MuJoCo MJX capability diagnostics",
-    )
-    probe_mjx_parser.add_argument(
-        "--no-rollout-test",
-        action="store_true",
-        help="Skip the tiny JIT + mjx.step smoke test",
-    )
-
-    # End-to-end scaffold pipeline.
-    run_parser = subparsers.add_parser("run", help="Run the end-to-end MVP pipeline")
-    run_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
-    run_parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("outputs") / "run",
-        help="Directory for pipeline outputs",
-    )
-    run_parser.add_argument(
-        "--path",
-        choices=["feedforward", "optimization"],
-        default="optimization",
-        help=(
-            "Pipeline path. 'feedforward' stops after articulation init; "
-            "'optimization' runs the temporal refinement stage before export."
-        ),
-    )
-
-    batch_parser = subparsers.add_parser(
-        "run-articulation-batch",
-        help="Run the record -> fuse -> track -> pose -> joint -> viewer pipeline over a batch manifest",
-    )
-    batch_parser.add_argument(
-        "manifest",
-        type=Path,
-        help="Tab-separated manifest: category, model_path, object_id, joint_name",
-    )
-    batch_parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Skip any stage whose expected output already exists",
-    )
-    batch_parser.add_argument(
-        "--skip-existing",
-        action="store_true",
-        help="Skip a whole object when its final batch artifact already exists",
-    )
-    batch_parser.add_argument(
-        "--jobs",
-        type=int,
-        default=1,
-        help="Maximum number of objects to process concurrently",
-    )
-    batch_parser.add_argument(
-        "--output-root",
-        type=Path,
-        default=Path("outputs") / "recordings",
-        help="Root directory for per-object recording outputs",
-    )
-    batch_parser.add_argument(
-        "--batch-log-dir",
-        type=Path,
-        default=Path("outputs") / "recordings" / "_batch_logs",
-        help="Per-object batch logs when --jobs > 1",
-    )
-    batch_parser.add_argument(
-        "--torch-home",
-        type=Path,
-        default=Path(os.environ.get("TORCH_HOME", ".cache/torch")),
-        help="Torch cache directory propagated to subprocess stages",
-    )
-    batch_parser.add_argument(
-        "--record-config",
-        type=Path,
-        default=None,
-        help="Optional YAML/JSON record-mujoco template used for every object in the batch",
-    )
-    batch_parser.add_argument(
-        "--track-config",
-        type=Path,
-        default=None,
-        help="Optional YAML/JSON track-part-pixels template used for every object in the batch",
-    )
-    batch_parser.add_argument(
-        "--cotracker-repo",
-        type=Path,
-        default=None,
-        help="Optional override for the CoTracker repo path used by the tracking stage",
-    )
-    batch_parser.add_argument(
-        "--cotracker-checkpoint",
-        type=Path,
-        default=None,
-        help="Optional override for the CoTracker checkpoint path used by the tracking stage",
-    )
-    batch_parser.add_argument(
-        "--track-device",
-        choices=["auto", "mps", "cpu", "cuda"],
-        default=None,
-        help="Optional override for the device used by track-part-pixels",
-    )
-    batch_parser.add_argument(
-        "--tracking-jobs",
-        type=int,
-        default=None,
-        help=(
-            "Maximum number of concurrent track-part-pixels stages. "
-            "Defaults to 1 for auto/mps/cuda and to --jobs for cpu."
-        ),
-    )
-    batch_parser.add_argument(
-        "--fuse-pixel-stride",
-        type=int,
-        default=8,
-        help="Depth sampling stride for fuse-pointcloud",
-    )
-    batch_parser.add_argument(
-        "--fuse-voxel-size-m",
-        type=float,
-        default=0.02,
-        help="Fusion voxel size for fuse-pointcloud",
-    )
-    batch_parser.add_argument(
-        "--min-tracks-per-part",
-        type=int,
-        default=4,
-        help="Minimum visible 3D tracks required for track-based part pose estimation",
-    )
-    batch_parser.add_argument(
-        "--mujoco-prior",
-        choices=["auto", "off", "required"],
-        default="off",
-        help="MJCF prior mode passed through to infer-joints",
-    )
-    batch_parser.add_argument(
-        "--no-generate-viewer",
-        action="store_true",
-        help="Skip the final visualize-pointcloud stage",
-    )
-
-    # 4D pointcloud fusion and inspection.
-    fuse_parser = subparsers.add_parser(
-        "fuse-pointcloud",
-        help="Fuse multi-view depth observations into a time-indexed 4D point cloud",
-    )
-    fuse_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
-    fuse_parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Directory for fused point cloud outputs (defaults to <episode_dir>/pointcloud_4d)",
-    )
-    fuse_parser.add_argument("--pixel-stride", type=int, default=4, help="Depth sampling stride")
-    fuse_parser.add_argument("--voxel-size-m", type=float, default=0.015, help="Voxel size for view fusion")
-    fuse_parser.add_argument(
-        "--bbox-margin-m",
-        type=float,
-        default=0.20,
-        help="Margin added to the estimated object bounds",
-    )
-    fuse_parser.add_argument(
-        "--near-depth-band-m",
-        type=float,
-        default=0.35,
-        help="Near-depth band used during object bootstrap",
-    )
-    fuse_parser.add_argument(
-        "--no-shared-pose-fallback",
-        action="store_true",
-        help="Fail instead of falling back to the central pose when per-view poses are missing",
-    )
-
-    viewer_parser = subparsers.add_parser(
-        "visualize-pointcloud",
-        help="Build a self-contained HTML viewer for a 4D point cloud manifest or PLY",
-    )
-    viewer_parser.add_argument(
-        "input",
-        type=Path,
-        help="Path to fusion_manifest.json or pointcloud_4d.ply",
-    )
-    viewer_parser.add_argument(
-        "--output-html",
-        type=Path,
-        default=None,
-        help="Where to write the viewer HTML",
-    )
-    viewer_parser.add_argument(
-        "--max-points-per-frame",
-        type=int,
-        default=4000,
-        help="Maximum rendered points per frame after uniform downsampling",
-    )
-    viewer_parser.add_argument(
-        "--point-radius-px",
-        type=float,
-        default=2.0,
-        help="Default rendered point radius in pixels",
-    )
-    viewer_parser.add_argument(
-        "--part-poses-json",
-        type=Path,
-        default=None,
-        help="Optional part_poses.json override used for joint overlays",
-    )
-    viewer_parser.add_argument(
-        "--part-tracks-json",
-        type=Path,
-        default=None,
-        help="Optional part_tracks.json override used for CoTracker flow overlays",
-    )
-    viewer_parser.add_argument(
-        "--joint-inference-json",
-        type=Path,
-        default=None,
-        help="Optional joint_inference.json override used for joint overlays",
-    )
-
-    # Part-level perception and kinematics from pointclouds.
-    part_tracker_parser = subparsers.add_parser(
-        "track-part-pixels",
-        help="Track part-mask seed pixels with CoTracker and backproject them into 3D tracks",
-    )
-    part_tracker_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
-    part_tracker_parser.add_argument(
-        "--output-json",
-        type=Path,
-        default=None,
-        help="Where to write the 3D track artifact (defaults to <episode_dir>/part_tracks.json)",
-    )
-    part_tracker_parser.add_argument(
-        "--device",
-        choices=["auto", "mps", "cpu", "cuda"],
-        default="auto",
-        help="PyTorch device. On Mac, 'auto' uses MPS when available and otherwise CPU.",
-    )
-    part_tracker_parser.add_argument(
-        "--cotracker-repo",
-        type=Path,
-        default=None,
-        help="Optional local co-tracker checkout for torch.hub source=local",
-    )
-    part_tracker_parser.add_argument(
-        "--cotracker-checkpoint",
-        type=Path,
-        default=None,
-        help="Optional local CoTracker checkpoint path used instead of torch.hub downloading weights",
-    )
-    part_tracker_parser.add_argument(
-        "--cotracker-model",
-        default="cotracker3_offline",
-        help="torch.hub CoTracker model entry point",
-    )
-    part_tracker_parser.add_argument(
-        "--unsafe-force-mps",
-        action="store_true",
-        help="When combined with --device mps, bypass the availability guard and try MPS anyway.",
-    )
-    part_tracker_parser.add_argument(
-        "--reference-frame",
-        type=int,
-        default=0,
-        help="Frame used for seed pixels and canonical 3D references; pass -1 to auto-pick per part",
-    )
-    part_tracker_parser.add_argument(
-        "--frame-stride",
-        type=int,
-        default=1,
-        help="Temporal subsampling stride for tracking. For a 60 Hz episode, 4 tracks at roughly 15 Hz.",
-    )
-    part_tracker_parser.add_argument("--seed-stride-px", type=int, default=16, help="Pixel stride for mask seed sampling")
-    part_tracker_parser.add_argument(
-        "--max-tracks-per-part-view",
-        type=int,
-        default=128,
-        help="Maximum seed tracks per part per view",
-    )
-    part_tracker_parser.add_argument(
-        "--visibility-threshold",
-        type=float,
-        default=0.5,
-        help="Minimum CoTracker visibility score required for a valid 3D sample",
-    )
-    part_tracker_parser.add_argument(
-        "--no-part-mask-consistency",
-        action="store_true",
-        help="Do not require tracked pixels to remain inside the same part mask before backprojection",
-    )
-    part_tracker_parser.add_argument(
-        "--no-backward-tracking",
-        action="store_true",
-        help="Disable CoTracker backward tracking from the reference frame",
-    )
-    part_tracker_parser.add_argument(
-        "--no-progress",
-        action="store_true",
-        help="Disable stderr progress updates during CoTracker tracking",
-    )
-
-    part_pose_parser = subparsers.add_parser(
-        "estimate-part-poses",
-        help="Estimate per-part per-frame 6D poses from a part-labeled fused pointcloud",
-    )
-    part_pose_parser.add_argument(
-        "input",
-        type=Path,
-        help="Path to fusion_manifest.json / pointcloud_4d.ply for PCA, or part_tracks.json for track-based poses",
-    )
-    part_pose_parser.add_argument(
-        "--method",
-        choices=["auto", "pca", "tracks"],
-        default="auto",
-        help="Pose estimator. 'pca' uses fused pointcloud PCA; 'tracks' uses 3D CoTracker correspondences.",
-    )
-    part_pose_parser.add_argument(
-        "--output-json",
-        type=Path,
-        default=None,
-        help="Where to write the estimated part pose artifact",
-    )
-    part_pose_parser.add_argument(
-        "--min-points-per-part",
-        type=int,
-        default=24,
-        help="Minimum per-frame point count required to emit a valid pose sample",
-    )
-    part_pose_parser.add_argument(
-        "--anchor-part-id",
-        type=int,
-        default=None,
-        help="Optional part id to use as the relative-pose anchor instead of auto-selecting the base/static part",
-    )
-    part_pose_parser.add_argument(
-        "--min-tracks-per-part",
-        type=int,
-        default=4,
-        help="Minimum visible 3D tracks required per frame when --method tracks is used",
-    )
-
-    joint_parser = subparsers.add_parser(
-        "infer-joints",
-        help="Infer joint type, axis, and pivot from per-part per-frame pose tracks",
-    )
-    joint_parser.add_argument(
-        "input",
-        type=Path,
-        help="Path to part_poses.json",
-    )
-    joint_parser.add_argument(
-        "--output-json",
-        type=Path,
-        default=None,
-        help="Where to write the inferred joint artifact",
-    )
-    joint_parser.add_argument(
-        "--rotation-threshold-rad",
-        type=float,
-        default=0.20,
-        help="Minimum rotation range required to classify a moving part as revolute",
-    )
-    joint_parser.add_argument(
-        "--translation-threshold-m",
-        type=float,
-        default=0.02,
-        help="Minimum translation range required to classify a moving part as prismatic when rotation is small",
-    )
-    joint_parser.add_argument(
-        "--mujoco-prior",
-        choices=["auto", "off", "required"],
-        default="auto",
-        help=(
-            "Use MJCF joint metadata when it is available through the recording manifest. "
-            "'auto' uses it as a simulation/debug prior, 'off' keeps pure geometry inference, "
-            "and 'required' fails if no prior can be found."
-        ),
-    )
-
-    inferred_export_parser = subparsers.add_parser(
-        "export-inferred-articulation",
-        help="Build articulation_artifact + URDF/MJCF from episode, part poses, and inferred joints",
-    )
-    inferred_export_parser.add_argument("episode", type=Path, help="Path to episode.json")
-    inferred_export_parser.add_argument("part_poses", type=Path, help="Path to part_poses.json")
-    inferred_export_parser.add_argument("joint_inference", type=Path, help="Path to joint_inference.json")
-    inferred_export_parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Directory for articulation and URDF outputs (defaults to <joint_inference_dir>/inferred_articulation)",
-    )
-
-    dynamics_parser = subparsers.add_parser(
-        "identify-dynamics",
-        help="Fit part masses and joint damping/friction against the observed joint trajectory in MuJoCo",
-    )
-    dynamics_parser.add_argument("episode", type=Path, help="Path to episode.json")
-    dynamics_parser.add_argument("articulation_artifact", type=Path, help="Path to articulation_artifact.json")
-    dynamics_parser.add_argument("mjcf", type=Path, help="Path to the MJCF model to optimize")
-    dynamics_parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Directory for dynamics identification outputs (defaults to <mjcf_dir>/dynamics_identification)",
-    )
-    dynamics_parser.add_argument("--max-iterations", type=int, default=10, help="Maximum optimization iterations")
-    dynamics_parser.add_argument("--learning-rate", type=float, default=0.25, help="Finite-difference gradient step size")
-    dynamics_parser.add_argument("--q-weight", type=float, default=1.0, help="Weight for q(t) trajectory matching")
-    dynamics_parser.add_argument("--qdot-weight", type=float, default=0.05, help="Weight for qdot(t) trajectory matching")
-    dynamics_parser.add_argument("--prior-weight", type=float, default=0.02, help="Regularization weight toward the initial MJCF parameters")
-    dynamics_parser.add_argument(
-        "--optimize-static-parts",
-        action="store_true",
-        help="Also include static/root part masses in the optimization vector",
-    )
-    dynamics_parser.add_argument(
-        "--no-optimize-mass",
-        action="store_true",
-        help="Do not optimize body masses/inertias",
-    )
-    dynamics_parser.add_argument(
-        "--no-optimize-damping",
-        action="store_true",
-        help="Do not optimize joint damping",
-    )
-    dynamics_parser.add_argument(
-        "--no-optimize-friction",
-        action="store_true",
-        help="Do not optimize joint frictionloss",
-    )
-
-    hunyuan_parser = subparsers.add_parser(
-        "hunyuan3d-generate",
-        help="Request a remote Hunyuan3D API server and save the generated 3D asset",
-    )
-    hunyuan_parser.add_argument("--server-url", required=True, help="Base URL of the Hunyuan3D API server")
-    hunyuan_parser.add_argument("--output", type=Path, required=True, help="Output model path, usually .glb")
-    hunyuan_parser.add_argument(
-        "--image",
-        type=Path,
-        nargs="+",
-        default=None,
-        help=(
-            "One or more input image paths. A single path uses Hunyuan3D single-view mode; "
-            "multiple paths are sent as a multiview payload."
-        ),
-    )
-    hunyuan_parser.add_argument(
-        "--image-views",
-        nargs="+",
-        choices=["front", "left", "right", "back"],
-        default=None,
-        help=(
-            "View names matching --image order for multiview generation. "
-            "Defaults to front left right back truncated to the number of images."
-        ),
-    )
-    hunyuan_parser.add_argument("--text", type=str, default=None, help="Optional text prompt")
-    hunyuan_parser.add_argument("--mesh", type=Path, default=None, help="Optional input mesh for texture generation")
-    hunyuan_parser.add_argument("--mode", choices=["async", "sync"], default="async", help="Use /send polling or /generate")
-    hunyuan_parser.add_argument("--texture", action="store_true", help="Request texture generation when supported")
-    hunyuan_parser.add_argument("--seed", type=int, default=1234, help="Generation seed")
-    hunyuan_parser.add_argument("--type", default="glb", help="Requested output type, e.g. glb or obj")
-    hunyuan_parser.add_argument("--octree-resolution", type=int, default=None, help="Optional Hunyuan3D octree resolution")
-    hunyuan_parser.add_argument("--num-inference-steps", type=int, default=None, help="Optional diffusion step count")
-    hunyuan_parser.add_argument("--guidance-scale", type=float, default=None, help="Optional guidance scale")
-    hunyuan_parser.add_argument("--face-count", type=int, default=None, help="Optional target face count")
-    hunyuan_parser.add_argument("--timeout-s", type=float, default=1800.0, help="Async polling timeout")
-    hunyuan_parser.add_argument("--poll-interval-s", type=float, default=5.0, help="Async polling interval")
-    hunyuan_parser.add_argument(
-        "--api-token",
-        type=str,
-        default=None,
-        help="Optional bearer token for a reverse proxy, tunnel, or API gateway",
-    )
-
-    # MuJoCo recording and mask generation.
-    render_masks_parser = subparsers.add_parser(
-        "render-mujoco-masks",
-        help="Render target-object segmentation masks for an existing MuJoCo episode",
-    )
-    render_masks_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
-    render_masks_parser.add_argument(
-        "--model",
-        type=Path,
-        default=None,
-        help="Optional MJCF model path override",
-    )
-    render_masks_parser.add_argument(
-        "--mask-format",
-        choices=["pgm", "png"],
-        default="pgm",
-        help="Mask output format",
-    )
-    render_masks_parser.add_argument(
-        "--part-segmentation-masks",
-        action="store_true",
-        help="Also render indexed per-part masks using MuJoCo body/geom priors",
-    )
-    render_masks_parser.add_argument(
-        "--output-episode",
-        type=Path,
-        default=None,
-        help="Optional output episode JSON path (defaults to in-place update)",
-    )
-
-    compact_recording_parser = subparsers.add_parser(
-        "compact-mujoco-recording",
-        help="Rewrite a triview episode to views-only assets and optionally delete assets/concat",
-    )
-    compact_recording_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
-    compact_recording_parser.add_argument(
-        "--keep-concat-dir",
-        action="store_true",
-        help="Do not delete assets/concat after rewriting frame paths",
-    )
-    compact_recording_parser.add_argument(
-        "--remove-concat-video",
-        action="store_true",
-        help="Also delete episode_concat.mp4 when present",
-    )
-    compact_recording_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Report what would be compacted without modifying the episode or deleting files",
-    )
-
-    repack_recording_parser = subparsers.add_parser(
-        "repack-mujoco-recording",
-        help="Convert a recorded MuJoCo episode's referenced ppm/pgm assets to png and update episode.json",
-    )
-    repack_recording_parser.add_argument("episode", type=Path, help="Path to the episode JSON file")
-    repack_recording_parser.add_argument(
-        "--keep-originals",
-        action="store_true",
-        help="Keep the original ppm/pgm files after writing the png copies",
-    )
-    repack_recording_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Report what would be converted without modifying the episode or writing pngs",
-    )
-
-    record_parser = subparsers.add_parser(
-        "record-mujoco",
-        help="Record a sim RGB-D episode from a MuJoCo articulated object",
-    )
-    record_parser.add_argument("model", type=Path, help="Path to MJCF XML or URDF model")
-    record_parser.add_argument(
-        "--category",
-        type=normalize_category,
-        choices=list(SUPPORTED_CATEGORIES),
-        required=True,
-    )
-    record_parser.add_argument("--object-id", required=True, help="Object instance id")
-    record_parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("outputs") / "recordings",
-        help="Directory for recorded episode outputs",
-    )
-    record_parser.add_argument("--frames", type=int, default=48, help="Number of frames to record")
-    record_parser.add_argument("--sim-dt", type=float, default=1.0 / 240.0, help="MuJoCo sim timestep")
-    record_parser.add_argument(
-        "--frame-dt",
-        type=float,
-        default=0.1,
-        help="Wall-clock interval represented by consecutive frames",
-    )
-    record_parser.add_argument(
-        "--duration-s",
-        type=float,
-        default=None,
-        help="Total recording duration in seconds (overrides --frames when combined with --fps)",
-    )
-    record_parser.add_argument(
-        "--fps",
-        type=float,
-        default=None,
-        help="Recorded frame rate in Hz (used with --duration-s; sets frame_dt=1/fps)",
-    )
-    record_parser.add_argument("--width", type=int, default=640, help="RGB-D frame width")
-    record_parser.add_argument("--height", type=int, default=480, help="RGB-D frame height")
-    record_parser.add_argument(
-        "--rgb-format",
-        choices=["ppm", "png"],
-        default="ppm",
-        help="RGB output format",
-    )
-    record_parser.add_argument(
-        "--depth-format",
-        choices=["pgm", "png"],
-        default="pgm",
-        help="Depth output format (pgm is 16-bit PGM; png is 16-bit PNG)",
-    )
-    record_parser.add_argument(
-        "--write-concat-assets",
-        action="store_true",
-        help=(
-            "In triview mode, also write duplicated horizontally concatenated RGB/depth/mask assets "
-            "under assets/concat. Disabled by default to reduce disk usage."
-        ),
-    )
-    record_parser.add_argument(
-        "--camera-distance",
-        type=float,
-        default=1,
-        help="Orbit camera distance from lookat",
-    )
-    record_parser.add_argument(
-        "--camera-elevation-deg",
-        type=float,
-        default=-28.0,
-        help="Orbit camera elevation in degrees",
-    )
-    record_parser.add_argument(
-        "--camera-azimuth-start-deg",
-        type=float,
-        default=50.0,
-        help="Orbit camera start azimuth in degrees",
-    )
-    record_parser.add_argument(
-        "--camera-azimuth-span-deg",
-        type=float,
-        default=90.0,
-        help="Orbit camera azimuth sweep span in degrees",
-    )
-    record_parser.add_argument(
-        "--camera-fovy-deg",
-        type=float,
-        default=90.0,
-        help="Vertical field of view in degrees",
-    )
-    record_parser.add_argument(
-        "--camera-mode",
-        choices=["orbit", "triview"],
-        default="orbit",
-        help="Camera mode: orbit sweep or fixed tri-view capture",
-    )
-    record_parser.add_argument(
-        "--camera-triview-spacing-deg",
-        type=float,
-        default=45.0,
-        help="Azimuth spacing (deg) between neighboring views in triview mode",
-    )
-    record_parser.add_argument(
-        "--lookat",
-        type=float,
-        nargs=3,
-        metavar=("X", "Y", "Z"),
-        default=(0.0, 0.0, 0.3),
-        help="Orbit camera lookat center in world frame",
-    )
-    record_parser.add_argument(
-        "--perturbation-scale",
-        type=float,
-        default=1,
-        help="Random perturbation force magnitude",
-    )
-
-    record_parser.add_argument(
-        "--control-mode",
-        choices=["track", "free"],
-        default="track",
-        help="Control mode: 'track' uses PD tracking; 'free' only applies initial conditions then runs with no external force",
-    )
-    record_parser.add_argument(
-        "--random-initial-qpos",
-        action="store_true",
-        help="In free mode, initialize each controlled hinge/slide joint position randomly within its limits",
-    )
-    record_parser.add_argument(
-        "--auto-initial-qvel-from-limits",
-        action="store_true",
-        help=(
-            "In free mode, infer each controlled joint's initial qvel direction/magnitude from its limits and initial qpos"
-        ),
-    )
-    record_parser.add_argument(
-        "--auto-initial-qvel-min-abs",
-        type=float,
-        default=1.0,
-        help="Minimum absolute initial qvel used by --auto-initial-qvel-from-limits when --initial-qvel is 0",
-    )
-    record_parser.add_argument(
-        "--auto-initial-qvel-max-abs",
-        type=float,
-        default=8.0,
-        help="Maximum absolute initial qvel allowed in --auto-initial-qvel-from-limits",
-    )
-    record_parser.add_argument(
-        "--auto-initial-qvel-direction-mode",
-        choices=["away-from-qpos0", "toward-lower", "toward-upper"],
-        default="away-from-qpos0",
-        help="Direction mode for --auto-initial-qvel-from-limits",
-    )
-    record_parser.add_argument(
-        "--initial-qvel",
-        type=float,
-        default=0.0,
-        help="Initial joint velocity for the selected hinge/slide DOF",
-    )
-    record_parser.add_argument(
-        "--kick-force",
-        type=float,
-        default=0.0,
-        help="External force/torque applied along the selected DOF during the kick window",
-    )
-    record_parser.add_argument(
-        "--kick-start-s",
-        type=float,
-        default=0.0,
-        help="Kick window start time in seconds (simulation time)",
-    )
-    record_parser.add_argument(
-        "--kick-duration-s",
-        type=float,
-        default=0.0,
-        help="Kick window duration in seconds (0 disables kick)",
-    )
-    record_parser.add_argument("--control-kp", type=float, default=30.0, help="Joint tracking P gain")
-    record_parser.add_argument("--control-kd", type=float, default=3.0, help="Joint tracking D gain")
-    record_parser.add_argument("--seed", type=int, default=0, help="Random seed")
-
-    record_parser.add_argument(
-        "--joint-name",
-        type=str,
-        default=None,
-        help="Name of the hinge/slide joint to drive/record (defaults to first hinge/slide)",
-    )
-    record_parser.add_argument(
-        "--joint-id",
-        type=int,
-        default=None,
-        help="MuJoCo joint id of the hinge/slide joint to drive/record (defaults to first hinge/slide)",
-    )
-    record_parser.add_argument(
-        "--all-joints",
-        action="store_true",
-        help="Apply initial velocity/forces to all hinge+slide joints (requires --control-mode free)",
-    )
-
-    record_parser.add_argument(
-        "--video",
-        action="store_true",
-        help="Also write an mp4 RGB video into the recorded episode directory",
-    )
-    record_parser.add_argument(
-        "--video-fps",
-        type=float,
-        default=None,
-        help="Video frame rate override (defaults to 1/frame_dt)",
-    )
-    record_parser.add_argument(
-        "--segmentation-masks",
-        action="store_true",
-        help="Also render binary target-object masks for each frame/view",
-    )
-    record_parser.add_argument(
-        "--part-segmentation-masks",
-        action="store_true",
-        help="Also render indexed per-part masks using MuJoCo body/geom priors",
-    )
-    record_parser.add_argument(
-        "--mask-format",
-        choices=["pgm", "png"],
-        default="pgm",
-        help="Mask output format when --segmentation-masks is enabled",
-    )
-    record_parser.add_argument(
-        "--disable-target-mesh-collision",
-        action="store_true",
-        help="Disable collision on the target object's mesh geoms while keeping them rendered",
-    )
-    record_parser.add_argument(
-        "--hide-clear-meshes",
-        action="store_true",
-        help="Hide target-object mesh geoms whose names contain 'Clear' from RGB/depth/mask rendering",
-    )
-
-    return parser
+from .pipeline import RGBDToURDFPipeline
+from .cli_parser import build_parser
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -868,7 +54,11 @@ def main(argv: list[str] | None = None) -> int:
 
         print(
             json.dumps(
-                probe_mjx(run_rollout_test=not bool(args.no_rollout_test)),
+                probe_mjx(
+                    run_rollout_test=not bool(args.no_rollout_test),
+                    jax_platform=str(args.jax_platform),
+                    enable_pjrt_compatibility=args.enable_pjrt_compatibility,
+                ),
                 indent=2,
             )
         )
@@ -912,11 +102,191 @@ def main(argv: list[str] | None = None) -> int:
                 fuse_pixel_stride=max(1, int(args.fuse_pixel_stride)),
                 fuse_voxel_size_m=float(args.fuse_voxel_size_m),
                 min_tracks_per_part=max(3, int(args.min_tracks_per_part)),
+                joint_rotation_threshold_rad=args.joint_rotation_threshold_rad,
+                joint_translation_threshold_m=args.joint_translation_threshold_m,
                 mujoco_prior_mode=str(args.mujoco_prior),
                 generate_viewer=not bool(args.no_generate_viewer),
+                dynamics_backend=str(args.dynamics_backend),
+                dynamics_config=args.dynamics_config,
+                dynamics_jobs=args.dynamics_jobs,
+                dynamics_jax_platform=args.dynamics_jax_platform,
+                dynamics_enable_pjrt_compatibility=args.dynamics_enable_pjrt_compatibility,
+                dynamics_render_gl_backend=args.dynamics_render_gl_backend,
+                plot_dynamics=bool(args.plot_dynamics),
             )
         ).run()
         print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "convert-usd-mjcf-batch":
+        from .batch.articulation_pipeline import UsdMjcfBatchConfig, UsdMjcfBatchConverter
+
+        if args.jobs < 1:
+            parser.error("--jobs must be a positive integer")
+        result = UsdMjcfBatchConverter(
+            UsdMjcfBatchConfig(
+                manifest_path=args.manifest,
+                output_dir=args.output_dir,
+                converted_manifest=args.converted_manifest,
+                jobs=int(args.jobs),
+                force=bool(args.force),
+            )
+        ).run()
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "segment-episode-masks":
+        from .perception.episode_masks import EpisodeMaskWriteConfig, EpisodeMaskWriter
+
+        if args.frame_stride < 1:
+            parser.error("--frame-stride must be a positive integer")
+        if args.start_frame < 0:
+            parser.error("--start-frame must be >= 0")
+        if args.max_frames is not None and args.max_frames < 1:
+            parser.error("--max-frames must be a positive integer when provided")
+        episode_path = EpisodeMaskWriter().write(
+            EpisodeMaskWriteConfig(
+                episode_path=args.episode,
+                output_episode_path=args.output_episode,
+                output_dir=args.output_dir,
+                provider=str(args.provider),
+                mask_dir=args.mask_dir,
+                command=args.provider_command,
+                sam2_root=args.sam2_root,
+                sam2_config=str(args.sam2_config),
+                sam2_checkpoint=args.sam2_checkpoint,
+                sam2_device=str(args.sam2_device),
+                sam2_prompt_mode=str(args.sam2_prompt_mode),
+                sam2_box_xyxy=args.sam2_box_xyxy,
+                sam2_center_box_scale=float(args.sam2_center_box_scale),
+                sam2_multimask=not bool(args.sam2_single_mask),
+                sam2_mask_selection=str(args.sam2_mask_selection),
+                sam2_mask_index=args.sam2_mask_index,
+                sam3_checkpoint=args.sam3_checkpoint,
+                sam3_device=str(args.sam3_device),
+                sam3_prompt_mode=str(args.sam3_prompt_mode),
+                sam3_box_xyxy=args.sam3_box_xyxy,
+                sam3_center_box_scale=float(args.sam3_center_box_scale),
+                sam3_mask_selection=str(args.sam3_mask_selection),
+                sam3_mask_index=args.sam3_mask_index,
+                sam3_conf=float(args.sam3_conf),
+                mask_kind=str(args.mask_kind),
+                frame_stride=int(args.frame_stride),
+                start_frame=int(args.start_frame),
+                max_frames=args.max_frames,
+                view_indices=args.view_indices,
+                threshold=int(args.threshold),
+                force=bool(args.force),
+            )
+        )
+        print(json.dumps({"episode_path": str(episode_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "segment-episode-masks-batch":
+        from .perception.episode_masks import EpisodeMaskBatchConfig, EpisodeMaskBatchWriter
+
+        if args.jobs < 1:
+            parser.error("--jobs must be a positive integer")
+        if args.frame_stride < 1:
+            parser.error("--frame-stride must be a positive integer")
+        if args.start_frame < 0:
+            parser.error("--start-frame must be >= 0")
+        if args.max_frames is not None and args.max_frames < 1:
+            parser.error("--max-frames must be a positive integer when provided")
+        result = EpisodeMaskBatchWriter(
+            EpisodeMaskBatchConfig(
+                manifest_path=args.manifest,
+                jobs=int(args.jobs),
+                provider=str(args.provider),
+                output_root=args.output_root,
+                sam2_root=args.sam2_root,
+                sam2_config=str(args.sam2_config),
+                sam2_checkpoint=args.sam2_checkpoint,
+                sam2_device=str(args.sam2_device),
+                sam2_prompt_mode=str(args.sam2_prompt_mode),
+                sam2_box_xyxy=args.sam2_box_xyxy,
+                sam2_center_box_scale=float(args.sam2_center_box_scale),
+                sam2_multimask=not bool(args.sam2_single_mask),
+                sam2_mask_selection=str(args.sam2_mask_selection),
+                sam2_mask_index=args.sam2_mask_index,
+                sam3_checkpoint=args.sam3_checkpoint,
+                sam3_device=str(args.sam3_device),
+                sam3_prompt_mode=str(args.sam3_prompt_mode),
+                sam3_box_xyxy=args.sam3_box_xyxy,
+                sam3_center_box_scale=float(args.sam3_center_box_scale),
+                sam3_mask_selection=str(args.sam3_mask_selection),
+                sam3_mask_index=args.sam3_mask_index,
+                sam3_conf=float(args.sam3_conf),
+                mask_kind=str(args.mask_kind),
+                frame_stride=int(args.frame_stride),
+                start_frame=int(args.start_frame),
+                max_frames=args.max_frames,
+                view_indices=args.view_indices,
+                threshold=int(args.threshold),
+                force=bool(args.force),
+            )
+        ).run()
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "propagate-episode-masks":
+        from .perception.episode_masks import EpisodeMaskPropagationConfig, EpisodeMaskPropagator
+
+        if args.reference_frame < 0:
+            parser.error("--reference-frame must be >= 0")
+        if args.frame_stride < 1:
+            parser.error("--frame-stride must be a positive integer")
+        if args.seed_stride_px < 1:
+            parser.error("--seed-stride-px must be a positive integer")
+        if args.max_tracks_per_view < 1:
+            parser.error("--max-tracks-per-view must be a positive integer")
+        if args.mask_radius_px < 1:
+            parser.error("--mask-radius-px must be a positive integer")
+        episode_path = EpisodeMaskPropagator().propagate(
+            EpisodeMaskPropagationConfig(
+                episode_path=args.episode,
+                output_episode_path=args.output_episode,
+                output_dir=args.output_dir,
+                backend=str(args.backend),
+                mask_kind=str(args.mask_kind),
+                sam2_root=args.sam2_root,
+                sam2_config=str(args.sam2_config),
+                sam2_checkpoint=args.sam2_checkpoint,
+                sam2_device=str(args.sam2_device),
+                sam2_part_mode=str(args.sam2_part_mode),
+                sam2_offload_video_to_cpu=bool(args.sam2_offload_video_to_cpu),
+                sam2_offload_state_to_cpu=bool(args.sam2_offload_state_to_cpu),
+                reference_frame=int(args.reference_frame),
+                frame_stride=int(args.frame_stride),
+                view_indices=args.view_indices,
+                device=str(args.device),
+                cotracker_repo=args.cotracker_repo,
+                cotracker_checkpoint=args.cotracker_checkpoint,
+                cotracker_model=str(args.cotracker_model),
+                seed_stride_px=int(args.seed_stride_px),
+                max_tracks_per_view=int(args.max_tracks_per_view),
+                visibility_threshold=float(args.visibility_threshold),
+                mask_radius_px=int(args.mask_radius_px),
+                threshold=int(args.threshold),
+                force=bool(args.force),
+            )
+        )
+        print(json.dumps({"episode_path": str(episode_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "evaluate-episode-masks":
+        from .perception.episode_masks import EpisodeMaskEvaluationConfig, EpisodeMaskEvaluator
+
+        output_json = EpisodeMaskEvaluator().evaluate(
+            EpisodeMaskEvaluationConfig(
+                predicted_episode_path=args.predicted_episode,
+                reference_episode_path=args.reference_episode,
+                output_json=args.output_json,
+                mask_kind=str(args.mask_kind),
+                threshold=int(args.threshold),
+            )
+        )
+        print(json.dumps({"mask_evaluation": str(output_json.resolve())}, indent=2))
         return 0
 
     if args.command == "fuse-pointcloud":
@@ -1020,6 +390,12 @@ def main(argv: list[str] | None = None) -> int:
                 output_json=args.output_json,
                 rotation_threshold_rad=float(args.rotation_threshold_rad),
                 translation_threshold_m=float(args.translation_threshold_m),
+                use_track_translation_axis=not bool(args.no_track_translation_axis),
+                use_track_residual_type=not bool(args.no_track_residual_type),
+                track_residual_requires_pose_candidate=bool(args.track_residual_requires_pose_candidate),
+                track_residual_decision_ratio=float(args.track_residual_decision_ratio),
+                min_track_residual_samples=max(1, int(args.min_track_residual_samples)),
+                min_track_residual_tracks=max(1, int(args.min_track_residual_tracks)),
                 mujoco_prior=args.mujoco_prior,
             )
         ).infer()
@@ -1046,6 +422,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "identify-dynamics":
+        if args.render_gl_backend not in {"auto", "none"}:
+            import os
+
+            os.environ["MUJOCO_GL"] = str(args.render_gl_backend)
         from .dynamics.system_id import DynamicsIdentificationConfig, DynamicsIdentifier
 
         artifact_path = DynamicsIdentifier().run(
@@ -1063,13 +443,321 @@ def main(argv: list[str] | None = None) -> int:
                 optimize_mass=not bool(args.no_optimize_mass),
                 optimize_damping=not bool(args.no_optimize_damping),
                 optimize_friction=not bool(args.no_optimize_friction),
+                enable_contact=bool(args.enable_contact),
+                render_gl_backend=str(args.render_gl_backend),
+                gravity_mode=str(args.gravity_mode),
             )
         )
         print(json.dumps({"dynamics_identification_artifact": str(artifact_path.resolve())}, indent=2))
         return 0
 
+    if args.command == "identify-dynamics-mjx":
+        if args.render_gl_backend not in {"auto", "none"}:
+            import os
+
+            os.environ["MUJOCO_GL"] = str(args.render_gl_backend)
+        from .core.jax_runtime import configure_jax_runtime
+        from .dynamics.system_id_mjx import MJXDynamicsIdentificationConfig, MJXDynamicsIdentifier
+
+        configure_jax_runtime(
+            platform=str(args.jax_platform),
+            enable_pjrt_compatibility=args.enable_pjrt_compatibility,
+        )
+        artifact_path = MJXDynamicsIdentifier().run(
+            MJXDynamicsIdentificationConfig(
+                episode_path=args.episode,
+                articulation_artifact_path=args.articulation_artifact,
+                mjcf_path=args.mjcf,
+                output_dir=args.output_dir,
+                max_iterations=max(1, int(args.max_iterations)),
+                learning_rate=float(args.learning_rate),
+                q_weight=float(args.q_weight),
+                qdot_weight=float(args.qdot_weight),
+                prior_weight=float(args.prior_weight),
+                optimize_static_parts=bool(args.optimize_static_parts),
+                optimize_mass=not bool(args.no_optimize_mass),
+                optimize_damping=not bool(args.no_optimize_damping),
+                optimize_friction=not bool(args.no_optimize_friction),
+                enable_contact=bool(args.enable_contact),
+                jit=not bool(args.no_jit),
+                jax_platform=str(args.jax_platform),
+                enable_pjrt_compatibility=args.enable_pjrt_compatibility,
+                render_gl_backend=str(args.render_gl_backend),
+            )
+        )
+        print(json.dumps({"dynamics_identification_artifact": str(artifact_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "plot-dynamics-identification":
+        from .dynamics.plotting import DynamicsOptimizationPlotConfig, DynamicsOptimizationPlotter
+
+        output_svg = DynamicsOptimizationPlotter().plot(
+            DynamicsOptimizationPlotConfig(
+                input_path=args.input,
+                output_svg=args.output_svg,
+                log_loss=not bool(args.linear_loss),
+                width=max(720, int(args.width)),
+                height=max(480, int(args.height)),
+            )
+        )
+        print(json.dumps({"optimization_history_svg": str(output_svg.resolve())}, indent=2))
+        return 0
+
+    if args.command == "plan-manipulation":
+        from .manipulation.mujoco_push_planner import MuJoCoPushPlanConfig, MuJoCoPushPlanner
+
+        artifact_path = MuJoCoPushPlanner().run(
+            MuJoCoPushPlanConfig(
+                mjcf_path=args.mjcf,
+                target_q=float(args.target_q),
+                output_dir=args.output_dir,
+                dynamics_identification_path=args.dynamics_identification,
+                joint_name=args.joint_name,
+                joint_id=args.joint_id,
+                mode=str(args.mode),
+                initial_q=args.initial_q,
+                duration_s=float(args.duration_s),
+                sim_dt=args.sim_dt,
+                num_candidates=max(3, int(args.num_candidates)),
+                max_initial_qvel=float(args.max_initial_qvel),
+                max_pulse_force=float(args.max_pulse_force),
+                pulse_duration_s=float(args.pulse_duration_s),
+                tolerance=float(args.tolerance),
+                enable_contact=bool(args.enable_contact),
+                gravity_mode=str(args.gravity_mode),
+            )
+        )
+        print(json.dumps({"manipulation_plan": str(artifact_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "generate-il-demos":
+        from .manipulation.il_dataset import BallisticILDatasetConfig, BallisticILDatasetGenerator
+
+        dataset_path = BallisticILDatasetGenerator().generate(
+            BallisticILDatasetConfig(
+                mjcf_path=args.mjcf,
+                output_dir=args.output_dir,
+                task=args.task,
+                num_episodes=max(1, int(args.num_episodes)),
+                release_duration_s=float(args.release_duration_s),
+                condition_source=args.condition_source,
+                joint_name=args.joint_name,
+                joint_id=args.joint_id,
+                sim_dt=args.sim_dt,
+                max_initial_qvel=float(args.max_initial_qvel),
+                num_teacher_candidates=max(3, int(args.num_teacher_candidates)),
+                response_samples=max(2, int(args.response_samples)),
+                tolerance=float(args.tolerance),
+                qdot_tolerance=float(args.qdot_tolerance),
+                seed=int(args.seed),
+                enable_contact=bool(args.enable_contact),
+                gravity_mode=str(args.gravity_mode),
+            )
+        )
+        print(json.dumps({"il_dataset": str(dataset_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "train-il-policy":
+        from .manipulation.il_train import BallisticILTrainConfig, BallisticILTrainer
+
+        policy_path = BallisticILTrainer().train(
+            BallisticILTrainConfig(
+                dataset_path=args.dataset,
+                output_dir=args.output_dir,
+                condition_mode=args.condition_mode,
+                epochs=max(1, int(args.epochs)),
+                batch_size=max(1, int(args.batch_size)),
+                learning_rate=float(args.learning_rate),
+                hidden_dim=max(1, int(args.hidden_dim)),
+                hidden_layers=max(1, int(args.hidden_layers)),
+                val_fraction=float(args.val_fraction),
+                seed=int(args.seed),
+                noisy_condition_std=float(args.noisy_condition_std),
+            )
+        )
+        print(json.dumps({"il_policy": str(policy_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "eval-il-policy":
+        from .manipulation.il_eval import BallisticILEvalConfig, BallisticILEvaluator
+
+        eval_path = BallisticILEvaluator().evaluate(
+            BallisticILEvalConfig(
+                policy_path=args.policy,
+                mjcf_path=args.mjcf,
+                output_dir=args.output_dir,
+                num_episodes=max(1, int(args.num_episodes)),
+                release_duration_s=float(args.release_duration_s),
+                joint_name=args.joint_name,
+                joint_id=args.joint_id,
+                sim_dt=args.sim_dt,
+                response_samples=max(2, int(args.response_samples)),
+                tolerance=float(args.tolerance),
+                qdot_tolerance=float(args.qdot_tolerance),
+                seed=int(args.seed),
+                max_abs_initial_qvel=float(args.max_abs_initial_qvel),
+                enable_contact=bool(args.enable_contact),
+                gravity_mode=str(args.gravity_mode),
+            )
+        )
+        print(json.dumps({"il_eval": str(eval_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "prepare-arx-x5-model":
+        from .manipulation.arx_x5 import ARXX5ModelPreparer, ARXX5PrepareConfig
+
+        manifest_path = ARXX5ModelPreparer().prepare(
+            ARXX5PrepareConfig(
+                output_dir=args.output_dir,
+                source_dir=args.source_dir,
+                repo_url=str(args.repo_url),
+                validate_mujoco=not bool(args.no_validate_mujoco),
+            )
+        )
+        print(json.dumps({"arx_x5_model_manifest": str(manifest_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "generate-contact-il-demos":
+        from .manipulation.contact_il import ContactILDatasetConfig, ContactILDatasetGenerator
+
+        dataset_path = ContactILDatasetGenerator().generate(
+            ContactILDatasetConfig(
+                mjcf_path=args.mjcf,
+                output_dir=args.output_dir,
+                robot_model_path=args.robot_model,
+                robot_end_effector_body=str(args.robot_end_effector_body),
+                task=args.task,
+                num_episodes=max(1, int(args.num_episodes)),
+                release_duration_s=float(args.release_duration_s),
+                contact_duration_s=float(args.contact_duration_s),
+                condition_source=args.condition_source,
+                joint_name=args.joint_name,
+                joint_id=args.joint_id,
+                sim_dt=args.sim_dt,
+                max_force=float(args.max_force),
+                num_teacher_candidates=max(3, int(args.num_teacher_candidates)),
+                response_samples=max(2, int(args.response_samples)),
+                tolerance=float(args.tolerance),
+                qdot_tolerance=float(args.qdot_tolerance),
+                seed=int(args.seed),
+                enable_contact=bool(args.enable_contact),
+                gravity_mode=str(args.gravity_mode),
+            )
+        )
+        print(json.dumps({"contact_il_dataset": str(dataset_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "eval-contact-il-policy":
+        from .manipulation.contact_il import ContactILEvalConfig, ContactILEvaluator
+
+        eval_path = ContactILEvaluator().evaluate(
+            ContactILEvalConfig(
+                policy_path=args.policy,
+                mjcf_path=args.mjcf,
+                output_dir=args.output_dir,
+                num_episodes=max(1, int(args.num_episodes)),
+                release_duration_s=float(args.release_duration_s),
+                joint_name=args.joint_name,
+                joint_id=args.joint_id,
+                sim_dt=args.sim_dt,
+                response_samples=max(2, int(args.response_samples)),
+                tolerance=float(args.tolerance),
+                qdot_tolerance=float(args.qdot_tolerance),
+                seed=int(args.seed),
+                max_force=float(args.max_force),
+                max_contact_duration_s=float(args.max_contact_duration_s),
+                enable_contact=bool(args.enable_contact),
+                gravity_mode=str(args.gravity_mode),
+            )
+        )
+        print(json.dumps({"contact_il_eval": str(eval_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "visualize-il-dataset":
+        from .manipulation.il_viz import ILDatasetVisualizationConfig, ILDatasetVisualizer
+
+        svg_path = ILDatasetVisualizer().visualize(
+            ILDatasetVisualizationConfig(
+                dataset_path=args.dataset,
+                output_svg=args.output_svg,
+                max_trajectories=max(1, int(args.max_trajectories)),
+                title=args.title,
+            )
+        )
+        print(json.dumps({"il_dataset_svg": str(svg_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "render-il-rollout":
+        from .manipulation.il_animation import ILRolloutRenderConfig, ILRolloutRenderer
+
+        render_path = ILRolloutRenderer().render(
+            ILRolloutRenderConfig(
+                dataset_path=args.dataset,
+                mjcf_path=args.mjcf,
+                output_path=args.output_path,
+                robot_model_path=args.robot_model,
+                dynamics_artifact_path=args.dynamics_artifact,
+                episode_index=int(args.episode_index),
+                trajectory_source=str(args.trajectory_source),
+                joint_name=args.joint_name,
+                joint_id=args.joint_id,
+                sim_dt=args.sim_dt,
+                width=max(64, int(args.width)),
+                height=max(64, int(args.height)),
+                fps=max(1, int(args.fps)),
+                camera_name=args.camera_name,
+                camera_azimuth=float(args.camera_azimuth),
+                camera_elevation=float(args.camera_elevation),
+                camera_distance=args.camera_distance,
+                object_visual_scale=float(args.object_visual_scale),
+                playback_slowdown=float(args.playback_slowdown),
+                robot_base_pos=tuple(float(value) for value in args.robot_base_pos),
+                robot_base_euler=tuple(float(value) for value in args.robot_base_euler),
+                robot_motion=str(args.robot_motion),
+                robot_ee_body=str(args.robot_ee_body),
+                robot_approach_distance=float(args.robot_approach_distance),
+                robot_pulse_distance=float(args.robot_pulse_distance),
+                dynamics_body_name=args.dynamics_body_name,
+                dynamics_joint_name=args.dynamics_joint_name,
+                enable_contact=bool(args.enable_contact),
+                avoid_robot_self_collision=not bool(args.allow_robot_self_collision),
+                self_collision_penetration_tolerance_m=float(args.self_collision_penetration_tolerance_m),
+                avoid_robot_object_collision=not bool(args.allow_robot_object_collision),
+                object_collision_penetration_tolerance_m=float(args.object_collision_penetration_tolerance_m),
+                gravity_mode=str(args.gravity_mode),
+                write_frames=bool(args.write_frames),
+            )
+        )
+        print(json.dumps({"il_rollout_animation": str(render_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "prepare-generation-images":
+        from .perception.generation_preprocess import GenerationImagePreparationConfig, GenerationImagePreparer
+
+        manifest_path = GenerationImagePreparer().prepare(
+            GenerationImagePreparationConfig(
+                episode_path=args.episode,
+                output_dir=args.output_dir,
+                frame_index=int(args.frame_index),
+                view_indices=args.view_indices,
+                image_views=args.image_views,
+                mask_source=str(args.mask_source),
+                background=str(args.background),
+                padding_ratio=float(args.padding_ratio),
+                min_mask_pixels=max(1, int(args.min_mask_pixels)),
+            )
+        )
+        print(json.dumps({"generation_image_manifest": str(manifest_path.resolve())}, indent=2))
+        return 0
+
     if args.command == "hunyuan3d-generate":
         from .perception.hunyuan3d_client import Hunyuan3DClient, Hunyuan3DGenerationConfig
+        from .perception.generation_preprocess import load_generation_image_manifest
+
+        image_path = args.image
+        image_views = args.image_views
+        if args.image_manifest is not None:
+            image_path, image_views = load_generation_image_manifest(args.image_manifest)
 
         output_path = Hunyuan3DClient(
             server_url=args.server_url,
@@ -1079,8 +767,8 @@ def main(argv: list[str] | None = None) -> int:
             Hunyuan3DGenerationConfig(
                 server_url=args.server_url,
                 output_path=args.output,
-                image_path=args.image,
-                image_views=args.image_views,
+                image_path=image_path,
+                image_views=image_views,
                 text=args.text,
                 mesh_path=args.mesh,
                 mode=args.mode,
@@ -1094,9 +782,207 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_s=float(args.timeout_s),
                 poll_interval_s=float(args.poll_interval_s),
                 api_token=args.api_token,
+                download_result=not bool(args.remote_skip_download),
             )
         )
         print(json.dumps({"generated_model_path": str(output_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "particulate-infer":
+        from .perception.particulate_adapter import ParticulateInferenceConfig, ParticulateInferenceRunner
+
+        manifest_path = ParticulateInferenceRunner().run(
+            ParticulateInferenceConfig(
+                mesh_path=args.mesh,
+                reconstruction_artifact_path=args.reconstruction_artifact,
+                output_dir=args.output_dir,
+                particulate_root=args.particulate_root,
+                python_bin=args.python_bin,
+                model_config=args.model_config,
+                ckpt_path=args.ckpt_path,
+                up_dir=args.up_dir,
+                num_points=max(1, int(args.num_points)),
+                num_points_global=max(1, int(args.num_points_global)),
+                target_faces=args.target_faces,
+                min_part_confidence=float(args.min_part_confidence),
+                strict=not bool(args.no_strict),
+                animation_frames=max(2, int(args.animation_frames)),
+                export_urdf=not bool(args.no_export_urdf),
+                export_mjcf=not bool(args.no_export_mjcf),
+                eval=not bool(args.no_eval),
+                dry_run=bool(args.dry_run),
+            )
+        )
+        print(json.dumps({"particulate_result": str(manifest_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "remote-articulate-generate":
+        from .perception.generation_preprocess import (
+            GenerationImagePreparationConfig,
+            GenerationImagePreparer,
+            load_generation_image_manifest,
+        )
+        from .perception.remote_articulation_client import RemoteArticulationClient, RemoteArticulationConfig
+
+        prepare_started = time.perf_counter()
+        prepare_timing_s: float | None = None
+        image_path = args.image
+        image_views = args.image_views
+        generation_image_manifest = args.image_manifest
+        if args.episode is not None:
+            generation_image_manifest = GenerationImagePreparer().prepare(
+                GenerationImagePreparationConfig(
+                    episode_path=args.episode,
+                    output_dir=args.generation_image_output_dir,
+                    frame_index=int(args.frame_index),
+                    view_indices=args.view_indices,
+                    image_views=args.image_views,
+                    mask_source=args.mask_source,
+                    background=args.background,
+                    padding_ratio=float(args.padding_ratio),
+                    min_mask_pixels=max(1, int(args.min_mask_pixels)),
+                )
+            )
+            prepare_timing_s = time.perf_counter() - prepare_started
+        if generation_image_manifest is not None:
+            image_path, image_views = load_generation_image_manifest(generation_image_manifest)
+
+        output_dir = RemoteArticulationClient(
+            server_url=args.server_url,
+            api_token=args.api_token,
+            timeout_s=min(float(args.timeout_s), 120.0),
+        ).generate(
+            RemoteArticulationConfig(
+                server_url=args.server_url,
+                output_dir=args.output_dir,
+                image_path=image_path,
+                image_views=image_views,
+                text=args.text,
+                texture=bool(args.texture),
+                seed=int(args.seed),
+                output_type=args.type,
+                octree_resolution=args.octree_resolution,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale,
+                face_count=args.face_count,
+                particulate_up_dir=args.particulate_up_dir,
+                particulate_num_points=max(1, int(args.particulate_num_points)),
+                particulate_global_points=max(1, int(args.particulate_global_points)),
+                particulate_target_faces=args.particulate_target_faces,
+                particulate_min_part_confidence=float(args.particulate_min_part_confidence),
+                particulate_strict=not bool(args.particulate_no_strict),
+                timeout_s=float(args.timeout_s),
+                poll_interval_s=float(args.poll_interval_s),
+                api_token=args.api_token,
+                download_result=not bool(args.remote_skip_download),
+            )
+        )
+        timing_path = output_dir / "remote_articulation_timing.json"
+        if prepare_timing_s is not None and timing_path.exists():
+            timing_payload = json.loads(timing_path.read_text(encoding="utf-8"))
+            client_timings = timing_payload.setdefault("client_timings", {})
+            if isinstance(client_timings, dict):
+                client_timings["prepare_generation_images_s"] = prepare_timing_s
+            timing_path.write_text(json.dumps(timing_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(json.dumps({"remote_articulation_output_dir": str(output_dir.resolve())}, indent=2))
+        return 0
+
+    if args.command == "export-reart-sequence":
+        from .perception.reart_adapter import ReArtSequenceExportConfig, ReArtSequenceExporter
+
+        output_dir = ReArtSequenceExporter().export(
+            ReArtSequenceExportConfig(
+                fusion_manifest_path=args.fusion_manifest,
+                output_dir=args.output_dir,
+                frame_stride=max(1, int(args.frame_stride)),
+                max_frames=args.max_frames,
+                max_points_per_frame=args.max_points_per_frame,
+                foreground_only=not bool(args.include_background),
+                random_seed=int(args.random_seed),
+            )
+        )
+        print(json.dumps({"reart_sequence_dir": str(output_dir.resolve())}, indent=2))
+        return 0
+
+    if args.command == "remote-reart-run":
+        from .perception.reart_adapter import RemoteReArtClient, RemoteReArtConfig
+
+        output_dir = RemoteReArtClient(
+            server_url=args.server_url,
+            api_token=args.api_token,
+            timeout_s=min(float(args.timeout_s), 120.0),
+        ).run(
+            RemoteReArtConfig(
+                server_url=args.server_url,
+                sequence_dir=args.sequence_dir,
+                output_dir=args.output_dir,
+                sequence_name=args.sequence_name,
+                cano_idx=int(args.cano_idx),
+                num_points=max(1, int(args.num_points)),
+                num_parts=max(1, int(args.num_parts)),
+                stage=args.stage,
+                base_n_iter=max(1, int(args.base_n_iter)),
+                kinematic_n_iter=max(1, int(args.kinematic_n_iter)),
+                assign_iter=max(0, int(args.assign_iter)),
+                snapshot_gap=max(1, int(args.snapshot_gap)),
+                use_assign_loss=bool(args.use_assign_loss),
+                use_flow_loss=bool(args.use_flow_loss),
+                use_nproc=bool(args.use_nproc),
+                timeout_s=float(args.timeout_s),
+                poll_interval_s=float(args.poll_interval_s),
+                api_token=args.api_token,
+                download_result=not bool(args.remote_skip_download),
+            )
+        )
+        print(json.dumps({"remote_reart_output_dir": str(output_dir.resolve())}, indent=2))
+        return 0
+
+    if args.command == "compare-articulation-backends":
+        from .perception.particulate_adapter import (
+            ArticulationBackendComparisonConfig,
+            ArticulationBackendComparator,
+        )
+
+        output_path = ArticulationBackendComparator().compare(
+            ArticulationBackendComparisonConfig(
+                tracking_joint_inference_path=args.tracking_joint_inference,
+                particulate_result_path=args.particulate_result,
+                output_json=args.output_json,
+            )
+        )
+        print(json.dumps({"articulation_backend_comparison": str(output_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "evaluate-kinematic-model":
+        from .kinematics.evaluation import KinematicModelEvaluationConfig, KinematicModelEvaluator
+
+        output_path = KinematicModelEvaluator().evaluate(
+            KinematicModelEvaluationConfig(
+                joint_inference_path=args.joint_inference,
+                part_pose_path=args.part_poses,
+                output_json=args.output_json,
+            )
+        )
+        print(json.dumps({"kinematic_evaluation": str(output_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "evaluate-feedforward-articulation":
+        from .kinematics.feedforward_evaluation import (
+            FeedforwardArticulationEvaluationConfig,
+            FeedforwardArticulationEvaluator,
+        )
+
+        output_path = FeedforwardArticulationEvaluator().evaluate(
+            FeedforwardArticulationEvaluationConfig(
+                feedforward_root=args.feedforward_root,
+                reference_evaluation=args.reference_evaluation,
+                output_json=args.output_json,
+                yaw_degrees=tuple(int(value) for value in args.yaw_degrees),
+                angle_score_weight=float(args.angle_score_weight),
+                position_score_weight=float(args.position_score_weight),
+            )
+        )
+        print(json.dumps({"feedforward_articulation_evaluation": str(output_path.resolve())}, indent=2))
         return 0
 
     if args.command == "render-mujoco-masks":
@@ -1112,6 +998,75 @@ def main(argv: list[str] | None = None) -> int:
             )
         ).render()
         print(json.dumps({"episode_path": str(episode_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "import-rbo-recording":
+        from .perception.rbo_adapter import RBORecordingImportConfig, RBORecordingImporter
+
+        if args.frame_stride < 1:
+            parser.error("--frame-stride must be a positive integer")
+        if args.start_frame < 0:
+            parser.error("--start-frame must be >= 0")
+        if args.max_frames is not None and args.max_frames < 1:
+            parser.error("--max-frames must be a positive integer when provided")
+        if args.target_fps is not None and args.target_fps <= 0.0:
+            parser.error("--target-fps must be positive when provided")
+        if args.max_sync_delta_s < 0:
+            parser.error("--max-sync-delta-s must be >= 0")
+        episode_path = RBORecordingImporter().import_recording(
+            RBORecordingImportConfig(
+                input_dir=args.input_dir,
+                output_dir=args.output_dir,
+                object_id=args.object_id,
+                category=args.category,
+                frame_stride=int(args.frame_stride),
+                start_frame=int(args.start_frame),
+                max_frames=args.max_frames,
+                target_fps=args.target_fps,
+                max_sync_delta_s=float(args.max_sync_delta_s),
+                mask_mode=str(args.mask_mode),
+                mask_depth_percentile=float(args.mask_depth_percentile),
+                mask_depth_margin_m=float(args.mask_depth_margin_m),
+                min_depth_m=float(args.min_depth_m),
+                max_depth_m=float(args.max_depth_m),
+                force=bool(args.force),
+            )
+        )
+        print(json.dumps({"episode_path": str(episode_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "import-rbo-recordings-batch":
+        from .perception.rbo_adapter import RBORecordingBatchConfig, RBORecordingBatchImporter
+
+        if args.jobs < 1:
+            parser.error("--jobs must be a positive integer")
+        if args.frame_stride < 1:
+            parser.error("--frame-stride must be a positive integer")
+        if args.start_frame < 0:
+            parser.error("--start-frame must be >= 0")
+        if args.max_frames is not None and args.max_frames < 1:
+            parser.error("--max-frames must be a positive integer when provided")
+        if args.target_fps is not None and args.target_fps <= 0.0:
+            parser.error("--target-fps must be positive when provided")
+        result = RBORecordingBatchImporter(
+            RBORecordingBatchConfig(
+                manifest_path=args.manifest,
+                output_root=args.output_root,
+                jobs=int(args.jobs),
+                frame_stride=int(args.frame_stride),
+                start_frame=int(args.start_frame),
+                max_frames=args.max_frames,
+                target_fps=args.target_fps,
+                max_sync_delta_s=float(args.max_sync_delta_s),
+                mask_mode=str(args.mask_mode),
+                mask_depth_percentile=float(args.mask_depth_percentile),
+                mask_depth_margin_m=float(args.mask_depth_margin_m),
+                min_depth_m=float(args.min_depth_m),
+                max_depth_m=float(args.max_depth_m),
+                force=bool(args.force),
+            )
+        ).run()
+        print(json.dumps(result, indent=2))
         return 0
 
     if args.command == "compact-mujoco-recording":
@@ -1162,6 +1117,27 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--kick-duration-s must be >= 0")
         if args.kick_duration_s == 0.0 and args.kick_force != 0.0:
             parser.error("--kick-force requires --kick-duration-s > 0")
+        if args.excitation_start_s < 0.0:
+            parser.error("--excitation-start-s must be >= 0")
+        if args.excitation_duration_s < 0.0:
+            parser.error("--excitation-duration-s must be >= 0")
+        if args.excitation_mode != "none" and args.excitation_duration_s <= 0.0:
+            parser.error("--excitation-duration-s must be > 0 when --excitation-mode is not none")
+        if args.excitation_period_s <= 0.0:
+            parser.error("--excitation-period-s must be positive")
+        if args.excitation_frequency_hz <= 0.0:
+            parser.error("--excitation-frequency-hz must be positive")
+        if args.staged_initial_qvel:
+            if args.control_mode != "free":
+                parser.error("--staged-initial-qvel requires --control-mode free")
+            if args.joint_name is not None or args.joint_id is not None:
+                parser.error("--staged-initial-qvel cannot be combined with --joint-name/--joint-id")
+            if args.staged_secondary_start_s < 0.0:
+                parser.error("--staged-secondary-start-s must be >= 0")
+            if args.staged_secondary_count_min < 0:
+                parser.error("--staged-secondary-count-min must be >= 0")
+            if args.staged_secondary_count_max < args.staged_secondary_count_min:
+                parser.error("--staged-secondary-count-max must be >= --staged-secondary-count-min")
 
         if args.all_joints and (args.joint_name is not None or args.joint_id is not None):
             parser.error("--all-joints cannot be combined with --joint-name/--joint-id")
@@ -1200,9 +1176,22 @@ def main(argv: list[str] | None = None) -> int:
             auto_initial_qvel_min_abs=float(args.auto_initial_qvel_min_abs),
             auto_initial_qvel_max_abs=float(args.auto_initial_qvel_max_abs),
             initial_joint_qvel=args.initial_qvel,
+            staged_initial_qvel=bool(args.staged_initial_qvel),
+            staged_primary_tokens=tuple(str(token) for token in args.staged_primary_tokens),
+            staged_secondary_tokens=tuple(str(token) for token in args.staged_secondary_tokens),
+            staged_secondary_count_min=int(args.staged_secondary_count_min),
+            staged_secondary_count_max=int(args.staged_secondary_count_max),
+            staged_secondary_start_s=float(args.staged_secondary_start_s),
             kick_force=args.kick_force,
             kick_start_s=args.kick_start_s,
             kick_duration_s=args.kick_duration_s,
+            excitation_mode=args.excitation_mode,
+            excitation_force=float(args.excitation_force),
+            excitation_start_s=float(args.excitation_start_s),
+            excitation_duration_s=float(args.excitation_duration_s),
+            excitation_period_s=float(args.excitation_period_s),
+            excitation_frequency_hz=float(args.excitation_frequency_hz),
+            write_dynamics_log=not bool(args.no_dynamics_log),
             make_video=bool(args.video),
             video_fps=args.video_fps,
             segmentation_masks=bool(args.segmentation_masks),

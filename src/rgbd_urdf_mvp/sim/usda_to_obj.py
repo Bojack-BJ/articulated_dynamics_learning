@@ -338,12 +338,13 @@ def write_obj(mesh: MeshData, out_path: Path) -> None:
     if not mesh.face_vertex_counts or not mesh.face_vertex_indices or not mesh.points:
         raise ValueError(f"Mesh '{mesh.name}' missing topology/points")
 
-    if st_interp == "vertex":
+    has_uvs = bool(mesh.st)
+    if has_uvs and st_interp == "vertex":
         if len(mesh.st) != len(mesh.points):
             raise ValueError(
                 f"Mesh '{mesh.name}': primvars:st vertex interpolation expects {len(mesh.points)} uvs, got {len(mesh.st)}"
             )
-    else:
+    elif has_uvs:
         corner_count = sum(mesh.face_vertex_counts)
         if mesh.st_indices is None:
             if len(mesh.st) != corner_count:

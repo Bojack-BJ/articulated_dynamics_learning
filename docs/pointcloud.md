@@ -94,16 +94,13 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp estimate-part-poses \
   --min-points-per-part 32
 ```
 
-The CoTracker path uses the original RGB-D episode and part masks. Install the
-optional tracking dependencies first:
+The CoTracker path uses the original RGB-D episode and part masks. Install the optional tracking dependencies first:
 
 ```bash
 python -m pip install -e ".[tracking]"
 ```
 
-On Mac, use `--device auto`, `--device mps`, or `--device cpu`. Do not pass
-`--device cuda` unless you are on a CUDA machine. The repository already ships
-with `co-tracker/` as a submodule, so initialize submodules after cloning:
+On Mac, use `--device auto`, `--device mps`, or `--device cpu`. Do not pass `--device cuda` unless you are on a CUDA machine. The repository already ships with `co-tracker/` as a submodule, so initialize submodules after cloning:
 
 ```bash
 git submodule update --init --recursive
@@ -124,8 +121,7 @@ TORCH_HOME="$PWD/.cache/torch" PYTHONPATH=src python3 -m rgbd_urdf_mvp track-par
   --max-tracks-per-part-view 128
 ```
 
-For a `60 Hz` recording, `--frame-stride 4` reduces CoTracker to roughly
-`15 Hz` while keeping the original episode files unchanged.
+For a `60 Hz` recording, `--frame-stride 4` reduces CoTracker to roughly `15 Hz` while keeping the original episode files unchanged.
 
 Then fit per-part SE(3) trajectories from those 3D correspondences:
 
@@ -157,9 +153,7 @@ PYTHONPATH=src python3 -m rgbd_urdf_mvp infer-joints \
 
 This writes `joint_inference.json` next to `part_poses.json` by default.
 
-When `part_tracks.json`, `part_poses.json`, and `joint_inference.json` are in
-the same directory as the input manifest, `visualize-pointcloud` now loads them
-automatically and exposes:
+When `part_tracks.json`, `part_poses.json`, and `joint_inference.json` are in the same directory as the input manifest, `visualize-pointcloud` now loads them automatically and exposes:
 
 - per-part pose overlays with the pose estimator source
 - per-part visibility filters
@@ -183,6 +177,26 @@ The artifact contains:
 - estimated `limits`
 - per-frame scalar `q` samples
 - simple confidence and motion metrics
+
+## Evaluate Kinematic Model Against MuJoCo GT
+
+For simulation/debug recordings, `joint_inference.json` can be evaluated against the source MJCF referenced by the episode metadata:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp evaluate-kinematic-model \
+  outputs/recordings/door-mj-partseg-001/pointcloud_4d_partseg/joint_inference.json
+```
+
+This writes `kinematic_evaluation.json` next to `joint_inference.json`. The evaluator currently reports:
+
+- joint coverage and joint type accuracy
+- sign-invariant axis angular error
+- revolute pivot error as shortest distance between predicted and GT hinge lines
+- prismatic pivot/origin distance as point distance
+- lower/upper/span limit error when GT limits exist
+- `q_rmse` and offset-aligned `q_rmse` against simulator joint positions when they are logged
+
+This is a MuJoCo-oracle eval tool for development. It does not yet solve cross-method part correspondence for arbitrary generated/PARTICULATE URDFs.
 
 ## Export Inferred Articulation To URDF/MJCF
 
