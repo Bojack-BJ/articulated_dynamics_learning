@@ -35,12 +35,20 @@ class JointInferenceTests(unittest.TestCase):
                 "0.05",
                 "--mujoco-prior",
                 "off",
+                "--robust-track-model-trim-ratio",
+                "0.2",
+                "--orient-parent-by-motion",
+                "--parent-orientation-motion-margin-m",
+                "0.01",
             ]
         )
         self.assertEqual(args.command, "infer-joints")
         self.assertAlmostEqual(args.rotation_threshold_rad, 0.3)
         self.assertAlmostEqual(args.translation_threshold_m, 0.05)
         self.assertEqual(args.mujoco_prior, "off")
+        self.assertAlmostEqual(args.robust_track_model_trim_ratio, 0.2)
+        self.assertTrue(args.orient_parent_by_motion)
+        self.assertAlmostEqual(args.parent_orientation_motion_margin_m, 0.01)
 
     def test_infer_revolute_and_prismatic_joints(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -139,6 +147,200 @@ class JointInferenceTests(unittest.TestCase):
             self.assertAlmostEqual(by_child["door"]["pivot"][0], 0.0, places=1)
             self.assertAlmostEqual(by_child["door"]["pivot"][1], 0.0, places=1)
             self.assertAlmostEqual(by_child["drawer"]["limits"][1], 0.16, places=2)
+
+    def test_motion_parent_orientation_can_flip_anchor_child_direction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            track_path = root / "part_tracks.json"
+            part_pose_path = root / "part_poses.json"
+            track_path.write_text(
+                json.dumps(
+                    {
+                        "tracks": [
+                            {
+                                "track_id": 1,
+                                "part_id": 1,
+                                "reference_xyz_world": [0.0, 0.0, 0.0],
+                                "samples": [
+                                    {"frame_index": 0, "xyz_world": [0.0, 0.0, 0.0], "visible": True, "depth_valid": True},
+                                    {"frame_index": 1, "xyz_world": [0.2, 0.0, 0.0], "visible": True, "depth_valid": True},
+                                ],
+                            },
+                            {
+                                "track_id": 2,
+                                "part_id": 2,
+                                "reference_xyz_world": [1.0, 0.0, 0.0],
+                                "samples": [
+                                    {"frame_index": 0, "xyz_world": [1.0, 0.0, 0.0], "visible": True, "depth_valid": True},
+                                    {"frame_index": 1, "xyz_world": [1.0, 0.0, 0.0], "visible": True, "depth_valid": True},
+                                ],
+                            },
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            part_pose_path.write_text(
+                json.dumps(
+                    {
+                        "input_path": str(track_path),
+                        "anchor_part_id": 1,
+                        "anchor_part_name": "moving_anchor",
+                        "parts": [
+                            {
+                                "part_id": 1,
+                                "name": "moving_anchor",
+                                "samples": [
+                                    {
+                                        "frame_index": index,
+                                        "timestamp_s": index * 0.1,
+                                        "valid": True,
+                                        "relative_to_anchor": {
+                                            "rotation_matrix": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                                            "translation": [0.0, 0.0, 0.0],
+                                        },
+                                    }
+                                    for index in range(2)
+                                ],
+                                "relative_motion_summary": {
+                                    "translation_range": [0.0, 0.0, 0.0],
+                                    "rotation_angle_range_rad": 0.0,
+                                },
+                            },
+                            {
+                                "part_id": 2,
+                                "name": "static_child",
+                                "samples": [
+                                    {
+                                        "frame_index": index,
+                                        "timestamp_s": index * 0.1,
+                                        "valid": True,
+                                        "relative_to_anchor": {
+                                            "rotation_matrix": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                                            "translation": [0.1 * index, 0.0, 0.0],
+                                        },
+                                    }
+                                    for index in range(2)
+                                ],
+                                "relative_motion_summary": {
+                                    "translation_range": [0.1, 0.0, 0.0],
+                                    "rotation_angle_range_rad": 0.0,
+                                },
+                            },
+                        ],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            output_path = JointInferencer(
+                JointInferenceConfig(
+                    input_path=part_pose_path,
+                    mujoco_prior="off",
+                    orient_parent_by_motion=True,
+                    parent_orientation_motion_margin_m=0.01,
+                )
+            ).infer()
+            artifact = json.loads(output_path.read_text(encoding="utf-8"))
+            joint = artifact["joints"][0]
+            self.assertEqual(joint["parent_part_id"], 2)
+            self.assertEqual(joint["child_part_id"], 1)
+            self.assertTrue(joint["metrics"]["parent_orientation"]["applied"])
+
+    def test_robust_track_model_trim_drops_largest_replay_residuals(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            track_path = root / "part_tracks.json"
+            part_pose_path = root / "part_poses.json"
+            tracks = []
+            for track_id in range(5):
+                reference = [float(track_id), 0.0, 0.0]
+                end = [float(track_id) + 0.2, 0.0, 0.0]
+                if track_id == 4:
+                    end = [float(track_id) + 0.2, 2.0, 0.0]
+                tracks.append(
+                    {
+                        "track_id": track_id,
+                        "part_id": 2,
+                        "reference_xyz_world": reference,
+                        "samples": [
+                            {"frame_index": 0, "xyz_world": reference, "visible": True, "depth_valid": True},
+                            {"frame_index": 1, "xyz_world": end, "visible": True, "depth_valid": True},
+                        ],
+                    }
+                )
+            track_path.write_text(json.dumps({"tracks": tracks}) + "\n", encoding="utf-8")
+            part_pose_path.write_text(
+                json.dumps(
+                    {
+                        "input_path": str(track_path),
+                        "anchor_part_id": 1,
+                        "anchor_part_name": "base",
+                        "parts": [
+                            {
+                                "part_id": 1,
+                                "name": "base",
+                                "samples": [
+                                    {
+                                        "frame_index": index,
+                                        "timestamp_s": index * 0.1,
+                                        "valid": True,
+                                        "relative_to_anchor": {
+                                            "rotation_matrix": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                                            "translation": [0.0, 0.0, 0.0],
+                                        },
+                                    }
+                                    for index in range(2)
+                                ],
+                                "relative_motion_summary": {
+                                    "translation_range": [0.0, 0.0, 0.0],
+                                    "rotation_angle_range_rad": 0.0,
+                                },
+                            },
+                            {
+                                "part_id": 2,
+                                "name": "drawer_like",
+                                "samples": [
+                                    {
+                                        "frame_index": index,
+                                        "timestamp_s": index * 0.1,
+                                        "valid": True,
+                                        "relative_to_anchor": {
+                                            "rotation_matrix": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                                            "translation": [0.2 * index, 0.0, 0.0],
+                                        },
+                                    }
+                                    for index in range(2)
+                                ],
+                                "relative_motion_summary": {
+                                    "translation_range": [0.2, 0.0, 0.0],
+                                    "rotation_angle_range_rad": 0.0,
+                                },
+                            },
+                        ],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            output_path = JointInferencer(
+                JointInferenceConfig(
+                    input_path=part_pose_path,
+                    mujoco_prior="off",
+                    min_track_residual_tracks=1,
+                    min_track_residual_samples=1,
+                    robust_track_model_trim_ratio=0.2,
+                )
+            ).infer()
+            artifact = json.loads(output_path.read_text(encoding="utf-8"))
+            comparison = artifact["joints"][0]["metrics"]["track_model_comparison"]
+            prismatic = comparison["prismatic"]
+            self.assertEqual(comparison["robust_trim_ratio"], 0.2)
+            self.assertGreater(prismatic["raw_sample_count"], prismatic["sample_count"])
+            self.assertGreater(prismatic["raw_rmse_m"], prismatic["rmse_m"])
 
     def test_mujoco_joint_prior_overrides_noisy_geometry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

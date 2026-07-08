@@ -222,6 +222,70 @@ class PartTrackingTests(unittest.TestCase):
             self.assertAlmostEqual(door_frame1["translation"][2], translation[2], places=6)
             self.assertGreater(tracks[2]["relative_motion_summary"]["rotation_angle_range_rad"], 0.4)
 
+    def test_quality_weighted_uniform_weights_match_unweighted_part_pose(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_points = [
+                [0.0, 0.0, 0.0],
+                [0.3, 0.0, 0.0],
+                [0.0, 0.3, 0.0],
+                [0.0, 0.0, 0.3],
+            ]
+            rotation = _rotation_z(math.radians(20.0))
+            translation = [0.2, -0.1, 0.05]
+            tracks = [
+                _track(index, 1, point, point)
+                for index, point in enumerate(source_points)
+            ] + [
+                _track(10 + index, 2, point, _transform(point, rotation, translation))
+                for index, point in enumerate(source_points)
+            ]
+            for track in tracks:
+                track["track_quality"] = {"track_quality_score": 1.0}
+                for sample in track["samples"]:
+                    sample["timestep_quality_score"] = 1.0
+            track_path = root / "part_tracks.json"
+            track_path.write_text(
+                json.dumps(
+                    {
+                        "frame_count": 2,
+                        "part_segmentation": {
+                            "parts": [
+                                {"part_id": 1, "name": "base", "role": "base"},
+                                {"part_id": 2, "name": "door", "role": "articulated"},
+                            ]
+                        },
+                        "tracks": tracks,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            unweighted_path = TrackPartPoseEstimator(
+                TrackPartPoseEstimationConfig(
+                    input_path=track_path,
+                    output_json=root / "part_poses_unweighted.json",
+                    min_tracks_per_part=3,
+                )
+            ).estimate()
+            weighted_path = TrackPartPoseEstimator(
+                TrackPartPoseEstimationConfig(
+                    input_path=track_path,
+                    output_json=root / "part_poses_weighted.json",
+                    min_tracks_per_part=3,
+                    quality_weighted=True,
+                )
+            ).estimate()
+            unweighted = json.loads(unweighted_path.read_text(encoding="utf-8"))
+            weighted = json.loads(weighted_path.read_text(encoding="utf-8"))
+            unweighted_door = next(part for part in unweighted["parts"] if part["part_id"] == 2)
+            weighted_door = next(part for part in weighted["parts"] if part["part_id"] == 2)
+            unweighted_sample = next(sample for sample in unweighted_door["samples"] if sample["frame_index"] == 1)
+            weighted_sample = next(sample for sample in weighted_door["samples"] if sample["frame_index"] == 1)
+            for left, right in zip(unweighted_sample["translation"], weighted_sample["translation"]):
+                self.assertAlmostEqual(left, right, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
