@@ -366,6 +366,99 @@ def register(subparsers: Any) -> None:
         help="Optional joint_inference.json override used for joint overlays",
     )
 
+    object_mask_viz_parser = subparsers.add_parser(
+        "visualize-object-mask-diagnostics",
+        help="Write diagnostic PLY files for object-mask motion clusters, joints, and local split candidates",
+    )
+    object_mask_viz_parser.add_argument("motion_tracks", type=Path, help="Path to motion_part_tracks.json")
+    object_mask_viz_parser.add_argument("--output-dir", type=Path, required=True, help="Directory for diagnostic PLY files")
+    object_mask_viz_parser.add_argument("--joint-inference", type=Path, default=None, help="Optional joint_inference.json")
+    object_mask_viz_parser.add_argument("--evaluation-json", type=Path, default=None, help="Optional object_mask_kinematic_evaluation.json")
+    object_mask_viz_parser.add_argument("--local-split-summary", type=Path, default=None, help="Optional local_split_summary.json")
+    object_mask_viz_parser.add_argument("--candidate-eval", type=Path, default=None, help="Optional local split candidate evaluation JSON")
+    object_mask_viz_parser.add_argument(
+        "--frame",
+        choices=["first", "median", "last"],
+        default="first",
+        help="Track sample used for static PLY point locations",
+    )
+    object_mask_viz_parser.add_argument("--top-n-candidates", type=int, default=8)
+    object_mask_viz_parser.add_argument("--axis-length-m", type=float, default=0.5)
+    object_mask_viz_parser.add_argument("--viz-frame", choices=["camera", "world", "mujoco", "auto"], default="world")
+    object_mask_viz_parser.add_argument(
+        "--axis-remap",
+        default="x,z,-y",
+        help="Visualization-only axis remap, e.g. x,z,-y to convert image-style y-down coordinates to z-up",
+    )
+    object_mask_viz_parser.add_argument("--flow-min-motion", type=float, default=0.005)
+    object_mask_viz_parser.add_argument("--flow-max-tracks", type=int, default=2000)
+    object_mask_viz_parser.add_argument("--flow-subsample", type=int, default=1)
+    object_mask_viz_parser.add_argument("--flow-scale", type=float, default=1.0)
+    object_mask_viz_parser.add_argument("--make-matplotlib", action="store_true")
+    object_mask_viz_parser.add_argument(
+        "--plot-projections",
+        default="xz,xy",
+        help="Comma-separated projection list from xy,xz,yz, or all",
+    )
+    object_mask_viz_parser.add_argument("--make-animation", action="store_true")
+    object_mask_viz_parser.add_argument("--animation-fps", type=int, default=12)
+    object_mask_viz_parser.add_argument("--animation-max-tracks", type=int, default=1000)
+    object_mask_viz_parser.add_argument(
+        "--animation-color-by",
+        choices=["pred_cluster", "gt_part", "motion_magnitude"],
+        default="pred_cluster",
+        help="Color temporal track replay by predicted cluster, GT part, or current motion magnitude",
+    )
+
+    object_mask_flow_html_parser = subparsers.add_parser(
+        "visualize-object-mask-flow-html",
+        help="Write an interactive Plotly HTML viewer for object-mask 3D tracks with time and track-count sliders",
+    )
+    object_mask_flow_html_parser.add_argument("motion_tracks", type=Path, help="Path to motion_part_tracks.json")
+    object_mask_flow_html_parser.add_argument("--output-html", type=Path, default=None, help="Output HTML path")
+    object_mask_flow_html_parser.add_argument("--joint-inference", type=Path, default=None, help="Optional joint_inference.json")
+    object_mask_flow_html_parser.add_argument("--evaluation-json", type=Path, default=None, help="Optional object_mask_kinematic_evaluation.json")
+    object_mask_flow_html_parser.add_argument("--max-tracks", type=int, default=1000, help="Maximum tracks embedded in the HTML")
+    object_mask_flow_html_parser.add_argument("--frame-stride", type=int, default=2, help="Embed every Nth frame in the time slider")
+    object_mask_flow_html_parser.add_argument("--trail-length", type=int, default=10, help="Default temporal trail length in frames")
+    object_mask_flow_html_parser.add_argument(
+        "--axis-remap",
+        default="x,z,-y",
+        help="Visualization-only axis remap, e.g. x,z,-y to convert image-style y-down coordinates to z-up",
+    )
+    object_mask_flow_html_parser.add_argument(
+        "--color-by",
+        choices=[
+            "pred_cluster",
+            "gt_part",
+            "motion_magnitude",
+            "track_quality",
+            "timestep_quality",
+            "step_length",
+            "acceleration",
+            "smooth_residual",
+            "step_outlier_score",
+            "acceleration_outlier_score",
+            "direction_change_deg",
+            "rigid_residual",
+            "rigid_model_residual",
+            "articulation_residual",
+            "best_motion_type",
+            "cluster_articulation_score",
+        ],
+        default="pred_cluster",
+        help="Initial HTML color mode",
+    )
+
+    track_quality_parser = subparsers.add_parser(
+        "compute-track-quality",
+        help="Compute diagnostic per-track and per-timestep quality scores for lifted 3D tracks",
+    )
+    track_quality_parser.add_argument("motion_tracks", type=Path, help="Path to object_tracks.json or motion_part_tracks.json")
+    track_quality_parser.add_argument("--output-dir", type=Path, required=True, help="Output directory for quality artifacts")
+    track_quality_parser.add_argument("--bad-track-threshold", type=float, default=0.35)
+    track_quality_parser.add_argument("--bad-timestep-threshold", type=float, default=0.35)
+
     # Part-level perception and kinematics from pointclouds.
     part_tracker_parser = subparsers.add_parser(
         "track-part-pixels",
@@ -486,6 +579,10 @@ def register(subparsers: Any) -> None:
         default=4,
         help="Minimum visible 3D tracks required per frame when --method tracks is used",
     )
+    part_pose_parser.add_argument("--quality-weighted", action="store_true", help="Use diagnostic track/timestep quality as SE(3) fitting weights")
+    part_pose_parser.add_argument("--quality-weight-field", default="timestep_quality_score")
+    part_pose_parser.add_argument("--track-quality-field", default="track_quality_score")
+    part_pose_parser.add_argument("--min-timestep-weight", type=float, default=0.2)
 
     motion_seg_parser = subparsers.add_parser(
         "segment-motion-parts",
@@ -493,6 +590,24 @@ def register(subparsers: Any) -> None:
     )
     motion_seg_parser.add_argument("input_tracks", type=Path, help="Path to object-level part_tracks.json")
     motion_seg_parser.add_argument("--output-json", type=Path, default=None, help="Output relabeled part_tracks.json")
+    motion_seg_parser.add_argument(
+        "--mode",
+        choices=["connected", "knn-spectral"],
+        default="connected",
+        help="Motion segmentation backend. 'connected' preserves the legacy rigidity connected-components baseline.",
+    )
+    motion_seg_parser.add_argument(
+        "--diagnostics-json",
+        type=Path,
+        default=None,
+        help="Optional diagnostics JSON with edge composition, cluster residuals, and quality-filter stats",
+    )
+    motion_seg_parser.add_argument(
+        "--sweep-output-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for per-ablation/per-K relabeled part_tracks artifacts in knn-spectral mode",
+    )
     motion_seg_parser.add_argument(
         "--rigidity-threshold-m",
         type=float,
@@ -528,6 +643,154 @@ def register(subparsers: Any) -> None:
         type=float,
         default=0.01,
         help="Mean endpoint motion below this threshold is treated as static/base for part ordering",
+    )
+    motion_seg_parser.add_argument(
+        "--moving-motion-threshold-m",
+        type=float,
+        default=0.03,
+        help="Endpoint motion above this threshold is moving-confident in knn-spectral mode",
+    )
+    motion_seg_parser.add_argument(
+        "--quality-filter",
+        action="store_true",
+        help="Enable visible-frame, depth-jump, and trajectory-discontinuity track filtering before clustering",
+    )
+    motion_seg_parser.add_argument(
+        "--min-visible-frames",
+        type=int,
+        default=2,
+        help="Minimum valid 3D samples required when --quality-filter is enabled",
+    )
+    motion_seg_parser.add_argument(
+        "--max-depth-jump-m",
+        type=float,
+        default=0.0,
+        help="Drop tracks with a consecutive depth_m jump above this threshold when positive",
+    )
+    motion_seg_parser.add_argument(
+        "--max-trajectory-jump-m",
+        type=float,
+        default=0.0,
+        help="Drop tracks with a consecutive 3D jump above this threshold when positive",
+    )
+    motion_seg_parser.add_argument(
+        "--knn-k",
+        type=int,
+        default=12,
+        help="Number of spatial neighbors used for the weighted kNN graph in knn-spectral mode",
+    )
+    motion_seg_parser.add_argument(
+        "--k-min",
+        type=int,
+        default=2,
+        help="Minimum fixed K evaluated by spectral clustering",
+    )
+    motion_seg_parser.add_argument(
+        "--k-max",
+        type=int,
+        default=8,
+        help="Maximum fixed K evaluated by spectral clustering",
+    )
+    motion_seg_parser.add_argument(
+        "--spectral-k",
+        type=int,
+        default=None,
+        help="Fixed K assignment to export as the main output. Defaults to --k-min.",
+    )
+    motion_seg_parser.add_argument(
+        "--edge-ablation",
+        choices=["A", "B", "C", "all"],
+        default="B",
+        help="Edge feature ablation for knn-spectral mode, or 'all' to sweep A/B/C.",
+    )
+    motion_seg_parser.add_argument(
+        "--quality-weighted-affinity",
+        action="store_true",
+        help=(
+            "Use track/timestep quality scores to weight pairwise rigidity affinity. "
+            "Disabled by default so legacy clustering is unchanged."
+        ),
+    )
+    motion_seg_parser.add_argument(
+        "--quality-weighted-affinity-time-only",
+        action="store_true",
+        help="Only use timestep quality when aggregating pairwise temporal rigidity errors.",
+    )
+    motion_seg_parser.add_argument(
+        "--quality-weighted-affinity-edge-prior",
+        action="store_true",
+        help="Multiply final edge strength by pair-level track quality prior.",
+    )
+    motion_seg_parser.add_argument(
+        "--quality-affinity-min-pair-weight",
+        type=float,
+        default=0.0,
+        help="Clamp pair-level quality prior to avoid disconnecting useful low-quality edges.",
+    )
+    motion_seg_parser.add_argument(
+        "--articulation-compatible-affinity",
+        action="store_true",
+        help=(
+            "Experimental: multiply motion affinity by static/prismatic/revolute trajectory compatibility. "
+            "Disabled by default."
+        ),
+    )
+    motion_seg_parser.add_argument(
+        "--skip-base-bridge-checks",
+        action="store_true",
+        help="Skip expensive O(N^2) base-bridge diagnostics; useful for quick dense-track ablations.",
+    )
+
+    local_split_parser = subparsers.add_parser(
+        "local-split-motion-cluster",
+        help="Diagnostic local kNN-spectral split for bad object-mask motion clusters",
+    )
+    local_split_parser.add_argument("input_tracks", type=Path, help="Path to motion_part_tracks.json")
+    local_split_parser.add_argument(
+        "--evaluation-json",
+        type=Path,
+        default=None,
+        help="Object-mask kinematic evaluation JSON. Recommended child clusters are read from failure_reason_guess.",
+    )
+    local_split_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for candidate split artifacts and local_split_summary.json",
+    )
+    local_split_parser.add_argument(
+        "--split-cluster-id",
+        type=int,
+        action="append",
+        default=None,
+        help="Cluster id to split. May be repeated. If omitted, read recommended ids from --evaluation-json.",
+    )
+    local_split_parser.add_argument("--local-k-min", type=int, default=2, help="Minimum local spectral K")
+    local_split_parser.add_argument("--local-k-max", type=int, default=3, help="Maximum local spectral K")
+    local_split_parser.add_argument("--knn-k", type=int, default=8, help="Local spatial kNN graph degree")
+    local_split_parser.add_argument(
+        "--edge-ablation",
+        choices=["A", "B", "C", "all"],
+        default="B",
+        help="Local edge feature ablation, or 'all' to sweep A/B/C",
+    )
+    local_split_parser.add_argument(
+        "--rigidity-threshold-m",
+        type=float,
+        default=0.015,
+        help="Rigidity scale used by local edge weights",
+    )
+    local_split_parser.add_argument(
+        "--max-neighbor-distance-m",
+        type=float,
+        default=0.18,
+        help="Spatial locality scale used by local edge weights",
+    )
+    local_split_parser.add_argument(
+        "--min-common-frames",
+        type=int,
+        default=3,
+        help="Minimum overlapping visible frames required to compare two tracks",
     )
 
     joint_parser = subparsers.add_parser(
@@ -594,6 +857,29 @@ def register(subparsers: Any) -> None:
         help="Minimum distinct tracks required before track residual can override threshold-priority type selection",
     )
     joint_parser.add_argument(
+        "--robust-track-model-trim-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "Trim this fraction of largest 3D track replay residuals before comparing revolute/prismatic models. "
+            "This is an object-mask diagnostic cleanup knob; 0 disables trimming."
+        ),
+    )
+    joint_parser.add_argument(
+        "--quality-weighted-replay",
+        action="store_true",
+        help=(
+            "Use track/timestep quality scores to weight 3D track replay residuals when comparing "
+            "revolute and prismatic models. Disabled by default for reproducibility."
+        ),
+    )
+    joint_parser.add_argument(
+        "--min-replay-weight",
+        type=float,
+        default=0.2,
+        help="Minimum per-observation weight used by --quality-weighted-replay",
+    )
+    joint_parser.add_argument(
         "--mujoco-prior",
         choices=["auto", "off", "required"],
         default="auto",
@@ -602,6 +888,17 @@ def register(subparsers: Any) -> None:
             "'auto' uses it as a simulation/debug prior, 'off' keeps pure geometry inference, "
             "and 'required' fails if no prior can be found."
         ),
+    )
+    joint_parser.add_argument(
+        "--orient-parent-by-motion",
+        action="store_true",
+        help="Experimental object-mask heuristic: orient a joint so the lower-motion cluster is the parent",
+    )
+    joint_parser.add_argument(
+        "--parent-orientation-motion-margin-m",
+        type=float,
+        default=0.005,
+        help="Minimum median endpoint-motion gap required before --orient-parent-by-motion flips parent/child",
     )
 
     inferred_export_parser = subparsers.add_parser(

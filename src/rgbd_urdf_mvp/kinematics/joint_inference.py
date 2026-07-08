@@ -8,6 +8,7 @@ from statistics import fmean
 from typing import Any
 
 from ..core.serialization import load_json, save_json
+from ..perception.quality_weights import observation_weight
 
 
 @dataclass(slots=True)
@@ -24,7 +25,12 @@ class JointInferenceConfig:
     track_residual_decision_ratio: float = 0.85
     min_track_residual_samples: int = 20
     min_track_residual_tracks: int = 12
+    robust_track_model_trim_ratio: float = 0.0
+    quality_weighted_replay: bool = False
+    min_replay_weight: float = 0.2
     mujoco_prior: str = "auto"
+    orient_parent_by_motion: bool = False
+    parent_orientation_motion_margin_m: float = 0.005
 
 
 def _dot(a: list[float], b: list[float]) -> float:
@@ -559,12 +565,40 @@ class JointInferencer:
         limits = [min(q_values), max(q_values)] if q_values else [0.0, 0.0]
         if mujoco_prior is not None and mujoco_prior.get("limits") is not None:
             limits = [float(value) for value in mujoco_prior["limits"]]
+        parent_motion = self._part_motion_score(anchor_part_id)
+        child_part_id = int(part.get("part_id", 0))
+        child_motion = self._part_motion_score(child_part_id)
+        parent_orientation = {
+            "mode": "motion_heuristic" if self.config.orient_parent_by_motion else "anchor_parent",
+            "applied": False,
+            "parent_motion_score_m": parent_motion,
+            "child_motion_score_m": child_motion,
+            "motion_margin_m": float(self.config.parent_orientation_motion_margin_m),
+        }
+        parent_part_id = anchor_part_id
+        parent_name = anchor_part_name
+        child_name = str(part.get("name", f"part_{child_part_id}"))
+        if (
+            self.config.orient_parent_by_motion
+            and parent_motion is not None
+            and child_motion is not None
+            and parent_motion > child_motion + self.config.parent_orientation_motion_margin_m
+        ):
+            parent_part_id = child_part_id
+            parent_name = child_name
+            child_part_id = anchor_part_id
+            child_name = anchor_part_name
+            q_values = [-value for value in q_values]
+            limits = [-limits[1], -limits[0]]
+            parent_orientation["applied"] = True
+            parent_orientation["reason"] = "anchor_cluster_has_larger_motion_than_child_cluster"
+
         return {
             "name": f"{part.get('name', f'part_{part.get('part_id', 0)}')}_joint",
-            "parent_part_id": anchor_part_id,
-            "parent_name": anchor_part_name,
-            "child_part_id": int(part.get("part_id", 0)),
-            "child_name": str(part.get("name", f"part_{part.get('part_id', 0)}")),
+            "parent_part_id": parent_part_id,
+            "parent_name": parent_name,
+            "child_part_id": child_part_id,
+            "child_name": child_name,
             "joint_type": joint_type,
             "axis": [float(value) for value in axis],
             "pivot": [float(value) for value in pivot],
@@ -588,6 +622,7 @@ class JointInferencer:
                 "valid_sample_count": len(relative_poses),
                 "track_translation_axis": track_translation_axis,
                 "track_model_comparison": track_model_comparison,
+                "parent_orientation": parent_orientation,
             },
             "q_samples": [
                 {
@@ -598,6 +633,29 @@ class JointInferencer:
                 for pose, q_value in zip(relative_poses, q_values)
             ],
         }
+
+    def _part_motion_score(self, part_id: int) -> float | None:
+        tracks = self._tracks_by_part.get(part_id, [])
+        motions = []
+        for track in tracks:
+            samples = [
+                sample
+                for sample in track.get("samples", [])
+                if _valid_track_sample(sample)
+            ]
+            if len(samples) < 2:
+                continue
+            samples = sorted(samples, key=lambda item: int(item.get("frame_index", 0)))
+            start = [float(value) for value in samples[0]["xyz_world"]]
+            end = [float(value) for value in samples[-1]["xyz_world"]]
+            motions.append(_distance(start, end))
+        if not motions:
+            return None
+        ordered = sorted(motions)
+        mid = len(ordered) // 2
+        if len(ordered) % 2:
+            return float(ordered[mid])
+        return 0.5 * (ordered[mid - 1] + ordered[mid])
 
     def _infer_revolute(
         self,
@@ -770,8 +828,9 @@ class JointInferencer:
         if not tracks:
             return None
         allowed_frames = set(frame_indices)
-        prismatic = self._prismatic_track_residual(tracks, prismatic_axis, allowed_frames)
-        revolute = self._revolute_track_residual(tracks, revolute_axis, revolute_pivot, allowed_frames)
+        trim_ratio = max(0.0, min(0.8, float(self.config.robust_track_model_trim_ratio)))
+        prismatic = self._prismatic_track_residual(tracks, prismatic_axis, allowed_frames, trim_ratio)
+        revolute = self._revolute_track_residual(tracks, revolute_axis, revolute_pivot, allowed_frames, trim_ratio)
         if prismatic is None or revolute is None:
             return None
         sample_count = min(int(prismatic["sample_count"]), int(revolute["sample_count"]))
@@ -794,6 +853,8 @@ class JointInferencer:
         )
         return {
             "source": "part_tracks_3d_replay",
+            "quality_weighted_replay_enabled": bool(self.config.quality_weighted_replay),
+            "min_replay_weight": float(self.config.min_replay_weight),
             "selected_type": selected_type,
             "residual_decisive": bool(residual_decisive),
             "type_override_applied": bool(type_override_applied),
@@ -810,6 +871,7 @@ class JointInferencer:
             "decision_threshold": float(self.config.track_residual_decision_ratio),
             "min_samples": int(self.config.min_track_residual_samples),
             "min_tracks": int(self.config.min_track_residual_tracks),
+            "robust_trim_ratio": trim_ratio,
             "sample_count": int(sample_count),
             "track_count": len(tracks),
             "prismatic": prismatic,
@@ -821,10 +883,11 @@ class JointInferencer:
         tracks: list[dict[str, Any]],
         axis: list[float],
         allowed_frames: set[int],
+        trim_ratio: float = 0.0,
     ) -> dict[str, Any] | None:
         unit_axis = _normalize(axis, fallback=[1.0, 0.0, 0.0])
         reference_by_track: dict[int, list[float]] = {}
-        frame_samples: dict[int, list[tuple[int, list[float]]]] = {}
+        frame_samples: dict[int, list[tuple[int, list[float], float]]] = {}
         for track in tracks:
             track_id = int(track.get("track_id", len(reference_by_track)))
             reference = track.get("reference_xyz_world")
@@ -837,31 +900,43 @@ class JointInferencer:
                 frame_index = int(sample["frame_index"])
                 if frame_index not in allowed_frames:
                     continue
-                frame_samples.setdefault(frame_index, []).append((track_id, [float(value) for value in sample["xyz_world"]]))
+                weight = observation_weight(track, sample, min_weight=float(self.config.min_replay_weight))
+                frame_samples.setdefault(frame_index, []).append((track_id, [float(value) for value in sample["xyz_world"]], weight))
         residuals: list[float] = []
+        weighted_residuals: list[tuple[float, float]] = []
         q_values: list[float] = []
         for samples in frame_samples.values():
             frame_q_votes = []
             valid_samples = []
-            for track_id, point in samples:
+            for track_id, point, weight in samples:
                 reference = reference_by_track.get(track_id)
                 if reference is None:
                     continue
                 frame_q_votes.append(_dot(_subtract(point, reference), unit_axis))
-                valid_samples.append((reference, point))
+                valid_samples.append((reference, point, weight))
             if not frame_q_votes:
                 continue
             q = fmean(frame_q_votes)
             q_values.append(q)
-            for reference, point in valid_samples:
+            for reference, point, weight in valid_samples:
                 predicted = _add(reference, _scale(unit_axis, q))
-                residuals.append(_distance(point, predicted))
+                residual = _distance(point, predicted)
+                residuals.append(residual)
+                weighted_residuals.append((residual, weight))
         if not residuals:
             return None
+        kept_residuals, trim_stats = _trim_residuals(residuals, trim_ratio)
+        rmse = _weighted_rmse(weighted_residuals) if self.config.quality_weighted_replay else math.sqrt(fmean(value * value for value in kept_residuals))
         return {
-            "rmse_m": math.sqrt(fmean(value * value for value in residuals)),
-            "mae_m": fmean(residuals),
-            "sample_count": len(residuals),
+            "rmse_m": rmse,
+            "rmse_unweighted_m": math.sqrt(fmean(value * value for value in kept_residuals)),
+            "rmse_weighted_m": _weighted_rmse(weighted_residuals),
+            "joint_replay_unweighted_m": math.sqrt(fmean(value * value for value in kept_residuals)),
+            "joint_replay_weighted_m": _weighted_rmse(weighted_residuals),
+            "mae_m": fmean(kept_residuals),
+            "sample_count": len(kept_residuals),
+            "raw_sample_count": len(residuals),
+            **trim_stats,
             "q_range": [min(q_values), max(q_values)] if q_values else [0.0, 0.0],
         }
 
@@ -871,10 +946,11 @@ class JointInferencer:
         axis: list[float],
         pivot: list[float],
         allowed_frames: set[int],
+        trim_ratio: float = 0.0,
     ) -> dict[str, Any] | None:
         unit_axis = _normalize(axis, fallback=[0.0, 0.0, 1.0])
         reference_by_track: dict[int, list[float]] = {}
-        frame_samples: dict[int, list[tuple[int, list[float]]]] = {}
+        frame_samples: dict[int, list[tuple[int, list[float], float]]] = {}
         for track in tracks:
             track_id = int(track.get("track_id", len(reference_by_track)))
             reference = track.get("reference_xyz_world")
@@ -887,14 +963,18 @@ class JointInferencer:
                 frame_index = int(sample["frame_index"])
                 if frame_index not in allowed_frames:
                     continue
-                frame_samples.setdefault(frame_index, []).append((track_id, [float(value) for value in sample["xyz_world"]]))
+                sample_weight = observation_weight(track, sample, min_weight=float(self.config.min_replay_weight))
+                frame_samples.setdefault(frame_index, []).append(
+                    (track_id, [float(value) for value in sample["xyz_world"]], sample_weight)
+                )
         residuals: list[float] = []
+        weighted_residuals: list[tuple[float, float]] = []
         q_values: list[float] = []
         for samples in frame_samples.values():
             sin_sum = 0.0
             cos_sum = 0.0
             valid_samples = []
-            for track_id, point in samples:
+            for track_id, point, sample_weight in samples:
                 reference = reference_by_track.get(track_id)
                 if reference is None:
                     continue
@@ -902,25 +982,67 @@ class JointInferencer:
                 if angle is None:
                     continue
                 radius = _norm(_subtract(_subtract(reference, pivot), _scale(unit_axis, _dot(_subtract(reference, pivot), unit_axis))))
-                weight = max(1e-6, radius)
-                sin_sum += weight * math.sin(angle)
-                cos_sum += weight * math.cos(angle)
-                valid_samples.append((reference, point))
+                angle_weight = max(1e-6, radius) * sample_weight
+                sin_sum += angle_weight * math.sin(angle)
+                cos_sum += angle_weight * math.cos(angle)
+                valid_samples.append((reference, point, sample_weight))
             if not valid_samples:
                 continue
             q = math.atan2(sin_sum, cos_sum)
             q_values.append(q)
-            for reference, point in valid_samples:
+            for reference, point, weight in valid_samples:
                 predicted = _add(pivot, _rotate_vector_about_axis(_subtract(reference, pivot), unit_axis, q))
-                residuals.append(_distance(point, predicted))
+                residual = _distance(point, predicted)
+                residuals.append(residual)
+                weighted_residuals.append((residual, weight))
         if not residuals:
             return None
+        kept_residuals, trim_stats = _trim_residuals(residuals, trim_ratio)
+        rmse = _weighted_rmse(weighted_residuals) if self.config.quality_weighted_replay else math.sqrt(fmean(value * value for value in kept_residuals))
         return {
-            "rmse_m": math.sqrt(fmean(value * value for value in residuals)),
-            "mae_m": fmean(residuals),
-            "sample_count": len(residuals),
+            "rmse_m": rmse,
+            "rmse_unweighted_m": math.sqrt(fmean(value * value for value in kept_residuals)),
+            "rmse_weighted_m": _weighted_rmse(weighted_residuals),
+            "joint_replay_unweighted_m": math.sqrt(fmean(value * value for value in kept_residuals)),
+            "joint_replay_weighted_m": _weighted_rmse(weighted_residuals),
+            "mae_m": fmean(kept_residuals),
+            "sample_count": len(kept_residuals),
+            "raw_sample_count": len(residuals),
+            **trim_stats,
             "q_range": [min(q_values), max(q_values)] if q_values else [0.0, 0.0],
         }
+
+
+def _trim_residuals(residuals: list[float], trim_ratio: float) -> tuple[list[float], dict[str, Any]]:
+    ratio = max(0.0, min(0.8, float(trim_ratio)))
+    if ratio <= 0.0 or len(residuals) < 4:
+        return residuals, {
+            "trimmed_sample_count": 0,
+            "trim_ratio": ratio,
+            "raw_rmse_m": math.sqrt(fmean(value * value for value in residuals)),
+            "raw_mae_m": fmean(residuals),
+        }
+    trim_count = min(len(residuals) - 1, int(round(len(residuals) * ratio)))
+    kept = sorted(residuals)[: len(residuals) - trim_count]
+    return kept, {
+        "trimmed_sample_count": trim_count,
+        "trim_ratio": ratio,
+        "raw_rmse_m": math.sqrt(fmean(value * value for value in residuals)),
+        "raw_mae_m": fmean(residuals),
+    }
+
+
+def _weighted_rmse(weighted_residuals: list[tuple[float, float]]) -> float:
+    if not weighted_residuals:
+        return float("inf")
+    total_weight = sum(max(1e-9, float(weight)) for _, weight in weighted_residuals)
+    if total_weight <= 1e-12:
+        return float("inf")
+    weighted_square_sum = sum(
+        max(1e-9, float(weight)) * float(residual) * float(residual)
+        for residual, weight in weighted_residuals
+    )
+    return math.sqrt(weighted_square_sum / total_weight)
 
 
 def _valid_track_sample(sample: Any) -> bool:

@@ -9,6 +9,7 @@ from typing import Any
 
 from .part_pose import _centroid, _matvec3, _pose_payload, _relative_pose, _rotation_angle_from_matrix
 from .part_segmentation import part_name_lookup
+from .quality_weights import observation_weight
 from .pointcloud_fusion import (
     _camera_to_world_point,
     _depth_convention,
@@ -48,6 +49,10 @@ class TrackPartPoseEstimationConfig:
     output_json: str | Path | None = None
     min_tracks_per_part: int = 4
     anchor_part_id: int | None = None
+    quality_weighted: bool = False
+    quality_weight_field: str = "timestep_quality_score"
+    track_quality_field: str = "track_quality_score"
+    min_timestep_weight: float = 0.2
 
 
 def _resolve_view_rgb_paths(frame: Any, episode_root: Path) -> list[Path]:
@@ -823,7 +828,18 @@ class TrackPartPoseEstimator:
                         continue
                     source_points.append([float(value) for value in reference_xyz])
                     target_points.append([float(value) for value in xyz_world])
-                    weights.append(float(sample.get("confidence", 1.0)))
+                    if self.config.quality_weighted:
+                        weights.append(
+                            observation_weight(
+                                track,
+                                sample,
+                                timestep_field=self.config.quality_weight_field,
+                                track_field=self.config.track_quality_field,
+                                min_weight=float(self.config.min_timestep_weight),
+                            )
+                        )
+                    else:
+                        weights.append(float(sample.get("confidence", 1.0)))
 
                 timestamp_s = frame_times.get(frame_index, 0.0)
                 source_frame_index = source_frame_indices.get(frame_index, sampled_frame_indices[frame_index] if frame_index < len(sampled_frame_indices) else frame_index)
@@ -859,6 +875,7 @@ class TrackPartPoseEstimator:
                         "track_count": len(source_points),
                         "confidence": float(confidence),
                         "registration_rms_m": float(rms),
+                        "quality_weighted": bool(self.config.quality_weighted),
                         "centroid_world": [float(value) for value in centroid_world],
                     }
                 )
@@ -935,6 +952,12 @@ class TrackPartPoseEstimator:
                 "frame_count": frame_count,
                 "source_frame_count": source_frame_count,
                 "sampled_frame_indices": sampled_frame_indices,
+                "quality_weighting": {
+                    "enabled": bool(self.config.quality_weighted),
+                    "quality_weight_field": self.config.quality_weight_field,
+                    "track_quality_field": self.config.track_quality_field,
+                    "min_timestep_weight": float(self.config.min_timestep_weight),
+                },
                 "anchor_part_id": anchor_part_id,
                 "anchor_part_name": part_tracks[anchor_part_id]["name"],
                 "parts": [part_tracks[part_id] for part_id in sorted(part_tracks)],

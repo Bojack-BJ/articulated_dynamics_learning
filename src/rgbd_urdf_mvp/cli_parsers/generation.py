@@ -369,6 +369,78 @@ def register(subparsers: Any) -> None:
         help="Evaluation output path (defaults next to joint_inference.json)",
     )
 
+    object_mask_kinematic_eval_parser = subparsers.add_parser(
+        "evaluate-object-mask-kinematics",
+        help="Simulation-only cluster-to-GT diagnostic evaluation for object-mask motion segmentation",
+    )
+    object_mask_kinematic_eval_parser.add_argument("joint_inference", type=Path, help="Path to joint_inference.json")
+    object_mask_kinematic_eval_parser.add_argument(
+        "--part-poses",
+        type=Path,
+        default=None,
+        help="Optional path to part_poses.json. Defaults to joint_inference.input_path.",
+    )
+    object_mask_kinematic_eval_parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Evaluation output path (defaults next to joint_inference.json)",
+    )
+    object_mask_kinematic_eval_parser.add_argument(
+        "--output-csv",
+        type=Path,
+        default=None,
+        help="Optional one-row CSV summary for sweep aggregation",
+    )
+    object_mask_kinematic_eval_parser.add_argument(
+        "--matching-metric",
+        choices=["iou", "overlap"],
+        default="iou",
+        help="Hungarian matching score used to map predicted clusters to GT parts",
+    )
+
+    local_split_candidate_eval_parser = subparsers.add_parser(
+        "evaluate-local-split-candidates",
+        help="Run pose/joint diagnostics for local split candidate track artifacts",
+    )
+    local_split_candidate_eval_parser.add_argument(
+        "local_split_summary",
+        type=Path,
+        help="local_split_summary.json from local-split-motion-cluster",
+    )
+    local_split_candidate_eval_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for generated part poses, joint inference, eval artifacts, and summary table",
+    )
+    local_split_candidate_eval_parser.add_argument("--output-json", type=Path, default=None)
+    local_split_candidate_eval_parser.add_argument("--output-csv", type=Path, default=None)
+    local_split_candidate_eval_parser.add_argument(
+        "--min-tracks-per-part",
+        type=int,
+        default=4,
+        help="Minimum tracks per frame passed to track-based part pose estimation",
+    )
+    local_split_candidate_eval_parser.add_argument(
+        "--mujoco-prior",
+        choices=["auto", "off", "required"],
+        default="off",
+        help="MJCF prior mode passed to infer-joints for each candidate",
+    )
+    local_split_candidate_eval_parser.add_argument(
+        "--robust-track-model-trim-ratio",
+        type=float,
+        default=0.0,
+        help="Trim largest 3D track replay residuals when infer-joints compares joint models",
+    )
+    local_split_candidate_eval_parser.add_argument(
+        "--matching-metric",
+        choices=["iou", "overlap"],
+        default="iou",
+        help="Cluster-to-GT matching score for simulation-only object-mask evaluation",
+    )
+
     feedforward_eval_parser = subparsers.add_parser(
         "evaluate-feedforward-articulation",
         help="Evaluate PARTICULATE feedforward URDFs by searching all exported joint candidates",

@@ -323,6 +323,73 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"viewer_html": str(html_path.resolve())}, indent=2))
         return 0
 
+    if args.command == "visualize-object-mask-diagnostics":
+        from .perception.object_mask_diagnostics_viz import (
+            ObjectMaskDiagnosticsVisualizationConfig,
+            ObjectMaskDiagnosticsVisualizer,
+        )
+
+        manifest_path = ObjectMaskDiagnosticsVisualizer().build(
+            ObjectMaskDiagnosticsVisualizationConfig(
+                motion_tracks=args.motion_tracks,
+                output_dir=args.output_dir,
+                joint_inference=args.joint_inference,
+                evaluation_json=args.evaluation_json,
+                local_split_summary=args.local_split_summary,
+                candidate_eval=args.candidate_eval,
+                frame=args.frame,
+                top_n_candidates=max(1, int(args.top_n_candidates)),
+                axis_length_m=float(args.axis_length_m),
+                viz_frame=args.viz_frame,
+                axis_remap=args.axis_remap,
+                flow_min_motion_m=float(args.flow_min_motion),
+                flow_max_tracks=max(1, int(args.flow_max_tracks)),
+                flow_subsample=max(1, int(args.flow_subsample)),
+                flow_scale=float(args.flow_scale),
+                make_matplotlib=bool(args.make_matplotlib),
+                plot_projections=args.plot_projections,
+                make_animation=bool(args.make_animation),
+                animation_fps=max(1, int(args.animation_fps)),
+                animation_max_tracks=max(1, int(args.animation_max_tracks)),
+                animation_color_by=str(args.animation_color_by),
+            )
+        )
+        print(json.dumps({"object_mask_diagnostics_viz": str(manifest_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "visualize-object-mask-flow-html":
+        from .perception.object_mask_flow_html import ObjectMaskFlowHtmlBuilder, ObjectMaskFlowHtmlConfig
+
+        html_path = ObjectMaskFlowHtmlBuilder().build(
+            ObjectMaskFlowHtmlConfig(
+                motion_tracks=args.motion_tracks,
+                output_html=args.output_html,
+                joint_inference=args.joint_inference,
+                evaluation_json=args.evaluation_json,
+                max_tracks=max(1, int(args.max_tracks)),
+                frame_stride=max(1, int(args.frame_stride)),
+                trail_length=max(0, int(args.trail_length)),
+                axis_remap=args.axis_remap,
+                color_by=str(args.color_by),
+            )
+        )
+        print(json.dumps({"object_mask_flow_html": str(html_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "compute-track-quality":
+        from .perception.track_quality import TrackQualityAnalyzer, TrackQualityConfig
+
+        outputs = TrackQualityAnalyzer().analyze(
+            TrackQualityConfig(
+                input_tracks=args.motion_tracks,
+                output_dir=args.output_dir,
+                bad_track_threshold=float(args.bad_track_threshold),
+                bad_timestep_threshold=float(args.bad_timestep_threshold),
+            )
+        )
+        print(json.dumps({key: str(path.resolve()) for key, path in outputs.items()}, indent=2))
+        return 0
+
     if args.command == "track-part-pixels":
         from .perception.part_tracking import PartPixelTracker, PartPixelTrackingConfig
 
@@ -365,6 +432,10 @@ def main(argv: list[str] | None = None) -> int:
                     output_json=args.output_json,
                     min_tracks_per_part=max(3, int(args.min_tracks_per_part)),
                     anchor_part_id=args.anchor_part_id,
+                    quality_weighted=bool(args.quality_weighted),
+                    quality_weight_field=str(args.quality_weight_field),
+                    track_quality_field=str(args.track_quality_field),
+                    min_timestep_weight=float(args.min_timestep_weight),
                 )
             ).estimate()
         else:
@@ -388,15 +459,55 @@ def main(argv: list[str] | None = None) -> int:
             MotionPartSegmentationConfig(
                 input_tracks=args.input_tracks,
                 output_json=args.output_json,
+                mode=args.mode,
+                diagnostics_json=args.diagnostics_json,
+                sweep_output_dir=args.sweep_output_dir,
                 rigidity_threshold_m=float(args.rigidity_threshold_m),
                 max_neighbor_distance_m=float(args.max_neighbor_distance_m),
                 min_common_frames=max(2, int(args.min_common_frames)),
                 min_tracks_per_part=max(1, int(args.min_tracks_per_part)),
                 min_motion_m=float(args.min_motion_m),
                 static_motion_threshold_m=float(args.static_motion_threshold_m),
+                moving_motion_threshold_m=float(args.moving_motion_threshold_m),
+                quality_filter=bool(args.quality_filter),
+                min_visible_frames=max(2, int(args.min_visible_frames)),
+                max_depth_jump_m=float(args.max_depth_jump_m),
+                max_trajectory_jump_m=float(args.max_trajectory_jump_m),
+                knn_k=max(1, int(args.knn_k)),
+                k_min=max(2, int(args.k_min)),
+                k_max=max(2, int(args.k_max)),
+                spectral_k=args.spectral_k,
+                edge_ablation=args.edge_ablation,
+                quality_weighted_affinity=bool(args.quality_weighted_affinity),
+                quality_weighted_affinity_time_only=bool(args.quality_weighted_affinity_time_only),
+                quality_weighted_affinity_edge_prior=bool(args.quality_weighted_affinity_edge_prior),
+                quality_affinity_min_pair_weight=max(0.0, min(1.0, float(args.quality_affinity_min_pair_weight))),
+                articulation_compatible_affinity=bool(args.articulation_compatible_affinity),
+                skip_base_bridge_checks=bool(args.skip_base_bridge_checks),
             )
         ).segment()
         print(json.dumps({"motion_part_tracks": str(output_json.resolve())}, indent=2))
+        return 0
+
+    if args.command == "local-split-motion-cluster":
+        from .perception.motion_segmentation import LocalMotionClusterSplitter, LocalSplitDiagnosticsConfig
+
+        summary_json = LocalMotionClusterSplitter(
+            LocalSplitDiagnosticsConfig(
+                input_tracks=args.input_tracks,
+                evaluation_json=args.evaluation_json,
+                output_dir=args.output_dir,
+                split_cluster_ids=args.split_cluster_id,
+                local_k_min=max(2, int(args.local_k_min)),
+                local_k_max=max(2, int(args.local_k_max)),
+                knn_k=max(1, int(args.knn_k)),
+                edge_ablation=args.edge_ablation,
+                rigidity_threshold_m=float(args.rigidity_threshold_m),
+                max_neighbor_distance_m=float(args.max_neighbor_distance_m),
+                min_common_frames=max(2, int(args.min_common_frames)),
+            )
+        ).split()
+        print(json.dumps({"local_split_summary": str(summary_json.resolve())}, indent=2))
         return 0
 
     if args.command == "infer-joints":
@@ -414,7 +525,12 @@ def main(argv: list[str] | None = None) -> int:
                 track_residual_decision_ratio=float(args.track_residual_decision_ratio),
                 min_track_residual_samples=max(1, int(args.min_track_residual_samples)),
                 min_track_residual_tracks=max(1, int(args.min_track_residual_tracks)),
+                robust_track_model_trim_ratio=max(0.0, min(0.8, float(args.robust_track_model_trim_ratio))),
+                quality_weighted_replay=bool(args.quality_weighted_replay),
+                min_replay_weight=max(0.0, min(1.0, float(args.min_replay_weight))),
                 mujoco_prior=args.mujoco_prior,
+                orient_parent_by_motion=bool(args.orient_parent_by_motion),
+                parent_orientation_motion_margin_m=float(args.parent_orientation_motion_margin_m),
             )
         ).infer()
         print(json.dumps({"joint_inference_artifact": str(output_json.resolve())}, indent=2))
@@ -982,6 +1098,42 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         print(json.dumps({"kinematic_evaluation": str(output_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "evaluate-object-mask-kinematics":
+        from .kinematics.evaluation import ObjectMaskKinematicEvaluationConfig, ObjectMaskKinematicEvaluator
+
+        output_path = ObjectMaskKinematicEvaluator().evaluate(
+            ObjectMaskKinematicEvaluationConfig(
+                joint_inference_path=args.joint_inference,
+                part_pose_path=args.part_poses,
+                output_json=args.output_json,
+                output_csv=args.output_csv,
+                matching_metric=args.matching_metric,
+            )
+        )
+        print(json.dumps({"object_mask_kinematic_evaluation": str(output_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "evaluate-local-split-candidates":
+        from .kinematics.local_split_candidate_evaluation import (
+            LocalSplitCandidateEvaluationConfig,
+            LocalSplitCandidateEvaluator,
+        )
+
+        output_path = LocalSplitCandidateEvaluator().evaluate(
+            LocalSplitCandidateEvaluationConfig(
+                local_split_summary=args.local_split_summary,
+                output_dir=args.output_dir,
+                output_json=args.output_json,
+                output_csv=args.output_csv,
+                min_tracks_per_part=max(3, int(args.min_tracks_per_part)),
+                mujoco_prior=args.mujoco_prior,
+                robust_track_model_trim_ratio=max(0.0, min(0.8, float(args.robust_track_model_trim_ratio))),
+                matching_metric=args.matching_metric,
+            )
+        )
+        print(json.dumps({"local_split_candidate_evaluation": str(output_path.resolve())}, indent=2))
         return 0
 
     if args.command == "evaluate-feedforward-articulation":
