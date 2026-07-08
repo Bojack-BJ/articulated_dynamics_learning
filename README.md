@@ -15,6 +15,7 @@ The current code is scaffold-first. It is meant to keep the full contract execut
 - End-to-end model-to-joint-inference tutorial: [docs/end-to-end-articulation.md](docs/end-to-end-articulation.md)
 - MuJoCo recording and USD-to-MJCF conversion: [docs/mujoco-recording.md](docs/mujoco-recording.md)
 - RGB-D fusion, part segmentation, and viewer workflow: [docs/pointcloud.md](docs/pointcloud.md)
+- Object-mask motion segmentation experiments: [docs/object-mask-motion-segmentation.md](docs/object-mask-motion-segmentation.md)
 - Dynamics identification and Lagrangian-network handoff: [docs/dynamics-identification.md](docs/dynamics-identification.md)
 - Downstream MuJoCo manipulation planning: [docs/downstream-manipulation.md](docs/downstream-manipulation.md)
 - Ballistic dynamics-conditioned IL pipeline: [docs/ballistic-il-pipeline.md](docs/ballistic-il-pipeline.md)
