@@ -8,6 +8,40 @@ signal to recover articulated refrigerator parts without ground-truth part masks
 V1 focuses on diagnostics and controlled clustering experiments. It does not
 perform automatic `K` selection, split/merge refinement, or joint-aware EM.
 
+## Dynamic reseeding for disocclusion
+
+Object-mask tracking can optionally add tracks for surfaces that first become
+visible after the reference frame, such as an interior drawer revealed by an
+opening refrigerator door:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp track-part-pixels episode.json \
+  --output-json object_tracks.json \
+  --dynamic-reseeding \
+  --reseed-interval-frames 5 \
+  --reseed-coverage-radius-px 12 \
+  --reseed-bbox-scale 1.2 \
+  --reseed-max-tracks-per-frame-view 64 \
+  --reseed-max-tracks-per-view 256
+```
+
+At each checkpoint, the tracker samples foreground pixels with valid depth
+that are not covered by an existing visible track. Candidates must lie inside
+a robust 3D object bounding box expanded by `--reseed-bbox-scale`. This
+proximity gate rejects most unrelated foreground objects while retaining newly
+exposed internal surfaces.
+
+Dynamic tracks record `seed_source: dynamic_reseed` and their own
+`query_frame_index`. Samples before this birth frame are always marked
+invisible. Existing tracks are not invalidated solely because they leave a
+propagated object mask: an opening articulated part may legitimately expand
+beyond the original silhouette. `mask_consistent` remains available as a soft
+quality diagnostic.
+
+The mechanism also works with simulation part masks. It then reseeds each known
+part separately, providing a controlled diagnostic for parts fully occluded in
+the first frame. GT part IDs are not required in object-mask inference mode.
+
 ## Stages
 
 1. **Baseline reproduction**: run the legacy connected-components baseline on
@@ -34,6 +68,82 @@ perform automatic `K` selection, split/merge refinement, or joint-aware EM.
    matching.
 
 ## CLI
+
+### Sequential RANSAC Rigid Proposals
+
+`sequential-ransac` is an optional proposal generator. Unlike kNN spectral
+clustering, each proposal is supported by one shared per-frame rigid SE(3)
+model. It does not choose the final kinematic graph: a real door can be split
+into several locally consistent RANSAC patches when RGB-D lifting or tracking
+noise makes a global rigid fit exceed the inlier threshold. Feed its output into
+the post-segmentation group-level merge diagnostic below.
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp segment-motion-parts \
+  outputs/flow_tracking_eval/refrigerator045/em_lite/baseline/motion_part_tracks_knn.json \
+  --mode sequential-ransac \
+  --output-json outputs/flow_tracking_eval/refrigerator045/ransac/motion_part_tracks_ransac.json \
+  --diagnostics-json outputs/flow_tracking_eval/refrigerator045/ransac/diagnostics.json \
+  --ransac-iterations 256 \
+  --ransac-inlier-threshold-m 0.025 \
+  --ransac-min-inliers 16 \
+  --ransac-spatial-link-m 0.45 \
+  --ransac-assignment-threshold-m 0.05
+```
+
+Then run the normal pose and joint stack, followed by group-level merge:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp estimate-part-poses \
+  outputs/flow_tracking_eval/refrigerator045/ransac/motion_part_tracks_ransac.json \
+  --method tracks \
+  --output-json outputs/flow_tracking_eval/refrigerator045/ransac/part_poses_ransac.json
+
+PYTHONPATH=src python3 -m rgbd_urdf_mvp infer-joints \
+  outputs/flow_tracking_eval/refrigerator045/ransac/part_poses_ransac.json \
+  --output-json outputs/flow_tracking_eval/refrigerator045/ransac/joint_inference_ransac.json \
+  --mujoco-prior off
+
+PYTHONPATH=src python3 scripts/run_post_spectral_merge_diagnostic.py \
+  outputs/flow_tracking_eval/refrigerator045/ransac/motion_part_tracks_ransac.json \
+  --joint-inference outputs/flow_tracking_eval/refrigerator045/ransac/joint_inference_ransac.json \
+  --output-dir outputs/flow_tracking_eval/refrigerator045/ransac/postmerge \
+  --segmentation-source sequential-ransac \
+  --enable-post-spectral-merge \
+  --post-merge-mode greedy \
+  --generate-viewer
+```
+
+The script name is retained for compatibility, but it is now source-agnostic:
+it operates on any predicted motion-part artifact. It tests nearby proposals
+against shared revolute/prismatic group models and emits a separate
+`motion_part_tracks_postmerge.json`; it never overwrites the RANSAC proposal
+artifact.
+
+### Threshold Guide
+
+The following parameters are intentionally exposed because their correct scale
+depends on depth noise, object size, motion excitation, and track density. They
+are not simulation GT priors.
+
+| Parameter | Default | Effect | Tuning guidance |
+| --- | ---: | --- | --- |
+| `--ransac-inlier-threshold-m` | `0.025` m | Maximum trimmed shared-SE(3) replay RMSE for a track to join a rigid proposal. | Start at `0.025`. Raise to `0.030-0.040` if one physical door is split by depth/track noise. Lower it if door and drawer merge. This alone cannot resolve over-segmentation; follow with group merge. |
+| `--ransac-assignment-threshold-m` | `0.050` m | Threshold for attaching ambiguous/leftover tracks to an extracted proposal. | Keep above the inlier threshold. Raising it improves coverage but can contaminate a clean proposal. |
+| `--ransac-min-inliers` | `12` tracks | Minimum consensus needed to instantiate another rigid proposal. | Raise to suppress tiny noise patches; lower only for genuinely small parts or sparse observations. |
+| `--ransac-max-models` | `8` | Maximum sequential proposals. | Set near the expected upper bound for visible moving parts plus a small margin. It is a safety cap, not a semantic part count. |
+| `--ransac-sample-size` | `4` tracks | Tracks used for each SE(3) hypothesis. | Keep `3-5`. Three is the geometric minimum; larger values reduce accidental hypotheses but are more sensitive to mixed samples. |
+| `--ransac-iterations` | `128` | Hypotheses evaluated for each extracted model. | Use `256` for dense refrigerator tracks; increase when consensus extraction is unstable, not as a substitute for better motion models. |
+| `--ransac-spatial-link-m` | `0.35` m | Reference-space locality for an inlier consensus component. | Raise for a large door whose valid tracks span a wide area. Lower if spatially distant, motion-similar regions are attached. |
+| `--static-motion-threshold-m` | `0.010` m | Tracks treated as confident base/static. | Keep conservative so hinge-adjacent moving tracks stay ambiguous rather than being permanently assigned to base. |
+| `--moving-motion-threshold-m` | `0.030` m | Tracks eligible for moving-proposal extraction. | Lower only when excitation is weak; otherwise low-motion base/hinge tracks become moving candidates. |
+| `--no-ransac-base-stabilize` | off | Disables base-frame stabilization. | Use only as a diagnostic when static base tracks are visibly contaminated; stabilization is usually preferred when camera/object global motion exists. |
+
+For `refrigerator045`, `0.025 m` is the safer current operating point: it
+preserves good joint geometry but produces fragmented proposals. `0.035 m`
+improves some coverage but can admit locally wrong joint explanations. The
+recommended approach is therefore `0.025 m` proposals followed by shared-joint
+merge, rather than using a large inlier threshold as the only cleanup mechanism.
 
 Legacy connected baseline:
 
@@ -461,6 +571,10 @@ The HTML viewer embeds the selected tracks and exposes browser-side controls:
 - `Color by`: switch between predicted cluster, GT part, and motion magnitude.
 - `Layers`: toggle trajectory trails, joint axes, and coordinate axes.
 
+`xyz_world` from the MuJoCo/SAPIEN recorder is already z-up, so the flow and
+PLY viewers preserve `x,y,z` by default. For an adapter that writes image-style
+y-down coordinates, explicitly add `--axis-remap x,z,-y`.
+
 This viewer is the preferred tool for checking whether a freezer/largest cluster
 contains mixed motion modes. PLY files remain useful as raw 3D debug exports,
 but the HTML viewer is better for point-flow inspection.
@@ -499,3 +613,302 @@ This is off by default. Use it for object-mask diagnostics where the selected
 anchor cluster may be more dynamic than the child cluster. The output joint
 metrics include `parent_orientation` with the parent/child motion scores and
 whether a flip was applied.
+
+## Frozen CoTracker Representation Probe
+
+The learning-based exploration path first tests whether CoTracker's frozen
+update-transformer tokens already separate physical parts. This is a
+simulation-only diagnostic and does not use GT labels during tracking.
+
+Export one L2-normalized, temporally pooled 384-D feature per emitted 3D track:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp track-part-pixels \
+  outputs/recordings/refrigerator039/episode.json \
+  --output-json outputs/recordings/refrigerator039/part_tracks_features.json \
+  --device mps \
+  --cotracker-repo co-tracker \
+  --cotracker-checkpoint co-tracker/ckpt/scaled_offline.pth \
+  --export-cotracker-features \
+  --cotracker-features-output outputs/recordings/refrigerator039/cotracker_features.npz
+```
+
+Probe same-part versus cross-part similarity and hidden-only clustering. The
+label field must come from simulator diagnostics and is never consumed by
+inference:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp probe-cotracker-features \
+  outputs/recordings/refrigerator039/part_tracks_features.json \
+  outputs/recordings/refrigerator039/cotracker_features.npz \
+  --label-field original_part_id \
+  --output-json outputs/recordings/refrigerator039/cotracker_feature_probe.json \
+  --output-embedding-csv outputs/recordings/refrigerator039/cotracker_feature_pca.csv
+```
+
+The probe reports same/cross-part cosine distributions, pairwise AUC, hidden-only
+cosine-k-means purity, mean GT coverage, ARI, and NMI. The PCA CSV is intended
+for plotting or interactive inspection.
+
+If the frozen representation is informative, it can be added as a bounded soft
+prior to the existing geometric kNN affinity:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp segment-motion-parts \
+  outputs/recordings/refrigerator039/part_tracks_features.json \
+  --mode knn-spectral \
+  --spectral-k 5 \
+  --cotracker-features-npz outputs/recordings/refrigerator039/cotracker_features.npz \
+  --learned-affinity-floor 0.7
+```
+
+This learned affinity is disabled by default. The multiplier is bounded to
+`[floor, 1]`, so the frozen representation can downweight a geometric edge but
+cannot create nonlocal edges or remove an edge outright. Compare it against the
+unchanged geometric baseline before considering a trainable affinity head.
+
+## Pairwise Affinity Head
+
+The trainable pairwise head predicts whether two local CoTracker tracks belong
+to the same rigid part. It combines frozen CoTracker descriptors with symmetric
+pair geometry and motion features. Training uses simulator-only
+`original_part_id` labels; inference does not consume GT part labels.
+
+Create a tab-separated manifest with one object per row:
+
+```text
+object_id	tracks_path	features_npz	split
+refrigerator038	/path/to/object_tracks.json	/path/to/cotracker_features.npz	train
+refrigerator039	/path/to/object_tracks.json	/path/to/cotracker_features.npz	val
+refrigerator040	/path/to/object_tracks.json	/path/to/cotracker_features.npz	test
+```
+
+The split must be object-level. Putting tracks from the same object in both
+training and evaluation measures memorization rather than generalization.
+
+Train and evaluate the local affinity model:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp train-pairwise-affinity \
+  configs/pairwise_affinity_manifest.tsv \
+  --output-dir outputs/pairwise_affinity \
+  --knn-k 12 \
+  --hard-mining-k 8 \
+  --max-positive-negative-ratio 2.0 \
+  --hard-negative-weight 2.0 \
+  --device mps
+
+PYTHONPATH=src python3 -m rgbd_urdf_mvp evaluate-pairwise-affinity \
+  configs/pairwise_affinity_manifest.tsv \
+  outputs/pairwise_affinity/pairwise_affinity.pt \
+  --split test \
+  --output-json outputs/pairwise_affinity/test_metrics.json \
+  --device mps
+```
+
+Training combines spatial neighbors with feature-similar and motion-similar
+cross-part hard negatives, plus spatially distant same-part hard positives.
+Positive pairs are downsampled when needed to enforce the configured class
+ratio. Simulator labels are used only to mine training pairs. The head scores
+only existing spatial kNN edges in the default inference path.
+
+Use the checkpoint as a bounded soft prior during spectral clustering:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp segment-motion-parts \
+  outputs/recordings/refrigerator040/object_tracks.json \
+  --mode knn-spectral \
+  --spectral-k 5 \
+  --cotracker-features-npz outputs/recordings/refrigerator040/cotracker_features.npz \
+  --pairwise-affinity-model outputs/pairwise_affinity/pairwise_affinity.pt \
+  --pairwise-affinity-floor 0.5 \
+  --diagnostics-json outputs/recordings/refrigerator040/pairwise_diagnostics.json
+```
+
+This path is experimental and disabled by default. A fixed spectral K still
+forces K clusters, so the affinity head can improve boundaries but cannot by
+itself solve model selection or remove over-segmented parts. Use a held-out
+object evaluation before enabling it in a production pipeline.
+
+To diagnose whether fixed-K spectral clustering is the bottleneck, the
+`learned-connected` mode scores every pair of moving-confident tracks and uses
+a probability threshold plus connected components to infer the part count:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp segment-motion-parts \
+  outputs/recordings/refrigerator040/object_tracks.json \
+  --mode learned-connected \
+  --cotracker-features-npz outputs/recordings/refrigerator040/cotracker_features.npz \
+  --pairwise-affinity-model outputs/pairwise_affinity/pairwise_affinity.pt \
+  --pairwise-connect-threshold 0.9 \
+  --output-json outputs/recordings/refrigerator040/motion_parts_learned_connected.json
+```
+
+This is a diagnostic rather than a recommended inference path. A model trained
+only on local kNN pairs may be poorly calibrated on dense nonlocal pairs, and a
+single false-positive bridge can merge two complete parts under connected
+components. Train with nonlocal hard negatives and evaluate on held-out objects
+before interpreting this mode as a learned part-count estimator.
+
+The safer hybrid experiment uses learned affinity only to propose coherent
+minimal samples for sequential RANSAC. Shared-SE(3) replay remains the final
+inlier criterion and no fixed K is required:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp segment-motion-parts \
+  outputs/recordings/refrigerator040/object_tracks.json \
+  --mode sequential-ransac \
+  --cotracker-features-npz outputs/recordings/refrigerator040/cotracker_features.npz \
+  --pairwise-affinity-model outputs/pairwise_affinity/pairwise_affinity.pt \
+  --ransac-learned-seed \
+  --output-json outputs/recordings/refrigerator040/motion_parts_learned_ransac.json
+```
+
+Always compare this against both unmodified sequential RANSAC and the
+learned-affinity kNN-spectral path. The flag is disabled by default.
+
+## DETR-Style Motion-Part Slots
+
+The slot path predicts an episode-local rigid object ID for every track. Slot
+IDs are permutation invariant: Hungarian matching aligns predicted slots with
+simulator `original_part_id` labels during training. Each slot is additionally
+regularized by differentiable weighted Kabsch replay, so tracks assigned to one
+slot are encouraged to share a per-frame SE(3). New training defaults address
+the common giant-slot failure with six complementary mechanisms:
+
+- inverse-part-frequency assignment loss;
+- matched-slot Dice loss and spatial hard-negative pairwise loss;
+- object-scale-normalized rigid replay;
+- canonical object geometry plus shared rigid/noise augmentation;
+- part-stratified track dropout;
+- topology-balanced episode sampling for rare multi-part objects.
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp train-motion-part-slots \
+  configs/pairwise_affinity_manifest.tsv \
+  --output-dir outputs/motion_part_slots \
+  --max-slots 8 \
+  --epochs 100 \
+  --rigid-loss-weight 0.2 \
+  --dice-loss-weight 0.5 \
+  --pairwise-loss-weight 0.35 \
+  --device mps
+
+PYTHONPATH=src python3 -m rgbd_urdf_mvp infer-motion-part-slots \
+  outputs/recordings/refrigerator040/object_tracks.json \
+  outputs/recordings/refrigerator040/cotracker_features.npz \
+  outputs/motion_part_slots/motion_part_slots.pt \
+  --output-json outputs/recordings/refrigerator040/motion_part_tracks_slots.json \
+  --slot-existence-threshold 0.5 \
+  --device mps
+```
+
+Inference uses the learned slot-existence logits to suppress inactive slots.
+The output includes `slot_segmentation_evaluation` when simulator
+`original_part_id` is available. Prefer its one-to-one Hungarian mIoU/F1,
+pairwise same-part F1, GT collision count, and over/under-segmentation counts.
+Independent per-GT best-cluster coverage can reuse one giant predicted cluster
+for several GT parts and must not be used as the primary slot metric.
+
+Post-RANSAC refinement is conservative: it keeps a model assignment unless a
+different slot's rigid replay residual is substantially lower. The initial slot
+ID and confidence remain in every output track for before/after diagnostics.
+Use object-held-out splits; same-object training only validates implementation.
+
+# TAPIP3D Remote Tracking Experiment
+
+TAPIP3D is CUDA-only in its reference implementation (`xformers`, `torch-scatter`, and custom point operators). The local project therefore prepares the recorded RGB-D sequence and imports remote results; it does not attempt to run TAPIP3D on macOS/MPS.
+
+Prepare one camera view with the exact existing object-mask seed tracks, then copy the NPZ to a CUDA TAPIP3D checkout:
+
+```bash
+PYTHONPATH=src ./.venv/bin/python -m rgbd_urdf_mvp prepare-tapip3d-input \
+  outputs/recordings_refrigerators_staged_dense_mps/refrigerator038/episode.json \
+  --view-index 0 --frame-stride 4 \
+  --seed-tracks outputs/flow_tracking_eval/refrigerators_dense_mps_object_mask/refrigerator038/object_tracks.json \
+  --output-npz /tmp/refrigerator038_view0_tapip3d.npz
+```
+
+On the CUDA host, run the official TAPIP3D inference with that NPZ. It preserves the supplied `query_point` values and ignores the additional project-only `track_ids` key:
+
+```bash
+python inference.py --input_path refrigerator038_view0_tapip3d.npz \
+  --checkpoint checkpoints/tapip3d_final.pth --device cuda --resolution_factor 2
+```
+
+Export the frozen TAPIP3D UpdateFormer tokens immediately before the flow head,
+then copy the output NPZ back. The exporter reruns inference with a forward hook
+because the reference result NPZ stores trajectories but not internal tokens. It
+stores per-timestep tokens plus an L2-normalized concatenation of temporal mean,
+standard deviation, and endpoint delta. The output keeps the same `track_ids` /
+`embeddings` contract as the CoTracker probe input:
+
+```bash
+python /path/to/articulated_dynamics_learning/scripts/export_tapip3d_encoder_features.py \
+  --tapip-root . --input refrigerator038_view0_tapip3d.npz \
+  --result outputs/inference/.../refrigerator038_view0_tapip3d.result.npz \
+  --checkpoint checkpoints/tapip3d_final.pth \
+  --output tapip3d_updateformer_features.npz
+```
+
+Import TAPIP3D's `coords` / `visibs` world trajectories into the existing pose, segmentation, joint, and feature-probe paths:
+
+```bash
+PYTHONPATH=src ./.venv/bin/python -m rgbd_urdf_mvp import-tapip3d-tracks \
+  /tmp/refrigerator038_view0_tapip3d.npz remote/refrigerator038_view0_tapip3d.result.npz \
+  outputs/flow_tracking_eval/refrigerators_dense_mps_object_mask/refrigerator038/object_tracks.json \
+  --output-json outputs/tapip3d/refrigerator038_view0_tracks.json
+
+PYTHONPATH=src ./.venv/bin/python -m rgbd_urdf_mvp probe-track-features \
+  outputs/tapip3d/refrigerator038_view0_tracks.json remote/tapip3d_encoder_features.npz \
+  --output-json outputs/tapip3d/refrigerator038_view0_feature_probe.json
+```
+
+The single-view commands above are adapter smoke tests. The production
+CoTracker path runs each camera independently, lifts tracks into the shared
+world frame, and then concatenates all views. TAPIP3D comparisons must use the
+same protocol. Prepare, infer, export, and import each view separately, then
+merge them before segmentation or representation learning:
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp merge-tapip3d-views \
+  outputs/tapip3d/view0_tracks.json \
+  outputs/tapip3d/view1_tracks.json \
+  outputs/tapip3d/view2_tracks.json \
+  --output-tracks outputs/tapip3d/multiview_tracks.json \
+  --features outputs/tapip3d/view0_tokens.npz \
+             outputs/tapip3d/view1_tokens.npz \
+             outputs/tapip3d/view2_tokens.npz \
+  --output-features outputs/tapip3d/multiview_updateformer_features.npz
+```
+
+This merge does not deduplicate cross-view observations. Each camera supplies
+independent tracks with globally unique IDs; their trajectories are comparable
+because TAPIP3D predicts them in the same world frame.
+
+## Per-Track Slot Head
+
+Pairwise affinity supervises graph edges but does not force all observations of
+one physical part to share one identity. The experimental track-slot head
+instead predicts a part slot for every track. Hungarian matching aligns slots
+with simulator part labels independently for each training object, so raw GT
+part IDs do not need to be consistent across objects.
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp train-track-slot-head \
+  configs/track_slot_cotracker_refrigerators_038_040.tsv \
+  --output-dir outputs/track_slot_head \
+  --max-slots 8 --device mps
+
+PYTHONPATH=src python3 -m rgbd_urdf_mvp predict-track-slots \
+  path/to/object_tracks.json path/to/features.npz \
+  outputs/track_slot_head/track_slot_head.pt \
+  --output-json outputs/track_slot_head/predicted_slots.json \
+  --output-viewer outputs/track_slot_head/viewer_slots.html \
+  --device mps
+```
+
+Prediction generates the interactive flow viewer by default. Use `--no-viewer`
+only for non-debug batch runs. The current head uses inverse-frequency slot CE
+to prevent the static base from collapsing smaller moving parts, plus a
+balanced pairwise partition loss as an auxiliary objective.
