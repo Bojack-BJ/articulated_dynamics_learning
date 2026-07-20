@@ -15,10 +15,16 @@ class ObjectMaskFlowHtmlConfig:
     output_html: str | Path | None = None
     joint_inference: str | Path | None = None
     evaluation_json: str | Path | None = None
+    background_fusion_manifest: str | Path | None = None
+    background_max_points: int = 3000
+    mjcf_replay_episode: str | Path | None = None
+    mjcf_mesh_opacity: float = 0.22
     max_tracks: int = 1000
     frame_stride: int = 2
     trail_length: int = 10
-    axis_remap: str = "x,z,-y"
+    # Lifted MuJoCo/SAPIEN tracks are already expressed in a z-up world frame.
+    # Image-style coordinates can still request x,z,-y explicitly through the CLI.
+    axis_remap: str = "x,y,z"
     color_by: str = "pred_cluster"
 
 
@@ -44,6 +50,21 @@ class ObjectMaskFlowHtmlBuilder:
         if not frames:
             raise ValueError("No visible track samples found for object-mask flow HTML visualization.")
 
+        sampled_source_frames = artifact.get("sampled_frame_indices", [])
+        background_frames = _background_frame_payload(
+            config.background_fusion_manifest,
+            frames=frames,
+            sampled_source_frames=sampled_source_frames,
+            max_points=max(1, int(config.background_max_points)),
+            transform=transform,
+        )
+        mjcf_replay = _mjcf_replay_payload(
+            config.mjcf_replay_episode,
+            frames=frames,
+            sampled_source_frames=sampled_source_frames,
+            transform=transform,
+            opacity=float(config.mjcf_mesh_opacity),
+        )
         payload = {
             "source": "object-mask-flow-html",
             "motion_tracks": str(tracks_path),
@@ -73,6 +94,8 @@ class ObjectMaskFlowHtmlBuilder:
             else "pred_cluster",
             "tracks": [_track_payload(track, transform=transform) for track in tracks],
             "frame_indices": frames,
+            "background_frames": background_frames,
+            "mjcf_replay": mjcf_replay,
             "bounds": _bounds(tracks, transform=transform),
             "joints": _joint_payload(config.joint_inference, config.evaluation_json, transform=transform),
             "metadata": {
@@ -80,6 +103,12 @@ class ObjectMaskFlowHtmlBuilder:
                 "track_count_embedded": len(tracks),
                 "max_tracks": max(1, int(config.max_tracks)),
                 "has_original_part_id": any("original_part_id" in track for track in tracks),
+                "background_fusion_manifest": str(Path(config.background_fusion_manifest).expanduser().resolve())
+                if config.background_fusion_manifest is not None
+                else None,
+                "mjcf_replay_episode": str(Path(config.mjcf_replay_episode).expanduser().resolve())
+                if config.mjcf_replay_episode is not None
+                else None,
             },
         }
         output_html.write_text(_build_html(payload), encoding="utf-8")
@@ -268,6 +297,195 @@ def _joint_payload(
     return out
 
 
+def _background_frame_payload(
+    manifest_path: str | Path | None,
+    *,
+    frames: list[int],
+    sampled_source_frames: Any,
+    max_points: int,
+    transform: _AxisRemap,
+) -> dict[str, dict[str, Any]]:
+    if manifest_path is None:
+        return {}
+    resolved_manifest = Path(manifest_path).expanduser().resolve()
+    manifest = load_json(resolved_manifest)
+    per_frame_dir = Path(manifest.get("per_frame_dir", ""))
+    if not per_frame_dir.is_absolute():
+        per_frame_dir = (resolved_manifest.parent / per_frame_dir).resolve()
+    if not per_frame_dir.is_dir():
+        raise FileNotFoundError(f"Background fusion per-frame directory does not exist: {per_frame_dir}")
+
+    source_indices = [int(value) for value in sampled_source_frames] if isinstance(sampled_source_frames, list) else []
+    payload: dict[str, dict[str, Any]] = {}
+    for frame_index in frames:
+        source_frame = source_indices[frame_index] if 0 <= frame_index < len(source_indices) else frame_index
+        frame_path = per_frame_dir / f"frame_{source_frame:04d}.ply"
+        if not frame_path.exists():
+            continue
+        points = _read_ascii_xyz_ply(frame_path)
+        stride = max(1, math.ceil(len(points) / max_points))
+        selected = [transform.point(point) for point in points[::stride][:max_points]]
+        payload[str(frame_index)] = {
+            "source_frame_index": source_frame,
+            "xyz": selected,
+        }
+    return payload
+
+
+def _read_ascii_xyz_ply(path: Path) -> list[list[float]]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not lines or lines[0].strip() != "ply":
+        raise ValueError(f"Expected ASCII PLY: {path}")
+    properties: list[str] = []
+    vertex_count = 0
+    data_start: int | None = None
+    in_vertex = False
+    for index, line in enumerate(lines[1:], start=1):
+        fields = line.split()
+        if not fields:
+            continue
+        if fields[0] == "format" and fields[1] != "ascii":
+            raise ValueError(f"Background PLY must be ASCII: {path}")
+        if fields[0] == "element":
+            in_vertex = fields[1] == "vertex"
+            if in_vertex:
+                vertex_count = int(fields[2])
+        elif fields[0] == "property" and in_vertex:
+            properties.append(fields[-1])
+        elif fields[0] == "end_header":
+            data_start = index + 1
+            break
+    if data_start is None:
+        raise ValueError(f"PLY has no end_header: {path}")
+    indices = {name: index for index, name in enumerate(properties)}
+    if not {"x", "y", "z"}.issubset(indices):
+        raise ValueError(f"PLY lacks xyz properties: {path}")
+    points: list[list[float]] = []
+    for line in lines[data_start : data_start + vertex_count]:
+        values = line.split()
+        if len(values) < len(properties):
+            continue
+        points.append([float(values[indices[axis]]) for axis in ("x", "y", "z")])
+    return points
+
+
+def _mjcf_replay_payload(
+    episode_path: str | Path | None,
+    *,
+    frames: list[int],
+    sampled_source_frames: Any,
+    transform: _AxisRemap,
+    opacity: float,
+) -> dict[str, Any] | None:
+    if episode_path is None:
+        return None
+    try:
+        import mujoco
+    except ImportError as exc:  # pragma: no cover - optional runtime dependency
+        raise RuntimeError("MJCF replay visualization requires the mujoco Python package.") from exc
+
+    resolved_episode = Path(episode_path).expanduser().resolve()
+    episode = load_json(resolved_episode)
+    metadata = episode.get("metadata", {})
+    model_value = metadata.get("model_path")
+    if not model_value:
+        raise ValueError(f"Episode metadata has no model_path for MJCF replay: {resolved_episode}")
+    model_path = Path(model_value).expanduser()
+    if not model_path.is_absolute():
+        model_path = (resolved_episode.parent / model_path).resolve()
+    model = mujoco.MjModel.from_xml_path(str(model_path))
+    data = mujoco.MjData(model)
+
+    hidden_geom_ids = {int(value) for value in metadata.get("hidden_clear_geom_ids", [])}
+    target_geom_ids = {int(value) for value in metadata.get("target_geom_ids", [])}
+    geom_ids = [
+        geom_id
+        for geom_id in range(model.ngeom)
+        if int(model.geom_dataid[geom_id]) >= 0
+        and geom_id not in hidden_geom_ids
+        and (not target_geom_ids or geom_id in target_geom_ids)
+    ]
+    palette = ["#64748b", "#38bdf8", "#f59e0b", "#34d399", "#f472b6", "#a78bfa"]
+    geometries: list[dict[str, Any]] = []
+    for payload_id, geom_id in enumerate(geom_ids):
+        mesh_id = int(model.geom_dataid[geom_id])
+        vertex_start = int(model.mesh_vertadr[mesh_id])
+        vertex_count = int(model.mesh_vertnum[mesh_id])
+        face_start = int(model.mesh_faceadr[mesh_id])
+        face_count = int(model.mesh_facenum[mesh_id])
+        vertices = model.mesh_vert[vertex_start : vertex_start + vertex_count]
+        faces = model.mesh_face[face_start : face_start + face_count]
+        body_id = int(model.geom_bodyid[geom_id])
+        body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or f"body_{body_id}"
+        geometries.append(
+            {
+                "payload_id": payload_id,
+                "geom_id": geom_id,
+                "body_id": body_id,
+                "name": body_name,
+                "vertices": [[float(value) for value in vertex] for vertex in vertices],
+                "faces": [[int(value) for value in face] for face in faces],
+                "color": palette[payload_id % len(palette)],
+            }
+        )
+
+    source_indices = [int(value) for value in sampled_source_frames] if isinstance(sampled_source_frames, list) else []
+    episode_frames = episode.get("frames", [])
+    target_joint_name = metadata.get("joint_name")
+    target_joint_id = (
+        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, str(target_joint_name))
+        if target_joint_name
+        else -1
+    )
+    frame_payload: dict[str, list[dict[str, Any]]] = {}
+    for frame_index in frames:
+        source_frame = source_indices[frame_index] if 0 <= frame_index < len(source_indices) else frame_index
+        data.qpos[:] = model.qpos0
+        if 0 <= source_frame < len(episode_frames):
+            episode_frame = episode_frames[source_frame]
+            joint_positions = episode_frame.get("action_log", {}).get("joint_positions", {})
+            applied_joint_count = 0
+            if isinstance(joint_positions, dict):
+                for joint_name, joint_position in joint_positions.items():
+                    joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, str(joint_name))
+                    if joint_id < 0 or joint_position is None:
+                        continue
+                    data.qpos[int(model.jnt_qposadr[joint_id])] = float(joint_position)
+                    applied_joint_count += 1
+            # Older recordings only stored the selected joint's scalar hint.
+            if applied_joint_count == 0 and target_joint_id >= 0:
+                hint = episode_frame.get("joint_position_hint")
+                if hint is not None:
+                    data.qpos[int(model.jnt_qposadr[target_joint_id])] = float(hint)
+        mujoco.mj_forward(model, data)
+        transforms: list[dict[str, Any]] = []
+        for payload_id, geom_id in enumerate(geom_ids):
+            world_rotation = data.geom_xmat[geom_id].reshape(3, 3)
+            # Axis remapping acts on world coordinates, so remap each output
+            # column of the geom-local-to-world rotation.
+            remapped_rotation = [transform.vector([float(value) for value in world_rotation[:, column]]) for column in range(3)]
+            rotation_rows = [[remapped_rotation[column][row] for column in range(3)] for row in range(3)]
+            transforms.append(
+                {
+                    "payload_id": payload_id,
+                    "position": transform.point([float(value) for value in data.geom_xpos[geom_id]]),
+                    "rotation": rotation_rows,
+                }
+            )
+        frame_payload[str(frame_index)] = transforms
+
+    return {
+        "episode_path": str(resolved_episode),
+        "model_path": str(model_path.resolve()),
+        "target_joint_name": target_joint_name,
+        "joint_state_source": "action_log.joint_positions; joint_position_hint fallback for legacy episodes",
+        "simulation_only_gt": True,
+        "opacity": max(0.0, min(1.0, opacity)),
+        "geometries": geometries,
+        "frames": frame_payload,
+    }
+
+
 def _build_html(payload: dict[str, Any]) -> str:
     data_json = json.dumps(payload, separators=(",", ":"))
     return f"""<!DOCTYPE html>
@@ -361,6 +579,8 @@ def _build_html(payload: dict[str, Any]) -> str:
     <div class="panel checks">
       <label>Layers</label>
       <div class="checkline"><input id="showTrails" type="checkbox" checked /> <span>Show trails</span></div>
+      <div class="checkline"><input id="showBackground" type="checkbox" checked /> <span>Show RGB-D geometry</span></div>
+      <div class="checkline"><input id="showMjcfMesh" type="checkbox" checked /> <span>Show GT MJCF mesh replay</span></div>
       <div class="checkline"><input id="showJoints" type="checkbox" checked /> <span>Show joint axes</span></div>
       <div class="checkline"><input id="showAxes" type="checkbox" checked /> <span>Show coordinate axes</span></div>
       <div class="checkline"><input id="hideLowQualityTimesteps" type="checkbox" /> <span>Hide low-quality timesteps</span></div>
@@ -375,6 +595,8 @@ const DATA = {data_json};
 const tracks = DATA.tracks || [];
 const frameIndices = DATA.frame_indices || [];
 const joints = DATA.joints || [];
+const backgroundFrames = DATA.background_frames || {{}};
+const mjcfReplay = DATA.mjcf_replay || null;
 const bounds = DATA.bounds || {{lower: [-1,-1,-1], upper: [1,1,1]}};
 const metadata = DATA.metadata || {{}};
 const frameSlider = document.getElementById("frameSlider");
@@ -387,10 +609,15 @@ const colorBySelect = document.getElementById("colorBySelect");
 const qualityThresholdSlider = document.getElementById("qualityThresholdSlider");
 const qualityThresholdValue = document.getElementById("qualityThresholdValue");
 const showTrails = document.getElementById("showTrails");
+const showBackground = document.getElementById("showBackground");
+const showMjcfMesh = document.getElementById("showMjcfMesh");
 const showJoints = document.getElementById("showJoints");
 const showAxes = document.getElementById("showAxes");
 const hideLowQualityTimesteps = document.getElementById("hideLowQualityTimesteps");
 const meta = document.getElementById("meta");
+const plot = document.getElementById("plot");
+let savedCamera = null;
+let cameraListenerAttached = false;
 
 frameSlider.max = Math.max(0, frameIndices.length - 1);
 trackCountSlider.max = Math.max(1, tracks.length);
@@ -404,6 +631,8 @@ meta.innerHTML = `
   <div class="row"><span>Frames</span><strong>${{frameIndices.length}}</strong></div>
   <div class="row"><span>Axis remap</span><strong>${{DATA.axis_remap}}</strong></div>
   <div class="row"><span>Source</span><strong>${{DATA.motion_tracks}}</strong></div>
+  <div class="row"><span>RGB-D geometry</span><strong>${{metadata.background_fusion_manifest || "not embedded"}}</strong></div>
+  <div class="row"><span>GT MJCF replay</span><strong>${{metadata.mjcf_replay_episode || "not embedded"}}</strong></div>
 `;
 
 function palette(index) {{
@@ -584,26 +813,94 @@ function percentileRange(values, lowQ, highQ, fallbackMin, fallbackMax) {{
   return {{min: low, max: high}};
 }}
 
-function buildPointTrace(activeTracks, frameIndex, colorBy, scalarRangePayload, qualityThreshold, hideLowQuality) {{
+function buildPointTraces(activeTracks, frameIndex, colorBy, scalarRangePayload, qualityThreshold, hideLowQuality) {{
   const maxMotion = Math.max(1e-12, ...activeTracks.map((track) => Number(track.motion_m || 0)));
-  const x = [], y = [], z = [], colors = [], hover = [];
+  const grouped = colorBy === "pred_cluster" || colorBy === "gt_part";
+  const groups = new Map();
   for (const track of activeTracks) {{
     const sample = sampleAtFrame(track, frameIndex);
     if (!sample) continue;
     if (hideLowQuality && sample.timestep_quality !== null && sample.timestep_quality !== undefined && Number(sample.timestep_quality) < qualityThreshold) continue;
-    x.push(sample.xyz[0]); y.push(sample.xyz[1]); z.push(sample.xyz[2]);
-    colors.push(sampleColor(track, sample, colorBy, maxMotion, scalarRangePayload));
-    hover.push(`track=${{track.track_id}}<br>pred=${{track.pred_cluster}}<br>gt=${{track.gt_part}}<br>motion=${{Number(track.motion_m || 0).toFixed(4)}} m<br>track_q=${{track.track_quality ?? "n/a"}}<br>best_motion_type=${{track.best_motion_type ?? "n/a"}}<br>articulation_score=${{track.articulation_score ?? "n/a"}}<br>timestep_q=${{sample.timestep_quality ?? "n/a"}}<br>step=${{sample.step_length_m ?? "n/a"}}<br>step_score=${{sample.step_outlier_score ?? "n/a"}}<br>accel=${{sample.acceleration_m ?? "n/a"}}<br>accel_score=${{sample.acceleration_outlier_score ?? "n/a"}}<br>smooth_residual=${{sample.smooth_residual_m ?? "n/a"}}<br>dir_change=${{sample.direction_change_deg ?? "n/a"}}<br>rigid_residual=${{sample.rigid_residual_m ?? "n/a"}}<br>articulation_residual=${{sample.articulation_residual_m ?? "n/a"}}<br>motion_model=${{sample.motion_model_type ?? "n/a"}}<br>frame=${{sample.frame_index}}`);
+    const key = grouped ? Number(colorBy === "gt_part" ? track.gt_part : track.pred_cluster) : "all";
+    if (!groups.has(key)) groups.set(key, {{x: [], y: [], z: [], colors: [], hover: []}});
+    const group = groups.get(key);
+    group.x.push(sample.xyz[0]); group.y.push(sample.xyz[1]); group.z.push(sample.xyz[2]);
+    group.colors.push(sampleColor(track, sample, colorBy, maxMotion, scalarRangePayload));
+    group.hover.push(`track=${{track.track_id}}<br>pred=${{track.pred_cluster}}<br>gt=${{track.gt_part}}<br>motion=${{Number(track.motion_m || 0).toFixed(4)}} m<br>track_q=${{track.track_quality ?? "n/a"}}<br>best_motion_type=${{track.best_motion_type ?? "n/a"}}<br>articulation_score=${{track.articulation_score ?? "n/a"}}<br>timestep_q=${{sample.timestep_quality ?? "n/a"}}<br>step=${{sample.step_length_m ?? "n/a"}}<br>step_score=${{sample.step_outlier_score ?? "n/a"}}<br>accel=${{sample.acceleration_m ?? "n/a"}}<br>accel_score=${{sample.acceleration_outlier_score ?? "n/a"}}<br>smooth_residual=${{sample.smooth_residual_m ?? "n/a"}}<br>dir_change=${{sample.direction_change_deg ?? "n/a"}}<br>rigid_residual=${{sample.rigid_residual_m ?? "n/a"}}<br>articulation_residual=${{sample.articulation_residual_m ?? "n/a"}}<br>motion_model=${{sample.motion_model_type ?? "n/a"}}<br>frame=${{sample.frame_index}}`);
   }}
-  return {{
+  const clusterCounts = new Map();
+  if (grouped) {{
+    for (const track of activeTracks) {{
+      const key = Number(colorBy === "gt_part" ? track.gt_part : track.pred_cluster);
+      clusterCounts.set(key, (clusterCounts.get(key) || 0) + 1);
+    }}
+  }}
+  return [...groups.entries()].map(([key, group]) => ({{
+      type: "scatter3d",
+      mode: "markers",
+      name: grouped
+        ? `${{colorBy === "gt_part" ? "GT part" : "motion_part"}}_${{key}} (${{clusterCounts.get(key) || 0}} tracks)`
+        : "current points",
+      x: group.x, y: group.y, z: group.z,
+      text: group.hover,
+      hoverinfo: "text",
+      marker: {{ size: 3.2, color: group.colors, opacity: 0.9 }},
+  }}));
+}}
+
+function buildBackgroundTrace(frameIndex) {{
+  if (!showBackground.checked) return [];
+  const frame = backgroundFrames[String(frameIndex)];
+  if (!frame || !frame.xyz || !frame.xyz.length) return [];
+  return [{{
     type: "scatter3d",
     mode: "markers",
-    name: "current points",
-    x, y, z,
-    text: hover,
-    hoverinfo: "text",
-    marker: {{ size: 3.2, color: colors, opacity: 0.9 }},
-  }};
+    name: `RGB-D geometry (source frame ${{frame.source_frame_index}})`,
+    x: frame.xyz.map((point) => point[0]),
+    y: frame.xyz.map((point) => point[1]),
+    z: frame.xyz.map((point) => point[2]),
+    marker: {{size: 2.2, color: "#cbd5e1", opacity: 0.38}},
+    hoverinfo: "skip",
+  }}];
+}}
+
+function transformMeshVertices(vertices, transform) {{
+  const rotation = transform.rotation;
+  const position = transform.position;
+  const x = [], y = [], z = [];
+  for (const vertex of vertices) {{
+    x.push(position[0] + rotation[0][0] * vertex[0] + rotation[0][1] * vertex[1] + rotation[0][2] * vertex[2]);
+    y.push(position[1] + rotation[1][0] * vertex[0] + rotation[1][1] * vertex[1] + rotation[1][2] * vertex[2]);
+    z.push(position[2] + rotation[2][0] * vertex[0] + rotation[2][1] * vertex[1] + rotation[2][2] * vertex[2]);
+  }}
+  return {{x, y, z}};
+}}
+
+function buildMjcfMeshTraces(frameIndex) {{
+  if (!showMjcfMesh.checked || !mjcfReplay) return [];
+  const frameTransforms = mjcfReplay.frames[String(frameIndex)] || [];
+  const transformsById = new Map(frameTransforms.map((item) => [Number(item.payload_id), item]));
+  const traces = [];
+  for (const geometry of mjcfReplay.geometries || []) {{
+    const transform = transformsById.get(Number(geometry.payload_id));
+    if (!transform) continue;
+    const vertices = transformMeshVertices(geometry.vertices, transform);
+    traces.push({{
+      type: "mesh3d",
+      name: `GT mesh: ${{geometry.name}}`,
+      x: vertices.x,
+      y: vertices.y,
+      z: vertices.z,
+      i: geometry.faces.map((face) => face[0]),
+      j: geometry.faces.map((face) => face[1]),
+      k: geometry.faces.map((face) => face[2]),
+      color: geometry.color,
+      opacity: Number(mjcfReplay.opacity || 0.22),
+      flatshading: true,
+      hovertemplate: `${{geometry.name}}<br>simulation-only GT mesh<extra></extra>`,
+    }});
+  }}
+  return traces;
 }}
 
 function shouldHideSample(sample, qualityThreshold, hideLowQuality) {{
@@ -658,14 +955,27 @@ function buildTrailTraces(activeTracks, frameIndex, colorBy, trailLength, scalar
   return traces;
 }}
 
-function buildJointTraces(activeTracks, colorBy) {{
+function childCentroidAtFrame(joint, activeTracks, frameIndex) {{
+  const childId = Number(joint.child_part_id);
+  const points = [];
+  for (const track of activeTracks) {{
+    if (Number(track.pred_cluster) !== childId) continue;
+    const sample = sampleAtFrame(track, frameIndex);
+    if (sample) points.push(sample.xyz);
+  }}
+  if (!points.length) return null;
+  return [0, 1, 2].map((dim) => points.reduce((sum, point) => sum + Number(point[dim]), 0) / points.length);
+}}
+
+function buildJointTraces(activeTracks, frameIndex, colorBy) {{
   if (!showJoints.checked) return [];
   const traces = [];
   for (const joint of joints) {{
     const p = joint.pivot || [0,0,0];
     const a = joint.axis || [0,0,1];
     const color = jointColor(joint, activeTracks, colorBy);
-    const segment = clippedAxisSegment(p, a);
+    const childCentroid = childCentroidAtFrame(joint, activeTracks, frameIndex);
+    const segment = clippedAxisSegment(p, a, childCentroid, joint.joint_type);
     const start = segment.start;
     const end = segment.end;
     const nearest = segment.nearest;
@@ -678,10 +988,11 @@ function buildJointTraces(activeTracks, colorBy) {{
       z: [start[2], nearest[2], end[2]],
       line: {{ color, width: 8 }},
       marker: {{ size: [2, 5, 2], color: [color, "#ffffff", color] }},
-      text: [`${{joint.name}} axis<br>child=${{joint.child_part_id}}`, `${{joint.name}} axis near object<br>pivot=[${{p.map((v) => Number(v).toFixed(3)).join(", ")}}]<br>child=${{joint.child_part_id}}<br>type=${{joint.joint_type}}<br>axis_err=${{joint.axis_error_deg ?? "n/a"}}<br>pivot_err=${{joint.pivot_error_m ?? "n/a"}}`, `${{joint.name}} axis<br>child=${{joint.child_part_id}}`],
+      text: [`${{joint.name}} axis<br>child=${{joint.child_part_id}}`, `${{joint.name}} display anchor<br>anchor=[${{nearest.map((v) => Number(v).toFixed(3)).join(", ")}}]<br>estimated_pivot=[${{p.map((v) => Number(v).toFixed(3)).join(", ")}}]<br>child=${{joint.child_part_id}}<br>type=${{joint.joint_type}}<br>axis_err=${{joint.axis_error_deg ?? "n/a"}}<br>pivot_err=${{joint.pivot_error_m ?? "n/a"}}`, `${{joint.name}} axis<br>child=${{joint.child_part_id}}`],
       hoverinfo: "text",
     }});
-    traces.push({{
+    // A prismatic joint has a direction but no unique pivot/axis-line position.
+    if (joint.joint_type === "revolute") traces.push({{
       type: "scatter3d",
       mode: "markers",
       name: `${{joint.name || "joint"}} pivot`,
@@ -697,7 +1008,7 @@ function buildJointTraces(activeTracks, colorBy) {{
   return traces;
 }}
 
-function clippedAxisSegment(pivot, axis) {{
+function clippedAxisSegment(pivot, axis, childCentroid, jointType) {{
   const center = [
     0.5 * (bounds.lower[0] + bounds.upper[0]),
     0.5 * (bounds.lower[1] + bounds.upper[1]),
@@ -712,9 +1023,18 @@ function clippedAxisSegment(pivot, axis) {{
   const len = 0.95 * diagonal;
   const axisNorm = Math.max(1e-9, Math.hypot(axis[0], axis[1], axis[2]));
   const unit = [axis[0] / axisNorm, axis[1] / axisNorm, axis[2] / axisNorm];
-  const centerDelta = [center[0] - pivot[0], center[1] - pivot[1], center[2] - pivot[2]];
-  const t = centerDelta[0] * unit[0] + centerDelta[1] * unit[1] + centerDelta[2] * unit[2];
-  const nearest = [pivot[0] + t * unit[0], pivot[1] + t * unit[1], pivot[2] + t * unit[2]];
+  const anchor = childCentroid || center;
+  let nearest;
+  if (jointType === "prismatic") {{
+    // Direction is the only geometrically meaningful quantity for a slider.
+    nearest = [...anchor];
+  }} else {{
+    // Preserve the inferred revolute line, but display the finite segment at
+    // the point on that line nearest to the child part.
+    const anchorDelta = [anchor[0] - pivot[0], anchor[1] - pivot[1], anchor[2] - pivot[2]];
+    const t = anchorDelta[0] * unit[0] + anchorDelta[1] * unit[1] + anchorDelta[2] * unit[2];
+    nearest = [pivot[0] + t * unit[0], pivot[1] + t * unit[1], pivot[2] + t * unit[2]];
+  }}
   return {{
     start: [nearest[0] - 0.5 * len * unit[0], nearest[1] - 0.5 * len * unit[1], nearest[2] - 0.5 * len * unit[2]],
     nearest,
@@ -736,7 +1056,51 @@ function buildAxisTraces() {{
   ];
 }}
 
+function pointCloudAspectRatio() {{
+  // Use only point-cloud bounds. Plotly's "data" mode also considers long
+  // joint-axis overlays, which can visually stretch an otherwise metric scene.
+  const spans = [
+    Math.max(1e-6, bounds.upper[0] - bounds.lower[0]),
+    Math.max(1e-6, bounds.upper[1] - bounds.lower[1]),
+    Math.max(1e-6, bounds.upper[2] - bounds.lower[2]),
+  ];
+  const longest = Math.max(...spans);
+  return {{x: spans[0] / longest, y: spans[1] / longest, z: spans[2] / longest}};
+}}
+
+function cloneCamera(camera) {{
+  if (!camera) return null;
+  // Plotly mutates layout objects in place. Keep an immutable snapshot so a
+  // later react() call cannot reuse a partially updated camera object.
+  return JSON.parse(JSON.stringify(camera));
+}}
+
+function captureCameraFromPlot() {{
+  const camera = plot.layout && plot.layout.scene && plot.layout.scene.camera;
+  if (camera) savedCamera = cloneCamera(camera);
+}}
+
+function preserveCamera(event) {{
+  if (event && event["scene.camera"]) savedCamera = cloneCamera(event["scene.camera"]);
+  else captureCameraFromPlot();
+}}
+
+function attachCameraListener() {{
+  if (!cameraListenerAttached && typeof plot.on === "function") {{
+    plot.on("plotly_relayout", preserveCamera);
+    cameraListenerAttached = true;
+  }}
+}}
+
+function currentCamera() {{
+  captureCameraFromPlot();
+  return cloneCamera(savedCamera) || undefined;
+}}
+
 function render() {{
+  // Sidebar input can fire before Plotly emits plotly_relayout after a drag.
+  // Read the live layout first so frame/color/layer updates retain the view.
+  captureCameraFromPlot();
   const framePosition = Number(frameSlider.value);
   const frameIndex = Number(frameIndices[framePosition] || 0);
   const trackCount = Math.min(Number(trackCountSlider.value), tracks.length);
@@ -751,9 +1115,11 @@ function render() {{
   trailValue.textContent = `${{trailLength}} frames`;
   qualityThresholdValue.textContent = `${{qualityThreshold.toFixed(2)}}`;
   const data = [
-    buildPointTrace(activeTracks, frameIndex, colorBy, scalarRangePayload, qualityThreshold, hideLowQuality),
+    ...buildMjcfMeshTraces(frameIndex),
+    ...buildBackgroundTrace(frameIndex),
+    ...buildPointTraces(activeTracks, frameIndex, colorBy, scalarRangePayload, qualityThreshold, hideLowQuality),
     ...buildTrailTraces(activeTracks, frameIndex, colorBy, trailLength, scalarRangePayload, qualityThreshold, hideLowQuality),
-    ...buildJointTraces(activeTracks, colorBy),
+    ...buildJointTraces(activeTracks, frameIndex, colorBy),
     ...buildAxisTraces(),
   ];
   const layout = {{
@@ -763,17 +1129,24 @@ function render() {{
     margin: {{l: 0, r: 0, t: 28, b: 0}},
     title: `frame ${{frameIndex}} | tracks ${{trackCount}} | color=${{colorBy}}`,
     showlegend: true,
+    uirevision: "object-mask-flow-camera-v1",
     scene: {{
       xaxis: {{range: [bounds.lower[0], bounds.upper[0]], title: "X", gridcolor: "#1f2a33", zerolinecolor: "#475569"}},
       yaxis: {{range: [bounds.lower[1], bounds.upper[1]], title: "Y", gridcolor: "#1f2a33", zerolinecolor: "#475569"}},
       zaxis: {{range: [bounds.lower[2], bounds.upper[2]], title: "Z", gridcolor: "#1f2a33", zerolinecolor: "#475569"}},
-      aspectmode: "data",
+      aspectmode: "manual",
+      aspectratio: pointCloudAspectRatio(),
+      camera: currentCamera(),
+      uirevision: "object-mask-flow-camera-v1",
     }},
   }};
-  Plotly.react("plot", data, layout, {{responsive: true, displaylogo: false}});
+  Plotly.react(plot, data, layout, {{responsive: true, displaylogo: false}}).then(() => {{
+    attachCameraListener();
+    captureCameraFromPlot();
+  }});
 }}
 
-for (const element of [frameSlider, trackCountSlider, trailSlider, colorBySelect, qualityThresholdSlider, showTrails, showJoints, showAxes, hideLowQualityTimesteps]) {{
+for (const element of [frameSlider, trackCountSlider, trailSlider, colorBySelect, qualityThresholdSlider, showTrails, showBackground, showMjcfMesh, showJoints, showAxes, hideLowQualityTimesteps]) {{
   element.addEventListener("input", render);
   element.addEventListener("change", render);
 }}

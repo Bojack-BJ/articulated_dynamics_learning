@@ -333,6 +333,7 @@ class JointInferenceTests(unittest.TestCase):
                     min_track_residual_tracks=1,
                     min_track_residual_samples=1,
                     robust_track_model_trim_ratio=0.2,
+                    quality_weighted_replay=True,
                 )
             ).infer()
             artifact = json.loads(output_path.read_text(encoding="utf-8"))
@@ -341,6 +342,9 @@ class JointInferenceTests(unittest.TestCase):
             self.assertEqual(comparison["robust_trim_ratio"], 0.2)
             self.assertGreater(prismatic["raw_sample_count"], prismatic["sample_count"])
             self.assertGreater(prismatic["raw_rmse_m"], prismatic["rmse_m"])
+            self.assertGreater(prismatic["weighted_replay_sample_count_raw"], prismatic["weighted_replay_sample_count_trimmed"])
+            self.assertGreater(prismatic["weighted_replay_rmse_raw"], prismatic["weighted_replay_rmse_trimmed"])
+            self.assertAlmostEqual(prismatic["rmse_m"], prismatic["weighted_replay_rmse_trimmed"])
 
     def test_mujoco_joint_prior_overrides_noisy_geometry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

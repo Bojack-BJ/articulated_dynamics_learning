@@ -926,17 +926,25 @@ class JointInferencer:
         if not residuals:
             return None
         kept_residuals, trim_stats = _trim_residuals(residuals, trim_ratio)
-        rmse = _weighted_rmse(weighted_residuals) if self.config.quality_weighted_replay else math.sqrt(fmean(value * value for value in kept_residuals))
+        kept_weighted_residuals, weighted_trim_stats = _trim_weighted_residuals(weighted_residuals, trim_ratio)
+        raw_weighted_rmse = _weighted_rmse(weighted_residuals)
+        trimmed_weighted_rmse = _weighted_rmse(kept_weighted_residuals)
+        rmse = trimmed_weighted_rmse if self.config.quality_weighted_replay else math.sqrt(fmean(value * value for value in kept_residuals))
         return {
             "rmse_m": rmse,
             "rmse_unweighted_m": math.sqrt(fmean(value * value for value in kept_residuals)),
-            "rmse_weighted_m": _weighted_rmse(weighted_residuals),
+            "rmse_weighted_m": trimmed_weighted_rmse,
             "joint_replay_unweighted_m": math.sqrt(fmean(value * value for value in kept_residuals)),
-            "joint_replay_weighted_m": _weighted_rmse(weighted_residuals),
+            "joint_replay_weighted_m": trimmed_weighted_rmse,
+            "weighted_replay_rmse_raw": raw_weighted_rmse,
+            "weighted_replay_rmse_trimmed": trimmed_weighted_rmse,
+            "weighted_replay_sample_count_raw": len(weighted_residuals),
+            "weighted_replay_sample_count_trimmed": len(kept_weighted_residuals),
             "mae_m": fmean(kept_residuals),
             "sample_count": len(kept_residuals),
             "raw_sample_count": len(residuals),
             **trim_stats,
+            **weighted_trim_stats,
             "q_range": [min(q_values), max(q_values)] if q_values else [0.0, 0.0],
         }
 
@@ -998,17 +1006,25 @@ class JointInferencer:
         if not residuals:
             return None
         kept_residuals, trim_stats = _trim_residuals(residuals, trim_ratio)
-        rmse = _weighted_rmse(weighted_residuals) if self.config.quality_weighted_replay else math.sqrt(fmean(value * value for value in kept_residuals))
+        kept_weighted_residuals, weighted_trim_stats = _trim_weighted_residuals(weighted_residuals, trim_ratio)
+        raw_weighted_rmse = _weighted_rmse(weighted_residuals)
+        trimmed_weighted_rmse = _weighted_rmse(kept_weighted_residuals)
+        rmse = trimmed_weighted_rmse if self.config.quality_weighted_replay else math.sqrt(fmean(value * value for value in kept_residuals))
         return {
             "rmse_m": rmse,
             "rmse_unweighted_m": math.sqrt(fmean(value * value for value in kept_residuals)),
-            "rmse_weighted_m": _weighted_rmse(weighted_residuals),
+            "rmse_weighted_m": trimmed_weighted_rmse,
             "joint_replay_unweighted_m": math.sqrt(fmean(value * value for value in kept_residuals)),
-            "joint_replay_weighted_m": _weighted_rmse(weighted_residuals),
+            "joint_replay_weighted_m": trimmed_weighted_rmse,
+            "weighted_replay_rmse_raw": raw_weighted_rmse,
+            "weighted_replay_rmse_trimmed": trimmed_weighted_rmse,
+            "weighted_replay_sample_count_raw": len(weighted_residuals),
+            "weighted_replay_sample_count_trimmed": len(kept_weighted_residuals),
             "mae_m": fmean(kept_residuals),
             "sample_count": len(kept_residuals),
             "raw_sample_count": len(residuals),
             **trim_stats,
+            **weighted_trim_stats,
             "q_range": [min(q_values), max(q_values)] if q_values else [0.0, 0.0],
         }
 
@@ -1030,6 +1046,18 @@ def _trim_residuals(residuals: list[float], trim_ratio: float) -> tuple[list[flo
         "raw_rmse_m": math.sqrt(fmean(value * value for value in residuals)),
         "raw_mae_m": fmean(residuals),
     }
+
+
+def _trim_weighted_residuals(
+    weighted_residuals: list[tuple[float, float]],
+    trim_ratio: float,
+) -> tuple[list[tuple[float, float]], dict[str, Any]]:
+    ratio = max(0.0, min(0.8, float(trim_ratio)))
+    if ratio <= 0.0 or len(weighted_residuals) < 4:
+        return weighted_residuals, {"weighted_trimmed_sample_count": 0}
+    trim_count = min(len(weighted_residuals) - 1, int(round(len(weighted_residuals) * ratio)))
+    kept = sorted(weighted_residuals, key=lambda item: float(item[0]))[: len(weighted_residuals) - trim_count]
+    return kept, {"weighted_trimmed_sample_count": trim_count}
 
 
 def _weighted_rmse(weighted_residuals: list[tuple[float, float]]) -> float:

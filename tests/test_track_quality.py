@@ -8,11 +8,14 @@ from pathlib import Path
 
 from rgbd_urdf_mvp.kinematics.joint_inference import _weighted_rmse
 from rgbd_urdf_mvp.perception.quality_weights import (
+    articulation_pair_compatibility,
+    articulation_pair_compatibility_metrics,
     cluster_quality_summary,
     compute_articulation_trace_diagnostics,
     observation_weight,
 )
 from rgbd_urdf_mvp.perception.track_quality import TrackQualityAnalyzer, TrackQualityConfig, compute_track_quality
+from scripts.run_articulation_affinity_quick_ablation import _case_config, _should_rerun
 from scripts.run_quality_weighting_ablation import _coverage_breakdown
 
 
@@ -65,6 +68,31 @@ class TrackQualityTests(unittest.TestCase):
         jitter_summary, _ = compute_articulation_trace_diagnostics(_track(2, jitter_points))
         self.assertGreater(smooth_summary["articulation_score"], jitter_summary["articulation_score"])
         self.assertLess(jitter_summary["articulation_score"], 0.75)
+
+    def test_static_revolute_mismatch_is_not_strongly_penalized_for_low_motion_static_track(self) -> None:
+        static_track = _track(1, [[0.0, 0.0, 0.0], [0.002, 0.0, 0.0], [0.003, 0.0, 0.0]])
+        revolute_track = _track(
+            2,
+            [[math.cos(theta), math.sin(theta), 0.0] for theta in [0.0, 0.2, 0.4, 0.6, 0.8]],
+        )
+        static_track["track_quality"] = {"best_motion_type": "static", "articulation_score": 0.95}
+        revolute_track["track_quality"] = {"best_motion_type": "revolute", "articulation_score": 0.95}
+        metrics = articulation_pair_compatibility_metrics(static_track, revolute_track)
+        self.assertEqual(metrics["penalty_reason"], "static_mismatch_neutralized")
+        self.assertAlmostEqual(metrics["penalty"], 1.0)
+        self.assertGreater(articulation_pair_compatibility(static_track, revolute_track), 0.9)
+
+    def test_confident_revolute_prismatic_mismatch_is_penalized(self) -> None:
+        revolute_track = _track(
+            1,
+            [[math.cos(theta), math.sin(theta), 0.0] for theta in [0.0, 0.2, 0.4, 0.6, 0.8]],
+        )
+        prismatic_track = _track(2, [[0.1 * idx, 0.0, 0.0] for idx in range(5)])
+        revolute_track["track_quality"] = {"best_motion_type": "revolute", "articulation_score": 0.95}
+        prismatic_track["track_quality"] = {"best_motion_type": "prismatic", "articulation_score": 0.95}
+        metrics = articulation_pair_compatibility_metrics(revolute_track, prismatic_track)
+        self.assertEqual(metrics["penalty_reason"], "confident_nonstatic_type_mismatch")
+        self.assertAlmostEqual(metrics["penalty"], 0.65)
 
     def test_large_jump_marks_bad_timestep(self) -> None:
         summary, timesteps = compute_track_quality(
@@ -188,6 +216,45 @@ class TrackQualityTests(unittest.TestCase):
             self.assertAlmostEqual(rows[0]["coverage_delta"], -0.3)
             self.assertEqual(rows[0]["fragmentation_delta"], 1)
             self.assertAlmostEqual(rows[0]["dominant_cluster_purity_after"], 0.7)
+
+    def test_quick_ablation_reruns_on_manifest_mismatch_and_force(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            outputs = [root / name for name in ["tracks.json", "diag.json", "poses.json", "joints.json", "eval.json"]]
+            for path in outputs:
+                path.write_text("{}", encoding="utf-8")
+            manifest = root / "config_manifest.json"
+            config = _case_config(Path.cwd(), "baseline", 5, "B")
+            manifest.write_text(json.dumps({"config": config}), encoding="utf-8")
+            rerun, reason = _should_rerun(
+                required_outputs=outputs,
+                manifest_path=manifest,
+                expected_config=config,
+                force=False,
+                reuse_without_manifest=False,
+            )
+            self.assertFalse(rerun)
+            self.assertEqual(reason, "reuse_manifest_match")
+            changed = dict(config)
+            changed["spectral_k"] = 4
+            rerun, reason = _should_rerun(
+                required_outputs=outputs,
+                manifest_path=manifest,
+                expected_config=changed,
+                force=False,
+                reuse_without_manifest=False,
+            )
+            self.assertTrue(rerun)
+            self.assertEqual(reason, "config_mismatch")
+            rerun, reason = _should_rerun(
+                required_outputs=outputs,
+                manifest_path=manifest,
+                expected_config=config,
+                force=True,
+                reuse_without_manifest=False,
+            )
+            self.assertTrue(rerun)
+            self.assertEqual(reason, "force")
 
 
 if __name__ == "__main__":

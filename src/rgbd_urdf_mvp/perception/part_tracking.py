@@ -41,6 +41,14 @@ class PartPixelTrackingConfig:
     require_part_mask_consistency: bool = True
     allow_backward_tracking: bool = True
     show_progress: bool = True
+    export_cotracker_features: bool = False
+    cotracker_features_output: str | Path | None = None
+    dynamic_reseeding: bool = False
+    reseed_interval_frames: int = 5
+    reseed_coverage_radius_px: float = 12.0
+    reseed_bbox_scale: float = 1.2
+    reseed_max_tracks_per_frame_view: int = 64
+    reseed_max_tracks_per_view: int = 256
 
 
 @dataclass(slots=True)
@@ -274,6 +282,55 @@ def _load_cotracker_model(config: PartPixelTrackingConfig, torch_module: Any, de
     return model.to(device).eval()
 
 
+def _resolve_cotracker_updateformer(model: Any) -> Any:
+    """Resolve CoTracker's update transformer without modifying the vendored repository."""
+    candidates = [model, getattr(model, "model", None)]
+    for candidate in candidates:
+        updateformer = getattr(candidate, "updateformer", None)
+        if updateformer is not None:
+            return updateformer
+    raise RuntimeError(
+        "Unable to find CoTracker updateformer. Feature export currently supports "
+        "CoTracker models exposing model.updateformer or updateformer."
+    )
+
+
+class _CoTrackerFeatureCapture:
+    """Capture final per-query hidden tokens entering CoTracker's flow head."""
+
+    def __init__(self, model: Any) -> None:
+        updateformer = _resolve_cotracker_updateformer(model)
+        flow_head = getattr(updateformer, "flow_head", None)
+        if flow_head is None or not hasattr(flow_head, "register_forward_pre_hook"):
+            raise RuntimeError("CoTracker updateformer does not expose a hookable flow_head.")
+        self.latest: Any = None
+        self._handle = flow_head.register_forward_pre_hook(self._capture)
+
+    def _capture(self, _module: Any, inputs: tuple[Any, ...]) -> None:
+        if inputs:
+            self.latest = inputs[0].detach()
+
+    def reset(self) -> None:
+        self.latest = None
+
+    def pooled_seed_features(self, seed_count: int) -> Any:
+        if self.latest is None:
+            raise RuntimeError("CoTracker feature hook did not capture hidden tokens.")
+        hidden = self.latest
+        if getattr(hidden, "ndim", 0) != 4 or int(hidden.shape[0]) != 1:
+            raise RuntimeError(f"Unexpected CoTracker hidden-token shape: {tuple(hidden.shape)}")
+        if int(hidden.shape[1]) < int(seed_count):
+            raise RuntimeError(
+                f"CoTracker returned {int(hidden.shape[1])} hidden tracks for {int(seed_count)} seed queries."
+            )
+        pooled = hidden[0, :seed_count].mean(dim=1)
+        pooled = pooled / pooled.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        return pooled.detach().cpu()
+
+    def close(self) -> None:
+        self._handle.remove()
+
+
 def _part_metadata(part_segmentation: dict[str, Any] | None) -> dict[int, dict[str, Any]]:
     if not isinstance(part_segmentation, dict):
         return {}
@@ -326,6 +383,73 @@ def _sample_foreground_seed_pixels(mask_u16: list[list[int]], stride_px: int, ma
         return candidates
     step = len(candidates) / float(max_points)
     return [candidates[min(len(candidates) - 1, int(round(index * step)))] for index in range(max_points)]
+
+
+def _sample_uncovered_foreground_seed_pixels(
+    mask_u16: list[list[int]],
+    depth_u16: list[list[int]],
+    covered_uv: list[tuple[float, float]],
+    stride_px: int,
+    coverage_radius_px: float,
+    min_depth_m: float,
+    max_depth_m: float,
+    max_points: int,
+    expected_part_id: int = -1,
+) -> list[tuple[int, int]]:
+    """Sample valid foreground pixels not already explained by visible tracks."""
+    height = min(len(mask_u16), len(depth_u16))
+    width = min(len(mask_u16[0]), len(depth_u16[0])) if height else 0
+    stride = max(1, int(stride_px))
+    radius_sq = max(0.0, float(coverage_radius_px)) ** 2
+    candidates: list[tuple[int, int]] = []
+    for v_coord in range(0, height, stride):
+        for u_coord in range(0, width, stride):
+            mask_value = int(mask_u16[v_coord][u_coord])
+            if (expected_part_id < 0 and mask_value <= 0) or (
+                expected_part_id >= 0 and mask_value != expected_part_id
+            ):
+                continue
+            depth_m = float(depth_u16[v_coord][u_coord]) / 1000.0
+            if depth_m < float(min_depth_m) or depth_m > float(max_depth_m):
+                continue
+            if any((u_coord - u) ** 2 + (v_coord - v) ** 2 <= radius_sq for u, v in covered_uv):
+                continue
+            candidates.append((u_coord, v_coord))
+    if len(candidates) <= max_points:
+        return candidates
+    step = len(candidates) / float(max_points)
+    return [candidates[min(len(candidates) - 1, int(round(index * step)))] for index in range(max_points)]
+
+
+def _expanded_robust_bbox(
+    points: list[list[float]],
+    scale: float,
+) -> tuple[list[float], list[float]] | None:
+    """Return a quantile-trimmed AABB expanded around its center."""
+    valid = [point for point in points if len(point) == 3 and all(math.isfinite(float(value)) for value in point)]
+    if not valid:
+        return None
+    lower: list[float] = []
+    upper: list[float] = []
+    expansion = max(1.0, float(scale))
+    for axis in range(3):
+        values = sorted(float(point[axis]) for point in valid)
+        low_index = min(len(values) - 1, int(math.floor(0.01 * (len(values) - 1))))
+        high_index = min(len(values) - 1, int(math.ceil(0.99 * (len(values) - 1))))
+        low = values[low_index]
+        high = values[high_index]
+        center = 0.5 * (low + high)
+        half_extent = max(0.025, 0.5 * (high - low) * expansion)
+        lower.append(center - half_extent)
+        upper.append(center + half_extent)
+    return lower, upper
+
+
+def _point_in_bbox(point: list[float], bbox: tuple[list[float], list[float]] | None) -> bool:
+    if bbox is None or len(point) != 3:
+        return False
+    lower, upper = bbox
+    return all(float(lower[axis]) <= float(point[axis]) <= float(upper[axis]) for axis in range(3))
 
 
 def _visibility_value(raw: Any) -> float:
@@ -564,6 +688,9 @@ class PartPixelTracker:
             return depth_cache[path]
 
         tracks: list[dict[str, Any]] = []
+        feature_track_ids: list[int] = []
+        feature_embeddings: list[Any] = []
+        feature_capture = _CoTrackerFeatureCapture(model) if self.config.export_cotracker_features else None
         track_id = 0
         completed_steps = 0
         with torch.no_grad():
@@ -575,6 +702,121 @@ class PartPixelTracker:
                 view_rgb_paths = [paths[view_index] for paths in rgb_paths_by_frame_view]
                 video = _load_video_tensor(view_rgb_paths, torch, device)
                 resource_samples.append(_torch_resource_snapshot(torch, device, f"view_{view_index}_video_loaded"))
+
+                def run_query_batch(
+                    part_id: int,
+                    query_records: list[dict[str, Any]],
+                    stage: str,
+                ) -> int:
+                    nonlocal track_id
+                    if not query_records:
+                        return 0
+                    query_payload = [
+                        [float(record["frame_index"]), float(record["u"]), float(record["v"])]
+                        for record in query_records
+                    ]
+                    queries = torch.tensor([query_payload], dtype=torch.float32, device=device)
+                    if feature_capture is not None:
+                        feature_capture.reset()
+                    pred_tracks, pred_visibility = model(
+                        video,
+                        queries=queries,
+                        backward_tracking=bool(self.config.allow_backward_tracking),
+                    )
+                    resource_samples.append(
+                        _torch_resource_snapshot(torch, device, f"view_{view_index}_{stage}_cotracker_done")
+                    )
+                    pred_tracks = pred_tracks.detach().cpu()
+                    pred_visibility = pred_visibility.detach().cpu()
+                    query_features = (
+                        feature_capture.pooled_seed_features(len(query_records))
+                        if feature_capture is not None
+                        else None
+                    )
+                    emitted = 0
+                    for query_index, record in enumerate(query_records):
+                        reference_frame = int(record["frame_index"])
+                        seed_u = int(record["u"])
+                        seed_v = int(record["v"])
+                        dynamic_birth = bool(record.get("dynamic", False))
+                        samples: list[dict[str, Any]] = []
+                        reference_xyz: list[float] | None = None
+                        for frame_index, frame in enumerate(sampled_frames):
+                            if frame_index >= pred_tracks.shape[1]:
+                                continue
+                            uv = pred_tracks[0, frame_index, query_index].tolist()
+                            tracker_visibility = _visibility_value(pred_visibility[0, frame_index, query_index].item())
+                            source_frame_index = sampled_frame_indices[frame_index]
+                            depth_path = depth_paths_by_frame_view[frame_index][view_index]
+                            part_mask_path = (
+                                part_masks_by_frame_view[frame_index][view_index]
+                                if view_index < len(part_masks_by_frame_view[frame_index])
+                                else None
+                            )
+                            xyz, depth_valid, mask_consistent = _backproject_track_sample(
+                                u_float=float(uv[0]),
+                                v_float=float(uv[1]),
+                                depth_u16=load_depth_cached(depth_path),
+                                part_mask_u16=load_depth_cached(part_mask_path) if part_mask_path is not None else None,
+                                expected_part_id=-1 if object_mask_mode else part_id,
+                                intrinsics=episode.camera_intrinsics,
+                                camera_pose=camera_poses_by_frame_view[frame_index][view_index],
+                                depth_convention=depth_convention,
+                                min_depth_m=float(self.config.min_depth_m),
+                                max_depth_m=float(self.config.max_depth_m),
+                                # Object masks are soft evidence: an opening door may
+                                # legitimately expand beyond a propagated mask.
+                                require_part_mask_consistency=(
+                                    bool(self.config.require_part_mask_consistency) and not object_mask_mode
+                                ),
+                            )
+                            after_birth = not dynamic_birth or frame_index >= reference_frame
+                            visible = (
+                                after_birth
+                                and tracker_visibility >= float(self.config.visibility_threshold)
+                                and depth_valid
+                                and xyz is not None
+                            )
+                            if frame_index == reference_frame and xyz is not None:
+                                reference_xyz = xyz
+                            samples.append(
+                                {
+                                    "frame_index": frame_index,
+                                    "source_frame_index": source_frame_index,
+                                    "timestamp_s": float(frame.timestamp_s),
+                                    "uv": [float(uv[0]), float(uv[1])],
+                                    "xyz_world": xyz,
+                                    "visible": bool(visible),
+                                    "tracker_visibility": float(tracker_visibility),
+                                    "depth_valid": bool(depth_valid),
+                                    "mask_consistent": bool(mask_consistent),
+                                    "confidence": float(tracker_visibility if visible else 0.0),
+                                }
+                            )
+                        if reference_xyz is None:
+                            continue
+                        tracks.append(
+                            {
+                                "track_id": track_id,
+                                "part_id": part_id,
+                                "part_name": part_names.get(part_id, f"part_{part_id}"),
+                                "view_index": view_index,
+                                "query_frame_index": reference_frame,
+                                "query_source_frame_index": sampled_frame_indices[reference_frame],
+                                "query_uv": [float(seed_u), float(seed_v)],
+                                "reference_xyz_world": reference_xyz,
+                                "seed_source": "dynamic_reseed" if dynamic_birth else "reference_frame",
+                                "samples": samples,
+                            }
+                        )
+                        if query_features is not None:
+                            feature_track_ids.append(track_id)
+                            feature_embeddings.append(query_features[query_index])
+                        track_id += 1
+                        emitted += 1
+                    return emitted
+
+                view_track_start = len(tracks)
                 for part_id in sorted(part_metadata):
                     reference_frame = reference_frame_by_part[part_id]
                     if reference_frame >= len(part_masks_by_frame_view):
@@ -612,99 +854,135 @@ class PartPixelTracker:
                             f"running CoTracker on {len(seed_pixels)} seeds x {len(sampled_frames)} frames"
                         ),
                     )
-                    query_payload = [
-                        [float(reference_frame), float(u_coord), float(v_coord)]
-                        for u_coord, v_coord in seed_pixels
-                    ]
-                    queries = torch.tensor([query_payload], dtype=torch.float32, device=device)
-                    pred_tracks, pred_visibility = model(
-                        video,
-                        queries=queries,
-                        backward_tracking=bool(self.config.allow_backward_tracking),
+                    emitted = run_query_batch(
+                        part_id,
+                        [
+                            {"frame_index": reference_frame, "u": u_coord, "v": v_coord, "dynamic": False}
+                            for u_coord, v_coord in seed_pixels
+                        ],
+                        f"part_{part_id}",
                     )
-                    resource_samples.append(
-                        _torch_resource_snapshot(
-                            torch,
-                            device,
-                            f"view_{view_index}_part_{part_id}_cotracker_done",
-                        )
-                    )
-                    pred_tracks = pred_tracks.detach().cpu()
-                    pred_visibility = pred_visibility.detach().cpu()
-
-                    for query_index, (seed_u, seed_v) in enumerate(seed_pixels):
-                        samples: list[dict[str, Any]] = []
-                        reference_xyz: list[float] | None = None
-                        for frame_index, frame in enumerate(sampled_frames):
-                            if frame_index >= pred_tracks.shape[1]:
-                                continue
-                            uv = pred_tracks[0, frame_index, query_index].tolist()
-                            tracker_visibility = _visibility_value(pred_visibility[0, frame_index, query_index].item())
-                            source_frame_index = sampled_frame_indices[frame_index]
-                            depth_path = depth_paths_by_frame_view[frame_index][view_index]
-                            part_mask_path = (
-                                part_masks_by_frame_view[frame_index][view_index]
-                                if view_index < len(part_masks_by_frame_view[frame_index])
-                                else None
-                            )
-                            xyz, depth_valid, mask_consistent = _backproject_track_sample(
-                                u_float=float(uv[0]),
-                                v_float=float(uv[1]),
-                                depth_u16=load_depth_cached(depth_path),
-                                part_mask_u16=load_depth_cached(part_mask_path) if part_mask_path is not None else None,
-                                expected_part_id=-1 if object_mask_mode else part_id,
-                                intrinsics=episode.camera_intrinsics,
-                                camera_pose=camera_poses_by_frame_view[frame_index][view_index],
-                                depth_convention=depth_convention,
-                                min_depth_m=float(self.config.min_depth_m),
-                                max_depth_m=float(self.config.max_depth_m),
-                                require_part_mask_consistency=bool(self.config.require_part_mask_consistency),
-                            )
-                            visible = (
-                                tracker_visibility >= float(self.config.visibility_threshold)
-                                and depth_valid
-                                and xyz is not None
-                            )
-                            if frame_index == reference_frame and xyz is not None:
-                                reference_xyz = xyz
-                            samples.append(
-                                {
-                                    "frame_index": frame_index,
-                                    "source_frame_index": source_frame_index,
-                                    "timestamp_s": float(frame.timestamp_s),
-                                    "uv": [float(uv[0]), float(uv[1])],
-                                    "xyz_world": xyz,
-                                    "visible": bool(visible),
-                                    "tracker_visibility": float(tracker_visibility),
-                                    "depth_valid": bool(depth_valid),
-                                    "mask_consistent": bool(mask_consistent),
-                                    "confidence": float(tracker_visibility if visible else 0.0),
-                                }
-                            )
-
-                        if reference_xyz is None:
-                            continue
-                        tracks.append(
-                            {
-                                "track_id": track_id,
-                                "part_id": part_id,
-                                "part_name": part_names.get(part_id, f"part_{part_id}"),
-                                "view_index": view_index,
-                                "query_frame_index": reference_frame,
-                                "query_source_frame_index": sampled_frame_indices[reference_frame],
-                                "query_uv": [float(seed_u), float(seed_v)],
-                                "reference_xyz_world": reference_xyz,
-                                "samples": samples,
-                            }
-                        )
-                        track_id += 1
                     completed_steps += 1
                     progress.update(
                         completed_steps,
-                        f"view {view_index + 1}/{view_count} {part_name}: emitted {len(seed_pixels)} tracks",
+                        f"view {view_index + 1}/{view_count} {part_name}: emitted {emitted} tracks",
                     )
+
+                if bool(self.config.dynamic_reseeding):
+                    initial_view_tracks = tracks[view_track_start:]
+                    envelope_points = [
+                        sample["xyz_world"]
+                        for track in initial_view_tracks
+                        for sample in track.get("samples", [])
+                        if bool(sample.get("visible", False))
+                        and isinstance(sample.get("xyz_world"), list)
+                    ]
+                    bbox = _expanded_robust_bbox(envelope_points, self.config.reseed_bbox_scale)
+                    interval = max(1, int(self.config.reseed_interval_frames))
+                    for part_id in sorted(part_metadata):
+                        part_view_tracks = [
+                            track for track in initial_view_tracks if int(track.get("part_id", -1)) == part_id
+                        ]
+                        dynamic_queries: list[dict[str, Any]] = []
+                        accepted_xyz: list[list[float]] = []
+                        for frame_index in range(interval, len(sampled_frames), interval):
+                            if len(dynamic_queries) >= max(1, int(self.config.reseed_max_tracks_per_view)):
+                                break
+                            mask_path = part_masks_by_frame_view[frame_index][view_index]
+                            depth_path = depth_paths_by_frame_view[frame_index][view_index]
+                            frame_mask = load_depth_cached(mask_path)
+                            frame_depth = load_depth_cached(depth_path)
+                            covered_uv: list[tuple[float, float]] = []
+                            for track in part_view_tracks:
+                                sample = next(
+                                    (
+                                        item
+                                        for item in track.get("samples", [])
+                                        if int(item.get("frame_index", -1)) == frame_index
+                                        and bool(item.get("visible", False))
+                                    ),
+                                    None,
+                                )
+                                if sample is not None and isinstance(sample.get("uv"), list):
+                                    covered_uv.append((float(sample["uv"][0]), float(sample["uv"][1])))
+                            remaining = max(0, int(self.config.reseed_max_tracks_per_view) - len(dynamic_queries))
+                            frame_limit = min(max(1, int(self.config.reseed_max_tracks_per_frame_view)), remaining)
+                            expected_part_id = -1 if object_mask_mode else part_id
+                            candidates = _sample_uncovered_foreground_seed_pixels(
+                                frame_mask,
+                                frame_depth,
+                                covered_uv,
+                                stride_px=self.config.seed_stride_px,
+                                coverage_radius_px=self.config.reseed_coverage_radius_px,
+                                min_depth_m=self.config.min_depth_m,
+                                max_depth_m=self.config.max_depth_m,
+                                max_points=frame_limit,
+                                expected_part_id=expected_part_id,
+                            )
+                            for u_coord, v_coord in candidates:
+                                xyz, depth_valid, _ = _backproject_track_sample(
+                                    u_float=float(u_coord),
+                                    v_float=float(v_coord),
+                                    depth_u16=frame_depth,
+                                    part_mask_u16=frame_mask,
+                                    expected_part_id=expected_part_id,
+                                    intrinsics=episode.camera_intrinsics,
+                                    camera_pose=camera_poses_by_frame_view[frame_index][view_index],
+                                    depth_convention=depth_convention,
+                                    min_depth_m=float(self.config.min_depth_m),
+                                    max_depth_m=float(self.config.max_depth_m),
+                                    require_part_mask_consistency=True,
+                                )
+                                if not depth_valid or xyz is None or not _point_in_bbox(xyz, bbox):
+                                    continue
+                                if any(
+                                    sum((xyz[axis] - other[axis]) ** 2 for axis in range(3)) < 0.0004
+                                    for other in accepted_xyz
+                                ):
+                                    continue
+                                accepted_xyz.append(xyz)
+                                dynamic_queries.append(
+                                    {"frame_index": frame_index, "u": u_coord, "v": v_coord, "dynamic": True}
+                                )
+                        if dynamic_queries:
+                            progress.update(
+                                completed_steps,
+                                (
+                                    f"view {view_index + 1}/{view_count} part {part_id}: "
+                                    f"tracking {len(dynamic_queries)} dynamic seeds"
+                                ),
+                            )
+                            run_query_batch(part_id, dynamic_queries, f"part_{part_id}_dynamic_reseed")
         progress.finish(f"done; emitted {len(tracks)} total tracks")
+        if feature_capture is not None:
+            feature_capture.close()
         resource_samples.append(_torch_resource_snapshot(torch, device, "finished"))
+
+        feature_artifact: dict[str, Any] | None = None
+        if feature_capture is not None:
+            if not feature_embeddings:
+                raise ValueError("CoTracker feature export was requested, but no valid 3D tracks were emitted.")
+            import numpy as np
+
+            feature_output = (
+                Path(self.config.cotracker_features_output).expanduser().resolve()
+                if self.config.cotracker_features_output is not None
+                else output_json.with_name("cotracker_features.npz")
+            )
+            feature_output.parent.mkdir(parents=True, exist_ok=True)
+            embedding_array = np.stack([value.numpy() for value in feature_embeddings]).astype(np.float32)
+            np.savez_compressed(
+                feature_output,
+                track_ids=np.asarray(feature_track_ids, dtype=np.int64),
+                embeddings=embedding_array,
+            )
+            feature_artifact = {
+                "path": str(feature_output),
+                "track_count": int(embedding_array.shape[0]),
+                "feature_dim": int(embedding_array.shape[1]),
+                "pooling": "final-updateformer-token-temporal-mean-l2",
+                "diagnostic_only": True,
+            }
 
         track_counts: dict[int, int] = {}
         for track in tracks:
@@ -727,6 +1005,7 @@ class PartPixelTracker:
                 "cotracker_model": self.config.cotracker_model,
                 "cotracker_repo": None if self.config.cotracker_repo is None else str(self.config.cotracker_repo),
                 "cotracker_checkpoint": None if self.config.cotracker_checkpoint is None else str(self.config.cotracker_checkpoint),
+                "cotracker_features": feature_artifact,
                 "depth_convention": depth_convention,
                 "pose_sources_used": sorted(pose_sources),
                 "part_segmentation": part_segmentation,
@@ -742,6 +1021,13 @@ class PartPixelTracker:
                     "visibility_threshold": self.config.visibility_threshold,
                     "require_part_mask_consistency": self.config.require_part_mask_consistency,
                     "allow_backward_tracking": self.config.allow_backward_tracking,
+                    "export_cotracker_features": self.config.export_cotracker_features,
+                    "dynamic_reseeding": self.config.dynamic_reseeding,
+                    "reseed_interval_frames": self.config.reseed_interval_frames,
+                    "reseed_coverage_radius_px": self.config.reseed_coverage_radius_px,
+                    "reseed_bbox_scale": self.config.reseed_bbox_scale,
+                    "reseed_max_tracks_per_frame_view": self.config.reseed_max_tracks_per_frame_view,
+                    "reseed_max_tracks_per_view": self.config.reseed_max_tracks_per_view,
                 },
                 "part_track_counts": {
                     str(part_id): {

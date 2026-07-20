@@ -366,6 +366,10 @@ def main(argv: list[str] | None = None) -> int:
                 output_html=args.output_html,
                 joint_inference=args.joint_inference,
                 evaluation_json=args.evaluation_json,
+                background_fusion_manifest=args.background_fusion_manifest,
+                background_max_points=max(1, int(args.background_max_points)),
+                mjcf_replay_episode=args.mjcf_replay_episode,
+                mjcf_mesh_opacity=float(args.mjcf_mesh_opacity),
                 max_tracks=max(1, int(args.max_tracks)),
                 frame_stride=max(1, int(args.frame_stride)),
                 trail_length=max(0, int(args.trail_length)),
@@ -410,9 +414,204 @@ def main(argv: list[str] | None = None) -> int:
                 require_part_mask_consistency=not bool(args.no_part_mask_consistency),
                 allow_backward_tracking=not bool(args.no_backward_tracking),
                 show_progress=not bool(args.no_progress),
+                export_cotracker_features=bool(args.export_cotracker_features),
+                cotracker_features_output=args.cotracker_features_output,
+                dynamic_reseeding=bool(args.dynamic_reseeding),
+                reseed_interval_frames=max(1, int(args.reseed_interval_frames)),
+                reseed_coverage_radius_px=max(0.0, float(args.reseed_coverage_radius_px)),
+                reseed_bbox_scale=max(1.0, float(args.reseed_bbox_scale)),
+                reseed_max_tracks_per_frame_view=max(1, int(args.reseed_max_tracks_per_frame_view)),
+                reseed_max_tracks_per_view=max(1, int(args.reseed_max_tracks_per_view)),
             )
         ).track()
         print(json.dumps({"part_tracks_artifact": str(output_json.resolve())}, indent=2))
+        return 0
+
+    if args.command in {"probe-cotracker-features", "probe-track-features"}:
+        from .perception.cotracker_features import CoTrackerFeatureProbeConfig, CoTrackerFeatureProber
+
+        output_json = CoTrackerFeatureProber(
+            CoTrackerFeatureProbeConfig(
+                tracks_path=args.tracks,
+                features_npz=args.features,
+                output_json=args.output_json,
+                output_embedding_csv=args.output_embedding_csv,
+                label_field=str(args.label_field),
+                max_pairs=max(1, int(args.max_pairs)),
+                cluster_k=args.cluster_k,
+                seed=int(args.seed),
+            )
+        ).probe()
+        print(json.dumps({"track_feature_probe": str(output_json.resolve())}, indent=2))
+        return 0
+
+    if args.command == "prepare-tapip3d-input":
+        from .perception.tapip3d_adapter import TAPIP3DInputConfig, TAPIP3DInputPreparer
+
+        output_path = TAPIP3DInputPreparer(
+            TAPIP3DInputConfig(
+                episode_path=args.episode,
+                output_npz=args.output_npz,
+                view_index=int(args.view_index),
+                frame_stride=max(1, int(args.frame_stride)),
+                seed_tracks=args.seed_tracks,
+            )
+        ).prepare()
+        print(json.dumps({"tapip3d_input": str(output_path)}, indent=2))
+        return 0
+
+    if args.command == "import-tapip3d-tracks":
+        from .perception.tapip3d_adapter import TAPIP3DImportConfig, TAPIP3DTrackImporter
+
+        output_path = TAPIP3DTrackImporter(
+            TAPIP3DImportConfig(
+                tapip_input_npz=args.tapip_input,
+                tapip_result_npz=args.tapip_result,
+                seed_tracks=args.seed_tracks,
+                output_json=args.output_json,
+                visibility_threshold=float(args.visibility_threshold),
+            )
+        ).import_tracks()
+        print(json.dumps({"tapip3d_tracks": str(output_path)}, indent=2))
+        return 0
+
+    if args.command == "merge-tapip3d-views":
+        from .perception.tapip3d_adapter import TAPIP3DMergeConfig, TAPIP3DMultiViewMerger
+
+        tracks_path, features_path = TAPIP3DMultiViewMerger(
+            TAPIP3DMergeConfig(
+                track_paths=list(args.tracks),
+                output_tracks=args.output_tracks,
+                feature_paths=None if args.features is None else list(args.features),
+                output_features=args.output_features,
+            )
+        ).merge()
+        print(json.dumps({
+            "tapip3d_tracks": str(tracks_path),
+            "tapip3d_features": None if features_path is None else str(features_path),
+        }, indent=2))
+        return 0
+
+    if args.command == "train-track-slot-head":
+        from .perception.track_slot_head import TrackSlotTrainer, TrackSlotTrainingConfig
+
+        model_path = TrackSlotTrainer(TrackSlotTrainingConfig(
+            manifest_path=args.manifest, output_dir=args.output_dir,
+            max_slots=max(2, int(args.max_slots)), hidden_dim=max(16, int(args.hidden_dim)),
+            epochs=max(1, int(args.epochs)), learning_rate=max(1e-8, float(args.learning_rate)),
+            weight_decay=max(0.0, float(args.weight_decay)),
+            pairwise_loss_weight=max(0.0, float(args.pairwise_loss_weight)),
+            device=str(args.device), seed=int(args.seed),
+        )).train()
+        print(json.dumps({"track_slot_model": str(model_path)}, indent=2))
+        return 0
+
+    if args.command == "predict-track-slots":
+        from .perception.track_slot_head import TrackSlotPredictionConfig, TrackSlotPredictor
+
+        output_path, viewer_path = TrackSlotPredictor(TrackSlotPredictionConfig(
+            tracks_path=args.tracks, features_npz=args.features, model_path=args.model,
+            output_json=args.output_json, output_viewer=args.output_viewer,
+            device=str(args.device), generate_viewer=not bool(args.no_viewer),
+        )).predict()
+        print(json.dumps({
+            "track_slot_predictions": str(output_path),
+            "viewer": None if viewer_path is None else str(viewer_path),
+        }, indent=2))
+        return 0
+
+    if args.command == "train-pairwise-affinity":
+        from .perception.pairwise_affinity import PairwiseAffinityTrainer, PairwiseAffinityTrainingConfig
+
+        model_path = PairwiseAffinityTrainer(
+            PairwiseAffinityTrainingConfig(
+                manifest_path=args.manifest,
+                output_dir=args.output_dir,
+                knn_k=max(1, int(args.knn_k)),
+                min_common_frames=max(2, int(args.min_common_frames)),
+                epochs=max(1, int(args.epochs)),
+                batch_size=max(1, int(args.batch_size)),
+                learning_rate=max(1e-8, float(args.learning_rate)),
+                weight_decay=max(0.0, float(args.weight_decay)),
+                hidden_dim=max(16, int(args.hidden_dim)),
+                hard_negative_weight=max(0.0, float(args.hard_negative_weight)),
+                hard_mining_k=max(0, int(args.hard_mining_k)),
+                max_positive_negative_ratio=max(0.0, float(args.max_positive_negative_ratio)),
+                device=str(args.device),
+                seed=int(args.seed),
+            )
+        ).train()
+        print(json.dumps({"pairwise_affinity_model": str(model_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "evaluate-pairwise-affinity":
+        from .perception.pairwise_affinity import PairwiseAffinityEvaluationConfig, PairwiseAffinityEvaluator
+
+        output_json = PairwiseAffinityEvaluator(
+            PairwiseAffinityEvaluationConfig(
+                manifest_path=args.manifest,
+                model_path=args.model,
+                output_json=args.output_json,
+                split=str(args.split),
+                knn_k=max(1, int(args.knn_k)),
+                min_common_frames=max(2, int(args.min_common_frames)),
+                device=str(args.device),
+            )
+        ).evaluate()
+        print(json.dumps({"pairwise_affinity_evaluation": str(output_json.resolve())}, indent=2))
+        return 0
+
+    if args.command == "train-motion-part-slots":
+        from .perception.motion_part_slots import MotionPartSlotTrainer, MotionPartSlotTrainingConfig
+
+        model_path = MotionPartSlotTrainer(
+            MotionPartSlotTrainingConfig(
+                manifest_path=args.manifest,
+                output_dir=args.output_dir,
+                max_slots=max(2, int(args.max_slots)),
+                hidden_dim=max(16, int(args.hidden_dim)),
+                encoder_layers=max(1, int(args.encoder_layers)),
+                decoder_layers=max(1, int(args.decoder_layers)),
+                attention_heads=max(1, int(args.attention_heads)),
+                epochs=max(1, int(args.epochs)),
+                learning_rate=max(1e-8, float(args.learning_rate)),
+                weight_decay=max(0.0, float(args.weight_decay)),
+                rigid_loss_weight=max(0.0, float(args.rigid_loss_weight)),
+                dice_loss_weight=max(0.0, float(args.dice_loss_weight)),
+                pairwise_loss_weight=max(0.0, float(args.pairwise_loss_weight)),
+                existence_loss_weight=max(0.0, float(args.existence_loss_weight)),
+                part_balanced_assignment=not bool(args.no_part_balanced_assignment),
+                canonicalize_geometry=not bool(args.no_canonicalize_geometry),
+                geometry_augmentation=not bool(args.no_geometry_augmentation),
+                track_dropout_ratio=max(0.0, min(float(args.track_dropout_ratio), 0.8)),
+                pair_samples_per_object=max(0, int(args.pair_samples_per_object)),
+                topology_balanced_sampling=not bool(args.no_topology_balanced_sampling),
+                device=str(args.device),
+                seed=int(args.seed),
+            )
+        ).train()
+        print(json.dumps({"motion_part_slot_model": str(model_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "infer-motion-part-slots":
+        from .perception.motion_part_slots import MotionPartSlotInferenceConfig, MotionPartSlotInferencer
+
+        output_json = MotionPartSlotInferencer(
+            MotionPartSlotInferenceConfig(
+                tracks_path=args.tracks,
+                features_npz=args.features_npz,
+                model_path=args.model,
+                output_json=args.output_json,
+                device=str(args.device),
+                post_ransac_refine=bool(args.post_ransac_refine),
+                ransac_iterations=max(1, int(args.ransac_iterations)),
+                ransac_inlier_threshold_m=max(1e-6, float(args.ransac_inlier_threshold_m)),
+                ransac_min_inliers=max(3, int(args.ransac_min_inliers)),
+                slot_existence_threshold=max(0.0, min(float(args.slot_existence_threshold), 1.0)),
+                seed=int(args.seed),
+            )
+        ).infer()
+        print(json.dumps({"motion_part_tracks": str(output_json.resolve())}, indent=2))
         return 0
 
     if args.command == "estimate-part-poses":
@@ -483,7 +682,39 @@ def main(argv: list[str] | None = None) -> int:
                 quality_weighted_affinity_edge_prior=bool(args.quality_weighted_affinity_edge_prior),
                 quality_affinity_min_pair_weight=max(0.0, min(1.0, float(args.quality_affinity_min_pair_weight))),
                 articulation_compatible_affinity=bool(args.articulation_compatible_affinity),
+                articulation_type_mismatch_penalty=max(
+                    0.0,
+                    min(1.0, float(args.articulation_type_mismatch_penalty)),
+                ),
+                articulation_static_mismatch_penalty=max(
+                    0.0,
+                    min(1.0, float(args.articulation_static_mismatch_penalty)),
+                ),
+                articulation_min_motion_for_type_penalty=max(
+                    0.0,
+                    float(args.articulation_min_motion_for_type_penalty),
+                ),
+                articulation_min_confidence_for_type_penalty=max(
+                    0.0,
+                    min(1.0, float(args.articulation_min_confidence_for_type_penalty)),
+                ),
+                cotracker_features_npz=args.cotracker_features_npz,
+                learned_affinity_floor=max(0.0, min(1.0, float(args.learned_affinity_floor))),
+                pairwise_affinity_model=args.pairwise_affinity_model,
+                pairwise_affinity_floor=max(0.0, min(1.0, float(args.pairwise_affinity_floor))),
+                pairwise_affinity_device=str(args.pairwise_affinity_device),
+                pairwise_connect_threshold=max(0.0, min(1.0, float(args.pairwise_connect_threshold))),
                 skip_base_bridge_checks=bool(args.skip_base_bridge_checks),
+                ransac_iterations=max(1, int(args.ransac_iterations)),
+                ransac_sample_size=max(3, int(args.ransac_sample_size)),
+                ransac_inlier_threshold_m=max(1e-6, float(args.ransac_inlier_threshold_m)),
+                ransac_min_inliers=max(3, int(args.ransac_min_inliers)),
+                ransac_max_models=max(1, int(args.ransac_max_models)),
+                ransac_spatial_link_m=max(1e-6, float(args.ransac_spatial_link_m)),
+                ransac_assignment_threshold_m=max(1e-6, float(args.ransac_assignment_threshold_m)),
+                ransac_seed=int(args.ransac_seed),
+                ransac_base_stabilize=bool(args.ransac_base_stabilize),
+                ransac_learned_seed=bool(args.ransac_learned_seed),
             )
         ).segment()
         print(json.dumps({"motion_part_tracks": str(output_json.resolve())}, indent=2))

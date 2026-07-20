@@ -125,15 +125,74 @@ def articulation_track_score(track: dict[str, Any], field: str = "articulation_s
     return _clip01(value) if value is not None else 1.0
 
 
-def articulation_pair_compatibility(a_track: dict[str, Any], b_track: dict[str, Any]) -> float:
+def articulation_pair_compatibility(
+    a_track: dict[str, Any],
+    b_track: dict[str, Any],
+    *,
+    type_mismatch_penalty: float = 0.65,
+    static_mismatch_penalty: float = 1.0,
+    min_motion_for_type_penalty: float = 0.03,
+    min_confidence_for_type_penalty: float = 0.75,
+) -> float:
+    return articulation_pair_compatibility_metrics(
+        a_track,
+        b_track,
+        type_mismatch_penalty=type_mismatch_penalty,
+        static_mismatch_penalty=static_mismatch_penalty,
+        min_motion_for_type_penalty=min_motion_for_type_penalty,
+        min_confidence_for_type_penalty=min_confidence_for_type_penalty,
+    )["compatibility"]
+
+
+def articulation_pair_compatibility_metrics(
+    a_track: dict[str, Any],
+    b_track: dict[str, Any],
+    *,
+    type_mismatch_penalty: float = 0.65,
+    static_mismatch_penalty: float = 1.0,
+    min_motion_for_type_penalty: float = 0.03,
+    min_confidence_for_type_penalty: float = 0.75,
+) -> dict[str, Any]:
     a_quality = a_track.get("track_quality") if isinstance(a_track.get("track_quality"), dict) else {}
     b_quality = b_track.get("track_quality") if isinstance(b_track.get("track_quality"), dict) else {}
     a_type = str(a_quality.get("best_motion_type") or a_track.get("best_motion_type") or "unknown")
     b_type = str(b_quality.get("best_motion_type") or b_track.get("best_motion_type") or "unknown")
-    score = math.sqrt(articulation_track_score(a_track) * articulation_track_score(b_track))
+    a_score = articulation_track_score(a_track)
+    b_score = articulation_track_score(b_track)
+    score = math.sqrt(a_score * b_score)
+    a_motion = _track_motion_m(a_track)
+    b_motion = _track_motion_m(b_track)
+    penalty = 1.0
+    reason = "same_or_unknown_type"
     if a_type != "unknown" and b_type != "unknown" and a_type != b_type:
-        score *= 0.65
-    return float(_clip01(score))
+        strong_type_evidence = (
+            a_motion >= float(min_motion_for_type_penalty)
+            and b_motion >= float(min_motion_for_type_penalty)
+            and a_score >= float(min_confidence_for_type_penalty)
+            and b_score >= float(min_confidence_for_type_penalty)
+        )
+        if a_type == "static" or b_type == "static":
+            penalty = float(static_mismatch_penalty) if strong_type_evidence else 1.0
+            reason = "static_mismatch_penalized" if penalty < 1.0 else "static_mismatch_neutralized"
+        elif strong_type_evidence:
+            penalty = float(type_mismatch_penalty)
+            reason = "confident_nonstatic_type_mismatch"
+        else:
+            penalty = 0.9
+            reason = "weak_type_evidence_mismatch"
+        score *= penalty
+    return {
+        "compatibility": float(_clip01(score)),
+        "base_score": float(_clip01(math.sqrt(a_score * b_score))),
+        "penalty": float(_clip01(penalty)),
+        "penalty_reason": reason,
+        "a_motion_m": float(a_motion),
+        "b_motion_m": float(b_motion),
+        "a_best_motion_type": a_type,
+        "b_best_motion_type": b_type,
+        "a_articulation_score": float(a_score),
+        "b_articulation_score": float(b_score),
+    }
 
 
 def _safe_float(value: Any) -> float | None:
@@ -171,6 +230,15 @@ def _valid_track_points(track: dict[str, Any]) -> tuple[list[int], list[list[flo
         rows.append((int(sample.get("frame_index", len(rows))), [float(xyz[0]), float(xyz[1]), float(xyz[2])]))
     rows = sorted(rows, key=lambda item: item[0])
     return [item[0] for item in rows], [item[1] for item in rows]
+
+
+def _track_motion_m(track: dict[str, Any]) -> float:
+    _, points = _valid_track_points(track)
+    if len(points) < 2:
+        return 0.0
+    first = points[0]
+    last = points[-1]
+    return math.sqrt(sum((float(a) - float(b)) ** 2 for a, b in zip(first, last)))
 
 
 def _fit_static(points: list[list[float]]) -> dict[str, Any]:

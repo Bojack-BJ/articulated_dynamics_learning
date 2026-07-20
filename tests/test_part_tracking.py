@@ -11,7 +11,10 @@ from rgbd_urdf_mvp.perception.part_tracking import (
     TrackPartPoseEstimationConfig,
     TrackPartPoseEstimator,
     _backproject_track_sample,
+    _expanded_robust_bbox,
+    _point_in_bbox,
     _sample_foreground_seed_pixels,
+    _sample_uncovered_foreground_seed_pixels,
 )
 
 
@@ -86,6 +89,12 @@ class PartTrackingTests(unittest.TestCase):
                 "--seed-stride-px",
                 "12",
                 "--no-progress",
+                "--export-cotracker-features",
+                "--cotracker-features-output",
+                "features.npz",
+                "--dynamic-reseeding",
+                "--reseed-bbox-scale",
+                "1.2",
             ]
         )
         self.assertEqual(args.command, "track-part-pixels")
@@ -94,6 +103,10 @@ class PartTrackingTests(unittest.TestCase):
         self.assertEqual(args.frame_stride, 4)
         self.assertEqual(args.seed_stride_px, 12)
         self.assertTrue(args.no_progress)
+        self.assertTrue(args.export_cotracker_features)
+        self.assertEqual(args.cotracker_features_output, Path("features.npz"))
+        self.assertTrue(args.dynamic_reseeding)
+        self.assertAlmostEqual(args.reseed_bbox_scale, 1.2)
         self.assertEqual(Path(args.cotracker_checkpoint), Path("co-tracker/ckpt/scaled_offline.pth"))
 
     def test_estimate_part_poses_parser_accepts_tracks_method(self) -> None:
@@ -156,6 +169,49 @@ class PartTrackingTests(unittest.TestCase):
         self.assertTrue(depth_valid)
         self.assertTrue(mask_consistent)
         self.assertIsNotNone(xyz)
+
+    def test_dynamic_reseed_samples_only_uncovered_valid_depth(self) -> None:
+        mask = [[1 for _ in range(8)] for _ in range(8)]
+        depth = [[1000 for _ in range(8)] for _ in range(8)]
+        depth[6][6] = 0
+        seeds = _sample_uncovered_foreground_seed_pixels(
+            mask,
+            depth,
+            covered_uv=[(1.0, 1.0)],
+            stride_px=2,
+            coverage_radius_px=2.5,
+            min_depth_m=0.1,
+            max_depth_m=2.0,
+            max_points=20,
+        )
+        self.assertNotIn((0, 0), seeds)
+        self.assertNotIn((2, 2), seeds)
+        self.assertNotIn((6, 6), seeds)
+        self.assertIn((4, 4), seeds)
+
+        indexed_mask = [[0 for _ in range(8)] for _ in range(8)]
+        indexed_mask[4][4] = 2
+        indexed_mask[4][6] = 3
+        indexed = _sample_uncovered_foreground_seed_pixels(
+            indexed_mask,
+            depth,
+            covered_uv=[],
+            stride_px=2,
+            coverage_radius_px=1.0,
+            min_depth_m=0.1,
+            max_depth_m=2.0,
+            max_points=20,
+            expected_part_id=2,
+        )
+        self.assertEqual(indexed, [(4, 4)])
+
+    def test_dynamic_reseed_bbox_uses_expanded_robust_extent(self) -> None:
+        bbox = _expanded_robust_bbox(
+            [[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]],
+            scale=1.2,
+        )
+        self.assertTrue(_point_in_bbox([1.05, 2.1, 3.1], bbox))
+        self.assertFalse(_point_in_bbox([2.0, 2.1, 3.1], bbox))
 
     def test_track_based_pose_estimation_recovers_rigid_motion(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

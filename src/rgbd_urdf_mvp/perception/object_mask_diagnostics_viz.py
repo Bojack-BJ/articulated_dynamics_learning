@@ -20,7 +20,9 @@ class ObjectMaskDiagnosticsVisualizationConfig:
     top_n_candidates: int = 8
     axis_length_m: float = 0.5
     viz_frame: str = "world"
-    axis_remap: str = "x,z,-y"
+    # Keep xyz_world in its native z-up convention unless a camera-frame adapter
+    # explicitly requests an image-style remap.
+    axis_remap: str = "x,y,z"
     flow_min_motion_m: float = 0.005
     flow_max_tracks: int = 2000
     flow_subsample: int = 1

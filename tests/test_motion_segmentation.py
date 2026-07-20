@@ -23,6 +23,23 @@ from rgbd_urdf_mvp.perception.object_mask_flow_html import ObjectMaskFlowHtmlBui
 from rgbd_urdf_mvp.perception.part_tracking import TrackPartPoseEstimationConfig, TrackPartPoseEstimator
 
 
+def _ascii_xyz_ply(points: list[list[float]]) -> str:
+    rows = [" ".join(str(value) for value in point) for point in points]
+    return "\n".join(
+        [
+            "ply",
+            "format ascii 1.0",
+            f"element vertex {len(points)}",
+            "property float x",
+            "property float y",
+            "property float z",
+            "end_header",
+            *rows,
+            "",
+        ]
+    )
+
+
 def _rotate_about_z(point: list[float], pivot: list[float], angle_rad: float) -> list[float]:
     cosine = math.cos(angle_rad)
     sine = math.sin(angle_rad)
@@ -88,6 +105,14 @@ class MotionSegmentationTests(unittest.TestCase):
                 "--quality-affinity-min-pair-weight",
                 "0.25",
                 "--articulation-compatible-affinity",
+                "--articulation-type-mismatch-penalty",
+                "0.5",
+                "--articulation-static-mismatch-penalty",
+                "0.95",
+                "--articulation-min-motion-for-type-penalty",
+                "0.04",
+                "--articulation-min-confidence-for-type-penalty",
+                "0.8",
             ]
         )
         self.assertEqual(args.command, "segment-motion-parts")
@@ -103,6 +128,125 @@ class MotionSegmentationTests(unittest.TestCase):
         self.assertTrue(args.quality_weighted_affinity_edge_prior)
         self.assertAlmostEqual(args.quality_affinity_min_pair_weight, 0.25)
         self.assertTrue(args.articulation_compatible_affinity)
+        self.assertAlmostEqual(args.articulation_type_mismatch_penalty, 0.5)
+        self.assertAlmostEqual(args.articulation_static_mismatch_penalty, 0.95)
+        self.assertAlmostEqual(args.articulation_min_motion_for_type_penalty, 0.04)
+        self.assertAlmostEqual(args.articulation_min_confidence_for_type_penalty, 0.8)
+
+    def test_parser_accepts_sequential_ransac_motion_segmentation(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "segment-motion-parts",
+                "part_tracks.json",
+                "--mode",
+                "sequential-ransac",
+                "--ransac-iterations",
+                "64",
+                "--ransac-min-inliers",
+                "6",
+                "--no-ransac-base-stabilize",
+            ]
+        )
+        self.assertEqual(args.mode, "sequential-ransac")
+        self.assertEqual(args.ransac_iterations, 64)
+        self.assertEqual(args.ransac_min_inliers, 6)
+        self.assertFalse(args.ransac_base_stabilize)
+
+    def test_parser_accepts_learned_connected_without_fixed_k(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "segment-motion-parts",
+                "part_tracks.json",
+                "--mode",
+                "learned-connected",
+                "--pairwise-affinity-model",
+                "affinity.pt",
+                "--cotracker-features-npz",
+                "features.npz",
+                "--pairwise-connect-threshold",
+                "0.95",
+            ]
+        )
+        self.assertEqual(args.mode, "learned-connected")
+        self.assertAlmostEqual(args.pairwise_connect_threshold, 0.95)
+
+    def test_sequential_ransac_recovers_shared_rigid_motion_groups(self) -> None:
+        frame_angles = [0.0, 0.12, 0.24, 0.36, 0.48]
+        tracks = []
+        groups: dict[str, list[int]] = {"base": [], "door": [], "drawer": []}
+
+        base_points = [[-0.4, -0.2, 0.0], [-0.4, 0.2, 0.0], [-0.2, -0.2, 0.2], [-0.2, 0.2, 0.2]]
+        door_points = [
+            [0.15, -0.3, 0.1],
+            [0.3, -0.2, 0.4],
+            [0.55, -0.1, 0.2],
+            [0.8, 0.0, 0.5],
+            [1.0, 0.1, 0.15],
+            [1.2, 0.2, 0.45],
+        ]
+        drawer_points = [
+            [0.1, 1.0, 0.0],
+            [0.3, 1.0, 0.2],
+            [0.5, 1.0, 0.0],
+            [0.7, 1.0, 0.2],
+            [0.9, 1.0, 0.1],
+        ]
+        for point in base_points:
+            groups["base"].append(len(tracks))
+            tracks.append(_track(len(tracks), point, [list(point) for _ in frame_angles]))
+        for point in door_points:
+            groups["door"].append(len(tracks))
+            tracks.append(
+                _track(
+                    len(tracks),
+                    point,
+                    [_rotate_about_z(point, [0.0, 0.0, 0.0], angle) for angle in frame_angles],
+                )
+            )
+        for point in drawer_points:
+            groups["drawer"].append(len(tracks))
+            tracks.append(
+                _track(
+                    len(tracks),
+                    point,
+                    [[point[0], point[1] + 0.25 * frame_index, point[2]] for frame_index in range(5)],
+                )
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            input_path = root / "part_tracks.json"
+            output_path = root / "motion_part_tracks_ransac.json"
+            input_path.write_text(json.dumps({"estimator": "synthetic", "tracks": tracks}), encoding="utf-8")
+            MotionPartSegmenter(
+                MotionPartSegmentationConfig(
+                    input_tracks=input_path,
+                    output_json=output_path,
+                    mode="sequential-ransac",
+                    static_motion_threshold_m=0.01,
+                    moving_motion_threshold_m=0.03,
+                    min_common_frames=3,
+                    ransac_iterations=256,
+                    ransac_sample_size=3,
+                    ransac_inlier_threshold_m=0.005,
+                    ransac_min_inliers=4,
+                    ransac_max_models=3,
+                    ransac_spatial_link_m=1.5,
+                    ransac_assignment_threshold_m=0.01,
+                    ransac_base_stabilize=False,
+                )
+            ).segment()
+
+            result = json.loads(output_path.read_text(encoding="utf-8"))
+            labels = [int(track["part_id"]) for track in result["tracks"]]
+            group_labels = {
+                name: {labels[index] for index in indices}
+                for name, indices in groups.items()
+            }
+            self.assertEqual(result["motion_segmentation"]["mode"], "sequential-ransac")
+            self.assertEqual(result["motion_segmentation"]["part_count"], 3)
+            self.assertTrue(all(len(values) == 1 for values in group_labels.values()))
+            self.assertEqual(len({next(iter(values)) for values in group_labels.values()}), 3)
 
     def test_quality_weighted_pair_rigidity_downweights_bad_timestep(self) -> None:
         a_by_frame = {
@@ -186,6 +330,7 @@ class MotionSegmentationTests(unittest.TestCase):
         self.assertEqual(len(edges), 1)
         self.assertTrue(edges[0]["articulation_affinity_enabled"])
         self.assertAlmostEqual(edges[0]["articulation_compatibility"], 0.5)
+        self.assertIn("articulation_penalty_reason", edges[0])
 
     def test_mixed_cluster_has_higher_articulation_residual_than_clean_cluster(self) -> None:
         base_tracks = [
@@ -656,11 +801,21 @@ class MotionSegmentationTests(unittest.TestCase):
             self.assertIn("frameSlider", html)
             self.assertIn("trailSlider", html)
             self.assertIn("Plotly.react", html)
+            self.assertIn("plotly_relayout", html)
+            self.assertIn("savedCamera", html)
+            self.assertIn("captureCameraFromPlot", html)
+            self.assertIn("cloneCamera", html)
+            self.assertIn('uirevision: "object-mask-flow-camera-v1"', html)
+            self.assertIn("camera: currentCamera()", html)
+            self.assertIn("Plotly.react(plot, data, layout", html)
             self.assertIn("function jointColor", html)
             self.assertIn("function clippedAxisSegment", html)
             self.assertIn("Track quality", html)
             self.assertIn("hideLowQualityTimesteps", html)
-            self.assertIn("...buildJointTraces(activeTracks, colorBy)", html)
+            self.assertIn("...buildJointTraces(activeTracks, frameIndex, colorBy)", html)
+            self.assertIn("function childCentroidAtFrame", html)
+            self.assertIn("Show GT MJCF mesh replay", html)
+            self.assertIn("function buildMjcfMeshTraces", html)
             self.assertIn("\"track_count_embedded\":2", html)
             self.assertIn("\"default_color_by\":\"gt_part\"", html)
 
@@ -677,6 +832,40 @@ class MotionSegmentationTests(unittest.TestCase):
             html_path = ObjectMaskFlowHtmlBuilder().build(ObjectMaskFlowHtmlConfig(motion_tracks=tracks_path))
             self.assertEqual(html_path, (root / "viewers" / "object_mask_flow_viewer.html").resolve())
             self.assertTrue(html_path.exists())
+
+    def test_object_mask_flow_html_embeds_source_aligned_background_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tracks_path = root / "motion_part_tracks.json"
+            tracks_path.write_text(
+                json.dumps(
+                    {
+                        "sampled_frame_indices": [0, 4],
+                        "tracks": [_track(1, [0.0, 0.0, 0.0], [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]])],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            frames_dir = root / "frames"
+            frames_dir.mkdir()
+            (frames_dir / "frame_0000.ply").write_text(_ascii_xyz_ply([[1.0, 2.0, 3.0]]), encoding="utf-8")
+            (frames_dir / "frame_0004.ply").write_text(_ascii_xyz_ply([[4.0, 5.0, 6.0]]), encoding="utf-8")
+            manifest = root / "fusion_manifest.json"
+            manifest.write_text(json.dumps({"per_frame_dir": str(frames_dir)}), encoding="utf-8")
+
+            html_path = ObjectMaskFlowHtmlBuilder().build(
+                ObjectMaskFlowHtmlConfig(
+                    motion_tracks=tracks_path,
+                    output_html=root / "flow_with_background.html",
+                    frame_stride=1,
+                    background_fusion_manifest=manifest,
+                )
+            )
+            html = html_path.read_text(encoding="utf-8")
+            self.assertIn('"source_frame_index":4', html)
+            self.assertIn('"xyz":[[4.0,5.0,6.0]]', html)
+            self.assertIn("Show RGB-D geometry", html)
+            self.assertIn("function buildBackgroundTrace", html)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import fmean
@@ -8,7 +9,7 @@ from typing import Any
 
 from ..core.serialization import load_json, save_json
 from .quality_weights import (
-    articulation_pair_compatibility,
+    articulation_pair_compatibility_metrics,
     articulation_track_score,
     cluster_quality_summary,
     observation_weight,
@@ -44,7 +45,27 @@ class MotionPartSegmentationConfig:
     quality_weighted_affinity_edge_prior: bool = False
     quality_affinity_min_pair_weight: float = 0.0
     articulation_compatible_affinity: bool = False
+    articulation_type_mismatch_penalty: float = 0.65
+    articulation_static_mismatch_penalty: float = 1.0
+    articulation_min_motion_for_type_penalty: float = 0.03
+    articulation_min_confidence_for_type_penalty: float = 0.75
+    cotracker_features_npz: str | Path | None = None
+    learned_affinity_floor: float = 0.7
+    pairwise_affinity_model: str | Path | None = None
+    pairwise_affinity_floor: float = 0.5
+    pairwise_affinity_device: str = "cpu"
+    pairwise_connect_threshold: float = 0.9
     skip_base_bridge_checks: bool = False
+    ransac_iterations: int = 128
+    ransac_sample_size: int = 4
+    ransac_inlier_threshold_m: float = 0.025
+    ransac_min_inliers: int = 12
+    ransac_max_models: int = 8
+    ransac_spatial_link_m: float = 0.35
+    ransac_assignment_threshold_m: float = 0.05
+    ransac_seed: int = 0
+    ransac_base_stabilize: bool = True
+    ransac_learned_seed: bool = False
 
 
 @dataclass(slots=True)
@@ -67,10 +88,25 @@ class MotionPartSegmenter:
 
     def __init__(self, config: MotionPartSegmentationConfig) -> None:
         self.config = config
+        self._learned_feature_map: dict[int, Any] = {}
+        self._pairwise_affinity_predictor: Any = None
 
     def segment(self) -> Path:
         input_path = Path(self.config.input_tracks).expanduser().resolve()
         artifact = load_json(input_path)
+        if self.config.cotracker_features_npz is not None:
+            from .cotracker_features import load_cotracker_feature_map
+
+            self._learned_feature_map = load_cotracker_feature_map(self.config.cotracker_features_npz)
+        if self.config.pairwise_affinity_model is not None:
+            if not self._learned_feature_map:
+                raise ValueError("--pairwise-affinity-model requires --cotracker-features-npz.")
+            from .pairwise_affinity import PairwiseAffinityPredictor
+
+            self._pairwise_affinity_predictor = PairwiseAffinityPredictor(
+                self.config.pairwise_affinity_model,
+                device=self.config.pairwise_affinity_device,
+            )
         tracks, filter_report = self._load_tracks(artifact)
         if not tracks:
             raise ValueError("No valid 3D tracks found for motion segmentation.")
@@ -79,6 +115,10 @@ class MotionPartSegmenter:
             output_path, diagnostics = self._segment_connected(input_path, artifact, tracks, filter_report)
         elif self.config.mode == "knn-spectral":
             output_path, diagnostics = self._segment_knn_spectral(input_path, artifact, tracks, filter_report)
+        elif self.config.mode == "sequential-ransac":
+            output_path, diagnostics = self._segment_sequential_ransac(input_path, artifact, tracks, filter_report)
+        elif self.config.mode == "learned-connected":
+            output_path, diagnostics = self._segment_learned_connected(input_path, artifact, tracks, filter_report)
         else:
             raise ValueError(f"Unsupported motion segmentation mode: {self.config.mode}")
 
@@ -163,6 +203,281 @@ class MotionPartSegmenter:
             part_ids=part_ids,
             filter_report=filter_report,
             extra={"base_bridge_checks": self._base_bridge_checks(tracks)},
+        )
+        return output_path, diagnostics
+
+    def _segment_learned_connected(
+        self,
+        input_path: Path,
+        artifact: dict[str, Any],
+        tracks: list[dict[str, Any]],
+        filter_report: dict[str, Any],
+    ) -> tuple[Path, dict[str, Any]]:
+        """Discover moving components directly from dense learned pair affinities."""
+        if self._pairwise_affinity_predictor is None:
+            raise ValueError("learned-connected requires --pairwise-affinity-model.")
+        from .pairwise_affinity import pair_feature_vector
+
+        static_indices, moving_indices, ambiguous_indices = self._motion_split(tracks)
+        graph = [set() for _ in tracks]
+        edge_metrics: list[dict[str, Any]] = []
+        vectors: list[Any] = []
+        pair_rows: list[tuple[int, int, dict[str, Any]]] = []
+        trajectories = [_trajectory_by_frame(track) for track in tracks]
+        for offset, global_i in enumerate(moving_indices):
+            for global_j in moving_indices[offset + 1 :]:
+                metrics = _pair_metrics(
+                    trajectories[global_i],
+                    trajectories[global_j],
+                    self.config.min_common_frames,
+                )
+                if metrics is None:
+                    continue
+                track_i = tracks[global_i]
+                track_j = tracks[global_j]
+                feature_i = self._learned_feature_map.get(int(track_i.get("track_id", -1)))
+                feature_j = self._learned_feature_map.get(int(track_j.get("track_id", -1)))
+                if feature_i is None or feature_j is None:
+                    continue
+                vectors.append(
+                    pair_feature_vector(
+                        feature_i,
+                        feature_j,
+                        track_i,
+                        track_j,
+                        metrics,
+                        reference_distance_m=float(metrics.get("median_distance_m", 0.0)),
+                    )
+                )
+                pair_rows.append((global_i, global_j, metrics))
+
+        probabilities = self._pairwise_affinity_predictor.predict_many(vectors)
+        threshold = float(self.config.pairwise_connect_threshold)
+        for (global_i, global_j, metrics), probability in zip(pair_rows, probabilities):
+            row = dict(metrics)
+            row.update(
+                {
+                    "i": global_i,
+                    "j": global_j,
+                    "pairwise_affinity_available": True,
+                    "pairwise_same_part_probability": probability,
+                    "pairwise_affinity_multiplier": probability,
+                    "connected": probability >= threshold,
+                }
+            )
+            if probability >= threshold:
+                graph[global_i].add(global_j)
+                graph[global_j].add(global_i)
+            edge_metrics.append(row)
+
+        moving_graph = [set() for _ in moving_indices]
+        local_index = {global_index: index for index, global_index in enumerate(moving_indices)}
+        for global_i in moving_indices:
+            for global_j in graph[global_i]:
+                moving_graph[local_index[global_i]].add(local_index[global_j])
+        components = [
+            [moving_indices[local_index_value] for local_index_value in component]
+            for component in _connected_components(moving_graph, len(moving_indices))
+        ]
+        components = self._merge_small_components(tracks, components)
+        components = sorted(components, key=lambda values: (-len(values), min(values)))
+        part_ids = {index: 1 for index in static_indices}
+        for part_id, component in enumerate(components, start=2):
+            for index in component:
+                part_ids[index] = part_id
+        for index in ambiguous_indices:
+            part_ids[index] = _nearest_assigned_part_id(tracks[index], tracks, part_ids)
+
+        output_path = self._write_assignment(
+            input_path=input_path,
+            artifact=artifact,
+            tracks=tracks,
+            part_ids=part_ids,
+            estimator="motion-learned-connected-cotracker-clustering",
+            segmentation_extra={
+                "mode": "learned-connected",
+                "pairwise_connect_threshold": threshold,
+                "source_estimator": artifact.get("estimator"),
+                "track_count": len(tracks),
+                "part_count": len(set(part_ids.values())),
+                "config": self._config_payload(),
+            },
+        )
+        diagnostics = self._diagnostics(
+            mode="learned-connected",
+            artifact=artifact,
+            tracks=tracks,
+            graph=graph,
+            edge_metrics=edge_metrics,
+            part_ids=part_ids,
+            filter_report=filter_report,
+            extra={
+                "pairwise_connect_threshold": threshold,
+                "all_pair_candidate_count": len(pair_rows),
+                "accepted_edge_count": sum(bool(row["connected"]) for row in edge_metrics),
+                "motion_split": {
+                    "static_confident": len(static_indices),
+                    "moving_confident": len(moving_indices),
+                    "ambiguous": len(ambiguous_indices),
+                },
+            },
+        )
+        return output_path, diagnostics
+
+    def _segment_sequential_ransac(
+        self,
+        input_path: Path,
+        artifact: dict[str, Any],
+        tracks: list[dict[str, Any]],
+        filter_report: dict[str, Any],
+    ) -> tuple[Path, dict[str, Any]]:
+        static_indices, moving_indices, ambiguous_indices = self._motion_split(tracks)
+        trajectories = [_trajectory_by_frame(track) for track in tracks]
+        references = [_reference_position(track) for track in tracks]
+        base_transforms = (
+            _fit_frame_transforms(static_indices, references, trajectories)
+            if self.config.ransac_base_stabilize and len(static_indices) >= 3
+            else {}
+        )
+        stabilized = _stabilize_trajectories(trajectories, base_transforms)
+        learned_seed_neighbors: dict[int, list[tuple[float, int]]] | None = None
+        if self.config.ransac_learned_seed:
+            if self._pairwise_affinity_predictor is None:
+                raise ValueError("--ransac-learned-seed requires --pairwise-affinity-model.")
+            _, _, learned_edges = self._build_knn_weighted_graph(tracks, moving_indices, "B")
+            learned_seed_neighbors = {index: [] for index in moving_indices}
+            for edge in learned_edges:
+                probability = edge.get("pairwise_same_part_probability")
+                if not isinstance(probability, (int, float)):
+                    continue
+                index_i = int(edge["i"])
+                index_j = int(edge["j"])
+                learned_seed_neighbors[index_i].append((float(probability), index_j))
+                learned_seed_neighbors[index_j].append((float(probability), index_i))
+            for neighbors in learned_seed_neighbors.values():
+                neighbors.sort(reverse=True)
+        rng = random.Random(int(self.config.ransac_seed))
+        remaining = set(moving_indices)
+        models: list[dict[str, Any]] = []
+
+        for model_index in range(max(1, int(self.config.ransac_max_models))):
+            if len(remaining) < max(3, int(self.config.ransac_min_inliers)):
+                break
+            model = _best_rigid_ransac_model(
+                candidate_indices=sorted(remaining),
+                references=references,
+                trajectories=stabilized,
+                iterations=max(1, int(self.config.ransac_iterations)),
+                sample_size=max(3, int(self.config.ransac_sample_size)),
+                min_common_frames=max(2, int(self.config.min_common_frames)),
+                inlier_threshold_m=max(1e-6, float(self.config.ransac_inlier_threshold_m)),
+                spatial_link_m=max(1e-6, float(self.config.ransac_spatial_link_m)),
+                rng=rng,
+                learned_seed_neighbors=learned_seed_neighbors,
+            )
+            if model is None or len(model["inlier_indices"]) < max(3, int(self.config.ransac_min_inliers)):
+                break
+            model["model_index"] = model_index
+            models.append(model)
+            remaining.difference_update(model["inlier_indices"])
+
+        if not models:
+            raise ValueError(
+                "Sequential RANSAC found no rigid moving-part model. "
+                "Lower --ransac-min-inliers or increase --ransac-inlier-threshold-m."
+            )
+
+        part_ids = {index: 1 for index in static_indices}
+        for model_index, model in enumerate(models, start=2):
+            for index in model["inlier_indices"]:
+                part_ids[int(index)] = model_index
+
+        unassigned = sorted(set(ambiguous_indices) | remaining)
+        assignment_rows = []
+        for index in unassigned:
+            best_part_id, residual = _best_model_assignment(
+                index,
+                models,
+                references,
+                stabilized,
+            )
+            motion = _track_motion_m(tracks[index])
+            if motion <= float(self.config.static_motion_threshold_m):
+                assigned = 1
+            elif best_part_id is not None and residual is not None and residual <= float(
+                self.config.ransac_assignment_threshold_m
+            ):
+                assigned = 2 + best_part_id
+            else:
+                assigned = _nearest_assigned_part_id(tracks[index], tracks, part_ids)
+            part_ids[index] = int(assigned)
+            assignment_rows.append(
+                {
+                    "track_index": int(index),
+                    "assigned_part_id": int(assigned),
+                    "best_model_residual_m": residual,
+                    "fallback": best_part_id is None
+                    or residual is None
+                    or residual > float(self.config.ransac_assignment_threshold_m),
+                }
+            )
+
+        model_rows = [
+            {
+                "model_index": int(model["model_index"]),
+                "part_id": int(model["model_index"]) + 2,
+                "inlier_count": len(model["inlier_indices"]),
+                "inlier_ratio_at_extraction": model["inlier_ratio"],
+                "mean_inlier_residual_m": model["mean_inlier_residual_m"],
+                "median_inlier_residual_m": model["median_inlier_residual_m"],
+                "model_frame_count": len(model["transforms"]),
+                "sample_pool_count": int(model["sample_pool_count"]),
+                "minimum_sample_support_frames": int(model["minimum_sample_support_frames"]),
+                "sample_indices": [int(value) for value in model["sample_indices"]],
+            }
+            for model in models
+        ]
+        output_path = self._write_assignment(
+            input_path=input_path,
+            artifact=artifact,
+            tracks=tracks,
+            part_ids=part_ids,
+            estimator="motion-sequential-ransac-cotracker-clustering",
+            segmentation_extra={
+                "mode": "sequential-ransac",
+                "source_estimator": artifact.get("estimator"),
+                "track_count": len(tracks),
+                "part_count": len(set(part_ids.values())),
+                "config": self._config_payload(),
+                "motion_split": {
+                    "static_confident": len(static_indices),
+                    "moving_confident": len(moving_indices),
+                    "ambiguous": len(ambiguous_indices),
+                },
+                "base_stabilization_frame_count": len(base_transforms),
+                "models": model_rows,
+                "learned_seed_enabled": bool(self.config.ransac_learned_seed),
+                "unassigned_reassignment": assignment_rows,
+            },
+        )
+        diagnostics = self._diagnostics(
+            mode="sequential-ransac",
+            artifact=artifact,
+            tracks=tracks,
+            graph=[set() for _ in tracks],
+            edge_metrics=[],
+            part_ids=part_ids,
+            filter_report=filter_report,
+            extra={
+                "motion_split": {
+                    "static_confident": len(static_indices),
+                    "moving_confident": len(moving_indices),
+                    "ambiguous": len(ambiguous_indices),
+                },
+                "base_stabilization_frame_count": len(base_transforms),
+                "models": model_rows,
+                "unassigned_reassignment": assignment_rows,
+            },
         )
         return output_path, diagnostics
 
@@ -405,6 +720,8 @@ class MotionPartSegmenter:
                 if metrics is None:
                     continue
                 self._add_articulation_metrics(metrics, tracks[global_i], tracks[global_j])
+                self._add_learned_feature_metrics(metrics, tracks[global_i], tracks[global_j])
+                self._add_pairwise_affinity_metrics(metrics, tracks[global_i], tracks[global_j])
                 weight = self._edge_weight(metrics, ablation)
                 if weight <= 0.0:
                     continue
@@ -436,6 +753,10 @@ class MotionPartSegmenter:
             score *= float(metrics.get("pair_quality_prior", 1.0) or 1.0)
         if bool(metrics.get("articulation_affinity_enabled", False)):
             score *= float(metrics.get("articulation_compatibility", 1.0) or 1.0)
+        if bool(metrics.get("learned_affinity_enabled", False)):
+            score *= float(metrics.get("learned_affinity_multiplier", 1.0) or 1.0)
+        if bool(metrics.get("pairwise_affinity_enabled", False)):
+            score *= float(metrics.get("pairwise_affinity_multiplier", 1.0) or 1.0)
         return float(max(0.0, min(1.0, score)))
 
     def _merge_small_components(self, tracks: list[dict[str, Any]], components: list[list[int]]) -> list[list[int]]:
@@ -579,7 +900,37 @@ class MotionPartSegmenter:
             "quality_weighted_affinity_edge_prior": bool(self.config.quality_weighted_affinity_edge_prior),
             "quality_affinity_min_pair_weight": float(self.config.quality_affinity_min_pair_weight),
             "articulation_compatible_affinity": bool(self.config.articulation_compatible_affinity),
+            "articulation_type_mismatch_penalty": float(self.config.articulation_type_mismatch_penalty),
+            "articulation_static_mismatch_penalty": float(self.config.articulation_static_mismatch_penalty),
+            "articulation_min_motion_for_type_penalty": float(self.config.articulation_min_motion_for_type_penalty),
+            "articulation_min_confidence_for_type_penalty": float(
+                self.config.articulation_min_confidence_for_type_penalty
+            ),
+            "cotracker_features_npz": (
+                None
+                if self.config.cotracker_features_npz is None
+                else str(Path(self.config.cotracker_features_npz).expanduser().resolve())
+            ),
+            "learned_affinity_floor": float(self.config.learned_affinity_floor),
+            "pairwise_affinity_model": (
+                None
+                if self.config.pairwise_affinity_model is None
+                else str(Path(self.config.pairwise_affinity_model).expanduser().resolve())
+            ),
+            "pairwise_affinity_floor": float(self.config.pairwise_affinity_floor),
+            "pairwise_affinity_device": self.config.pairwise_affinity_device,
+            "pairwise_connect_threshold": float(self.config.pairwise_connect_threshold),
             "skip_base_bridge_checks": bool(self.config.skip_base_bridge_checks),
+            "ransac_iterations": int(self.config.ransac_iterations),
+            "ransac_sample_size": int(self.config.ransac_sample_size),
+            "ransac_inlier_threshold_m": float(self.config.ransac_inlier_threshold_m),
+            "ransac_min_inliers": int(self.config.ransac_min_inliers),
+            "ransac_max_models": int(self.config.ransac_max_models),
+            "ransac_spatial_link_m": float(self.config.ransac_spatial_link_m),
+            "ransac_assignment_threshold_m": float(self.config.ransac_assignment_threshold_m),
+            "ransac_seed": int(self.config.ransac_seed),
+            "ransac_base_stabilize": bool(self.config.ransac_base_stabilize),
+            "ransac_learned_seed": bool(self.config.ransac_learned_seed),
         }
 
     def _use_time_quality_affinity(self) -> bool:
@@ -602,7 +953,70 @@ class MotionPartSegmenter:
         metrics["articulation_affinity_enabled"] = enabled
         if not enabled:
             return
-        metrics["articulation_compatibility"] = articulation_pair_compatibility(a_track, b_track)
+        articulation_metrics = articulation_pair_compatibility_metrics(
+            a_track,
+            b_track,
+            type_mismatch_penalty=float(self.config.articulation_type_mismatch_penalty),
+            static_mismatch_penalty=float(self.config.articulation_static_mismatch_penalty),
+            min_motion_for_type_penalty=float(self.config.articulation_min_motion_for_type_penalty),
+            min_confidence_for_type_penalty=float(self.config.articulation_min_confidence_for_type_penalty),
+        )
+        metrics["articulation_compatibility"] = articulation_metrics["compatibility"]
+        metrics["articulation_penalty"] = articulation_metrics["penalty"]
+        metrics["articulation_penalty_reason"] = articulation_metrics["penalty_reason"]
+        metrics["articulation_type_pair"] = (
+            f"{articulation_metrics['a_best_motion_type']}:{articulation_metrics['b_best_motion_type']}"
+        )
+
+    def _add_learned_feature_metrics(
+        self,
+        metrics: dict[str, Any],
+        a_track: dict[str, Any],
+        b_track: dict[str, Any],
+    ) -> None:
+        enabled = bool(self._learned_feature_map) and self._pairwise_affinity_predictor is None
+        metrics["learned_affinity_enabled"] = enabled
+        if not enabled:
+            return
+        a_feature = self._learned_feature_map.get(int(a_track.get("track_id", -1)))
+        b_feature = self._learned_feature_map.get(int(b_track.get("track_id", -1)))
+        if a_feature is None or b_feature is None:
+            metrics["learned_feature_pair_available"] = False
+            metrics["learned_affinity_multiplier"] = 1.0
+            return
+        cosine = float(max(-1.0, min(1.0, float(a_feature @ b_feature))))
+        similarity = 0.5 * (cosine + 1.0)
+        floor = max(0.0, min(1.0, float(self.config.learned_affinity_floor)))
+        metrics["learned_feature_pair_available"] = True
+        metrics["learned_feature_cosine"] = cosine
+        metrics["learned_affinity_multiplier"] = floor + (1.0 - floor) * similarity
+
+    def _add_pairwise_affinity_metrics(
+        self,
+        metrics: dict[str, Any],
+        a_track: dict[str, Any],
+        b_track: dict[str, Any],
+    ) -> None:
+        metrics["pairwise_affinity_enabled"] = self._pairwise_affinity_predictor is not None
+        if self._pairwise_affinity_predictor is None:
+            return
+        a_feature = self._learned_feature_map.get(int(a_track.get("track_id", -1)))
+        b_feature = self._learned_feature_map.get(int(b_track.get("track_id", -1)))
+        if a_feature is None or b_feature is None:
+            metrics["pairwise_affinity_available"] = False
+            metrics["pairwise_affinity_multiplier"] = 1.0
+            return
+        probability = self._pairwise_affinity_predictor.predict(
+            a_feature,
+            b_feature,
+            a_track,
+            b_track,
+            metrics,
+        )
+        floor = max(0.0, min(1.0, float(self.config.pairwise_affinity_floor)))
+        metrics["pairwise_affinity_available"] = True
+        metrics["pairwise_same_part_probability"] = probability
+        metrics["pairwise_affinity_multiplier"] = floor + (1.0 - floor) * probability
 
     def _base_bridge_checks(self, tracks: list[dict[str, Any]]) -> dict[str, Any]:
         if self.config.skip_base_bridge_checks:
@@ -964,6 +1378,304 @@ def _pair_metrics(
     }
 
 
+def _fit_rigid_transform(
+    source_points: list[list[float]],
+    target_points: list[list[float]],
+) -> tuple[list[list[float]], list[float]] | None:
+    np = _optional_numpy()
+    if np is None or len(source_points) < 3 or len(source_points) != len(target_points):
+        return None
+    source = np.asarray(source_points, dtype=float)
+    target = np.asarray(target_points, dtype=float)
+    source_centroid = source.mean(axis=0)
+    target_centroid = target.mean(axis=0)
+    source_centered = source - source_centroid
+    target_centered = target - target_centroid
+    if np.linalg.matrix_rank(source_centered) < 2:
+        return None
+    try:
+        covariance = source_centered.T @ target_centered
+        u_matrix, _, vt_matrix = np.linalg.svd(covariance)
+    except np.linalg.LinAlgError:
+        return None
+    rotation = vt_matrix.T @ u_matrix.T
+    if np.linalg.det(rotation) < 0.0:
+        vt_matrix[-1, :] *= -1.0
+        rotation = vt_matrix.T @ u_matrix.T
+    translation = target_centroid - rotation @ source_centroid
+    return rotation.tolist(), translation.tolist()
+
+
+def _apply_rigid_transform(
+    point: list[float],
+    transform: tuple[list[list[float]], list[float]],
+) -> list[float]:
+    rotation, translation = transform
+    return [
+        sum(float(rotation[row][col]) * float(point[col]) for col in range(3)) + float(translation[row])
+        for row in range(3)
+    ]
+
+
+def _apply_inverse_rigid_transform(
+    point: list[float],
+    transform: tuple[list[list[float]], list[float]],
+) -> list[float]:
+    rotation, translation = transform
+    centered = [float(point[axis]) - float(translation[axis]) for axis in range(3)]
+    return [sum(float(rotation[row][col]) * centered[row] for row in range(3)) for col in range(3)]
+
+
+def _fit_frame_transforms(
+    indices: list[int],
+    references: list[list[float]],
+    trajectories: list[dict[int, list[float]]],
+) -> dict[int, tuple[list[list[float]], list[float]]]:
+    frames = sorted({frame for index in indices for frame in trajectories[index]})
+    transforms: dict[int, tuple[list[list[float]], list[float]]] = {}
+    for frame in frames:
+        visible = [index for index in indices if frame in trajectories[index]]
+        transform = _fit_rigid_transform(
+            [references[index] for index in visible],
+            [trajectories[index][frame] for index in visible],
+        )
+        if transform is not None:
+            transforms[int(frame)] = transform
+    return transforms
+
+
+def _stabilize_trajectories(
+    trajectories: list[dict[int, list[float]]],
+    base_transforms: dict[int, tuple[list[list[float]], list[float]]],
+) -> list[dict[int, list[float]]]:
+    if not base_transforms:
+        return trajectories
+    return [
+        {
+            frame: (
+                _apply_inverse_rigid_transform(point, base_transforms[frame])
+                if frame in base_transforms
+                else list(point)
+            )
+            for frame, point in trajectory.items()
+        }
+        for trajectory in trajectories
+    ]
+
+
+def _model_track_residual(
+    index: int,
+    transforms: dict[int, tuple[list[list[float]], list[float]]],
+    references: list[list[float]],
+    trajectories: list[dict[int, list[float]]],
+    min_common_frames: int,
+) -> float | None:
+    frames = sorted(set(transforms) & set(trajectories[index]))
+    if len(frames) < min_common_frames:
+        return None
+    errors = [
+        _distance(
+            _apply_rigid_transform(references[index], transforms[frame]),
+            trajectories[index][frame],
+        )
+        for frame in frames
+    ]
+    errors.sort()
+    keep = errors[: max(min_common_frames, int(math.ceil(0.8 * len(errors))))]
+    return math.sqrt(fmean(error * error for error in keep))
+
+
+def _spatial_consensus_component(
+    inliers: list[int],
+    sample_indices: list[int],
+    references: list[list[float]],
+    spatial_link_m: float,
+) -> list[int]:
+    if not inliers:
+        return []
+    local_graph = [set() for _ in inliers]
+    for local_i, index_i in enumerate(inliers):
+        distances = sorted(
+            (
+                _distance(references[index_i], references[index_j]),
+                local_j,
+            )
+            for local_j, index_j in enumerate(inliers)
+            if local_j != local_i
+        )
+        for distance, local_j in distances[:8]:
+            if distance <= spatial_link_m:
+                local_graph[local_i].add(local_j)
+                local_graph[local_j].add(local_i)
+    components = _connected_components(local_graph, len(inliers))
+    sample_set = set(sample_indices)
+    best = max(
+        components,
+        key=lambda component: (
+            sum(inliers[local_index] in sample_set for local_index in component),
+            len(component),
+        ),
+    )
+    return sorted(inliers[local_index] for local_index in best)
+
+
+def _best_rigid_ransac_model(
+    *,
+    candidate_indices: list[int],
+    references: list[list[float]],
+    trajectories: list[dict[int, list[float]]],
+    iterations: int,
+    sample_size: int,
+    min_common_frames: int,
+    inlier_threshold_m: float,
+    spatial_link_m: float,
+    rng: random.Random,
+    learned_seed_neighbors: dict[int, list[tuple[float, int]]] | None = None,
+) -> dict[str, Any] | None:
+    if len(candidate_indices) < max(3, sample_size):
+        return None
+    maximum_support = max(len(trajectories[index]) for index in candidate_indices)
+    minimum_sample_support = max(min_common_frames, int(math.ceil(0.5 * maximum_support)))
+    sample_pool = [
+        index
+        for index in candidate_indices
+        if len(trajectories[index]) >= minimum_sample_support
+    ]
+    if len(sample_pool) < max(3, sample_size):
+        sample_pool = candidate_indices
+    best: dict[str, Any] | None = None
+    for _ in range(iterations):
+        sample = _ransac_sample(
+            sample_pool,
+            sample_size,
+            rng,
+            learned_seed_neighbors=learned_seed_neighbors,
+        )
+        transforms = _fit_frame_transforms(sample, references, trajectories)
+        if len(transforms) < min_common_frames:
+            continue
+        residuals = {
+            index: residual
+            for index in candidate_indices
+            if (
+                residual := _model_track_residual(
+                    index,
+                    transforms,
+                    references,
+                    trajectories,
+                    min_common_frames,
+                )
+            )
+            is not None
+        }
+        inliers = sorted(index for index, residual in residuals.items() if residual <= inlier_threshold_m)
+        inliers = _spatial_consensus_component(inliers, sample, references, spatial_link_m)
+        if len(inliers) < 3:
+            continue
+        inlier_residuals = [residuals[index] for index in inliers]
+        key = (len(inliers), -fmean(inlier_residuals), len(transforms))
+        if best is None or key > best["selection_key"]:
+            best = {
+                "sample_indices": sample,
+                "inlier_indices": inliers,
+                "transforms": transforms,
+                "residuals": residuals,
+                "selection_key": key,
+            }
+    if best is None:
+        return None
+
+    refined_transforms = _fit_frame_transforms(best["inlier_indices"], references, trajectories)
+    if len(refined_transforms) >= min_common_frames:
+        refined_residuals = {
+            index: residual
+            for index in candidate_indices
+            if (
+                residual := _model_track_residual(
+                    index,
+                    refined_transforms,
+                    references,
+                    trajectories,
+                    min_common_frames,
+                )
+            )
+            is not None
+        }
+        refined_inliers = sorted(
+            index for index, residual in refined_residuals.items() if residual <= inlier_threshold_m
+        )
+        refined_inliers = _spatial_consensus_component(
+            refined_inliers,
+            best["sample_indices"],
+            references,
+            spatial_link_m,
+        )
+        # The minimal hypothesis may only span the few frames shared by its sampled
+        # tracks. Always prefer a valid consensus refit so the model is evaluated
+        # over the full temporal support, even when stricter replay drops inliers.
+        if len(refined_inliers) >= 3:
+            best["inlier_indices"] = refined_inliers
+            best["transforms"] = refined_transforms
+            best["residuals"] = refined_residuals
+
+    values = [best["residuals"][index] for index in best["inlier_indices"]]
+    best["inlier_ratio"] = len(best["inlier_indices"]) / max(1, len(candidate_indices))
+    best["sample_pool_count"] = len(sample_pool)
+    best["minimum_sample_support_frames"] = minimum_sample_support
+    best["mean_inlier_residual_m"] = float(fmean(values))
+    best["median_inlier_residual_m"] = float(_median(values))
+    best.pop("selection_key", None)
+    return best
+
+
+def _ransac_sample(
+    sample_pool: list[int],
+    sample_size: int,
+    rng: random.Random,
+    *,
+    learned_seed_neighbors: dict[int, list[tuple[float, int]]] | None,
+) -> list[int]:
+    count = min(sample_size, len(sample_pool))
+    if learned_seed_neighbors is None or count <= 1:
+        return sorted(rng.sample(sample_pool, count))
+    anchor = rng.choice(sample_pool)
+    pool_set = set(sample_pool)
+    ranked = [
+        index
+        for probability, index in learned_seed_neighbors.get(anchor, [])
+        if probability >= 0.5 and index in pool_set and index != anchor
+    ]
+    candidate_window = ranked[: max(count - 1, 3 * (count - 1))]
+    chosen = rng.sample(candidate_window, min(count - 1, len(candidate_window)))
+    if len(chosen) < count - 1:
+        fallback = [index for index in sample_pool if index != anchor and index not in chosen]
+        chosen.extend(rng.sample(fallback, count - 1 - len(chosen)))
+    return sorted([anchor, *chosen])
+
+
+def _best_model_assignment(
+    index: int,
+    models: list[dict[str, Any]],
+    references: list[list[float]],
+    trajectories: list[dict[int, list[float]]],
+) -> tuple[int | None, float | None]:
+    candidates = []
+    for model_index, model in enumerate(models):
+        residual = _model_track_residual(
+            index,
+            model["transforms"],
+            references,
+            trajectories,
+            min_common_frames=2,
+        )
+        if residual is not None:
+            candidates.append((float(residual), model_index))
+    if not candidates:
+        return None, None
+    residual, model_index = min(candidates)
+    return int(model_index), float(residual)
+
+
 def _connected_components(graph: list[set[int]], count: int) -> list[list[int]]:
     seen = [False] * count
     components: list[list[int]] = []
@@ -1108,6 +1820,10 @@ def _edge_summary(edge_metrics: list[dict[str, Any]], tracks: list[dict[str, Any
     cross_gt = 0
     unknown = 0
     type_counts: dict[str, int] = {}
+    same_gt_learned_cosines: list[float] = []
+    cross_gt_learned_cosines: list[float] = []
+    same_gt_pairwise_probabilities: list[float] = []
+    cross_gt_pairwise_probabilities: list[float] = []
     part_meta = _original_part_metadata(artifact)
     for edge in edge_metrics:
         left = _original_part_id(tracks[int(edge["i"])])
@@ -1117,8 +1833,16 @@ def _edge_summary(edge_metrics: list[dict[str, Any]], tracks: list[dict[str, Any
             continue
         if left == right:
             same_gt += 1
+            if isinstance(edge.get("learned_feature_cosine"), (int, float)):
+                same_gt_learned_cosines.append(float(edge["learned_feature_cosine"]))
+            if isinstance(edge.get("pairwise_same_part_probability"), (int, float)):
+                same_gt_pairwise_probabilities.append(float(edge["pairwise_same_part_probability"]))
         else:
             cross_gt += 1
+            if isinstance(edge.get("learned_feature_cosine"), (int, float)):
+                cross_gt_learned_cosines.append(float(edge["learned_feature_cosine"]))
+            if isinstance(edge.get("pairwise_same_part_probability"), (int, float)):
+                cross_gt_pairwise_probabilities.append(float(edge["pairwise_same_part_probability"]))
             edge_type = _cross_edge_type(left, right, part_meta)
             type_counts[edge_type] = type_counts.get(edge_type, 0) + 1
     total_known = same_gt + cross_gt
@@ -1143,6 +1867,44 @@ def _edge_summary(edge_metrics: list[dict[str, Any]], tracks: list[dict[str, Any
         for edge in edge_metrics
         if isinstance(edge.get("articulation_compatibility"), (int, float))
     ]
+    learned_cosines = [
+        float(edge["learned_feature_cosine"])
+        for edge in edge_metrics
+        if isinstance(edge.get("learned_feature_cosine"), (int, float))
+    ]
+    learned_multipliers = [
+        float(edge["learned_affinity_multiplier"])
+        for edge in edge_metrics
+        if bool(edge.get("learned_feature_pair_available"))
+        and isinstance(edge.get("learned_affinity_multiplier"), (int, float))
+    ]
+    pairwise_probabilities = [
+        float(edge["pairwise_same_part_probability"])
+        for edge in edge_metrics
+        if bool(edge.get("pairwise_affinity_available"))
+        and isinstance(edge.get("pairwise_same_part_probability"), (int, float))
+    ]
+    pairwise_multipliers = [
+        float(edge["pairwise_affinity_multiplier"])
+        for edge in edge_metrics
+        if bool(edge.get("pairwise_affinity_available"))
+        and isinstance(edge.get("pairwise_affinity_multiplier"), (int, float))
+    ]
+    static_articulated_pair_count = 0
+    static_articulated_penalized_count = 0
+    static_articulated_neutralized_count = 0
+    confident_type_mismatch_pair_count = 0
+    for edge in edge_metrics:
+        reason = str(edge.get("articulation_penalty_reason") or "")
+        type_pair = str(edge.get("articulation_type_pair") or "")
+        if "static" in type_pair and ":" in type_pair and len(set(type_pair.split(":"))) > 1:
+            static_articulated_pair_count += 1
+            if reason == "static_mismatch_penalized":
+                static_articulated_penalized_count += 1
+            elif reason == "static_mismatch_neutralized":
+                static_articulated_neutralized_count += 1
+        if reason == "confident_nonstatic_type_mismatch":
+            confident_type_mismatch_pair_count += 1
     low_weight_edges = sum(1 for edge in edge_metrics if float(edge.get("pair_quality_prior", 1.0) or 1.0) < 0.35)
     return {
         "edge_count": len(edge_metrics),
@@ -1160,6 +1922,24 @@ def _edge_summary(edge_metrics: list[dict[str, Any]], tracks: list[dict[str, Any
         "median_articulation_compatibility": (
             _median(articulation_compatibilities) if articulation_compatibilities else None
         ),
+        "learned_feature_pair_count": len(learned_cosines),
+        "learned_feature_pair_coverage": len(learned_cosines) / len(edge_metrics) if edge_metrics else None,
+        "mean_learned_feature_cosine": _mean_optional(learned_cosines),
+        "median_learned_feature_cosine": _median(learned_cosines) if learned_cosines else None,
+        "mean_learned_affinity_multiplier": _mean_optional(learned_multipliers),
+        "median_learned_affinity_multiplier": _median(learned_multipliers) if learned_multipliers else None,
+        "mean_same_gt_learned_feature_cosine": _mean_optional(same_gt_learned_cosines),
+        "mean_cross_gt_learned_feature_cosine": _mean_optional(cross_gt_learned_cosines),
+        "pairwise_affinity_pair_count": len(pairwise_probabilities),
+        "mean_pairwise_same_part_probability": _mean_optional(pairwise_probabilities),
+        "median_pairwise_same_part_probability": _median(pairwise_probabilities) if pairwise_probabilities else None,
+        "mean_pairwise_affinity_multiplier": _mean_optional(pairwise_multipliers),
+        "mean_same_gt_pairwise_probability": _mean_optional(same_gt_pairwise_probabilities),
+        "mean_cross_gt_pairwise_probability": _mean_optional(cross_gt_pairwise_probabilities),
+        "static_articulated_pair_count": static_articulated_pair_count,
+        "static_articulated_penalized_count": static_articulated_penalized_count,
+        "static_articulated_neutralized_count": static_articulated_neutralized_count,
+        "confident_type_mismatch_pair_count": confident_type_mismatch_pair_count,
         "same_gt_edge_count": same_gt,
         "cross_gt_edge_count": cross_gt,
         "unknown_gt_edge_count": unknown,

@@ -387,8 +387,8 @@ def register(subparsers: Any) -> None:
     object_mask_viz_parser.add_argument("--viz-frame", choices=["camera", "world", "mujoco", "auto"], default="world")
     object_mask_viz_parser.add_argument(
         "--axis-remap",
-        default="x,z,-y",
-        help="Visualization-only axis remap, e.g. x,z,-y to convert image-style y-down coordinates to z-up",
+        default="x,y,z",
+        help="Visualization-only axis remap. xyz_world is z-up by default; use x,z,-y for image-style y-down coordinates.",
     )
     object_mask_viz_parser.add_argument("--flow-min-motion", type=float, default=0.005)
     object_mask_viz_parser.add_argument("--flow-max-tracks", type=int, default=2000)
@@ -418,13 +418,37 @@ def register(subparsers: Any) -> None:
     object_mask_flow_html_parser.add_argument("--output-html", type=Path, default=None, help="Output HTML path")
     object_mask_flow_html_parser.add_argument("--joint-inference", type=Path, default=None, help="Optional joint_inference.json")
     object_mask_flow_html_parser.add_argument("--evaluation-json", type=Path, default=None, help="Optional object_mask_kinematic_evaluation.json")
+    object_mask_flow_html_parser.add_argument(
+        "--background-fusion-manifest",
+        type=Path,
+        default=None,
+        help="Optional fusion_manifest.json whose per-frame RGB-D geometry is shown behind the tracks",
+    )
+    object_mask_flow_html_parser.add_argument(
+        "--background-max-points",
+        type=int,
+        default=3000,
+        help="Maximum background RGB-D points embedded per displayed frame",
+    )
+    object_mask_flow_html_parser.add_argument(
+        "--mjcf-replay-episode",
+        type=Path,
+        default=None,
+        help="Optional simulation episode.json used to overlay GT MJCF meshes at recorded joint positions",
+    )
+    object_mask_flow_html_parser.add_argument(
+        "--mjcf-mesh-opacity",
+        type=float,
+        default=0.22,
+        help="Opacity of the simulation-only GT MJCF mesh overlay",
+    )
     object_mask_flow_html_parser.add_argument("--max-tracks", type=int, default=1000, help="Maximum tracks embedded in the HTML")
     object_mask_flow_html_parser.add_argument("--frame-stride", type=int, default=2, help="Embed every Nth frame in the time slider")
     object_mask_flow_html_parser.add_argument("--trail-length", type=int, default=10, help="Default temporal trail length in frames")
     object_mask_flow_html_parser.add_argument(
         "--axis-remap",
-        default="x,z,-y",
-        help="Visualization-only axis remap, e.g. x,z,-y to convert image-style y-down coordinates to z-up",
+        default="x,y,z",
+        help="Visualization-only axis remap. xyz_world is z-up by default; use x,z,-y for image-style y-down coordinates.",
     )
     object_mask_flow_html_parser.add_argument(
         "--color-by",
@@ -539,6 +563,181 @@ def register(subparsers: Any) -> None:
         action="store_true",
         help="Disable stderr progress updates during CoTracker tracking",
     )
+    part_tracker_parser.add_argument(
+        "--export-cotracker-features",
+        action="store_true",
+        help="Export frozen final-updateformer query features for diagnostic representation probing.",
+    )
+    part_tracker_parser.add_argument(
+        "--cotracker-features-output",
+        type=Path,
+        default=None,
+        help="Output NPZ for track-aligned CoTracker features (defaults to <episode_dir>/cotracker_features.npz).",
+    )
+    part_tracker_parser.add_argument(
+        "--dynamic-reseeding",
+        action="store_true",
+        help="In object-mask mode, add birth-time-aware seeds in newly visible uncovered regions.",
+    )
+    part_tracker_parser.add_argument("--reseed-interval-frames", type=int, default=5)
+    part_tracker_parser.add_argument("--reseed-coverage-radius-px", type=float, default=12.0)
+    part_tracker_parser.add_argument("--reseed-bbox-scale", type=float, default=1.2)
+    part_tracker_parser.add_argument("--reseed-max-tracks-per-frame-view", type=int, default=64)
+    part_tracker_parser.add_argument("--reseed-max-tracks-per-view", type=int, default=256)
+
+    for command, help_text in (
+        ("probe-cotracker-features", "Evaluate frozen CoTracker features against simulation-only track part labels"),
+        ("probe-track-features", "Evaluate any track-aligned feature NPZ against simulation-only track part labels"),
+    ):
+        feature_probe_parser = subparsers.add_parser(command, help=help_text)
+        feature_probe_parser.add_argument("tracks", type=Path, help="Track JSON containing diagnostic GT part labels")
+        feature_probe_parser.add_argument("features", type=Path, help="Track-aligned feature NPZ")
+        feature_probe_parser.add_argument("--output-json", type=Path, default=None)
+        feature_probe_parser.add_argument("--output-embedding-csv", type=Path, default=None)
+        feature_probe_parser.add_argument("--label-field", default="original_part_id")
+        feature_probe_parser.add_argument("--max-pairs", type=int, default=200_000)
+        feature_probe_parser.add_argument("--cluster-k", type=int, default=None)
+        feature_probe_parser.add_argument("--seed", type=int, default=0)
+
+    tapip_input_parser = subparsers.add_parser(
+        "prepare-tapip3d-input",
+        help="Package one RGB-D view and optional existing seeds for remote CUDA TAPIP3D inference",
+    )
+    tapip_input_parser.add_argument("episode", type=Path, help="Path to episode.json")
+    tapip_input_parser.add_argument("--output-npz", type=Path, required=True)
+    tapip_input_parser.add_argument("--view-index", type=int, default=0)
+    tapip_input_parser.add_argument("--frame-stride", type=int, default=1)
+    tapip_input_parser.add_argument("--seed-tracks", type=Path, default=None)
+
+    tapip_import_parser = subparsers.add_parser(
+        "import-tapip3d-tracks",
+        help="Import remote TAPIP3D world trajectories into the part-track JSON contract",
+    )
+    tapip_import_parser.add_argument("tapip_input", type=Path, help="NPZ created by prepare-tapip3d-input")
+    tapip_import_parser.add_argument("tapip_result", type=Path, help="TAPIP3D .result.npz from the CUDA host")
+    tapip_import_parser.add_argument("seed_tracks", type=Path, help="Seed tracks used to prepare TAPIP3D queries")
+    tapip_import_parser.add_argument("--output-json", type=Path, required=True)
+    tapip_import_parser.add_argument("--visibility-threshold", type=float, default=0.5)
+
+    tapip_merge_parser = subparsers.add_parser(
+        "merge-tapip3d-views",
+        help="Merge per-view TAPIP3D world tracks and optional UpdateFormer features",
+    )
+    tapip_merge_parser.add_argument("tracks", type=Path, nargs="+", help="Imported per-view TAPIP track JSON files")
+    tapip_merge_parser.add_argument("--output-tracks", type=Path, required=True)
+    tapip_merge_parser.add_argument("--features", type=Path, nargs="+", default=None)
+    tapip_merge_parser.add_argument("--output-features", type=Path, default=None)
+
+    slot_train_parser = subparsers.add_parser(
+        "train-track-slot-head",
+        help="Train a permutation-invariant per-track part-slot classifier",
+    )
+    slot_train_parser.add_argument("manifest", type=Path)
+    slot_train_parser.add_argument("--output-dir", type=Path, required=True)
+    slot_train_parser.add_argument("--max-slots", type=int, default=8)
+    slot_train_parser.add_argument("--hidden-dim", type=int, default=256)
+    slot_train_parser.add_argument("--epochs", type=int, default=50)
+    slot_train_parser.add_argument("--learning-rate", type=float, default=1e-3)
+    slot_train_parser.add_argument("--weight-decay", type=float, default=1e-4)
+    slot_train_parser.add_argument("--pairwise-loss-weight", type=float, default=0.2)
+    slot_train_parser.add_argument("--device", default="auto")
+    slot_train_parser.add_argument("--seed", type=int, default=0)
+
+    slot_predict_parser = subparsers.add_parser(
+        "predict-track-slots",
+        help="Predict per-track part slots and generate an interactive flow viewer",
+    )
+    slot_predict_parser.add_argument("tracks", type=Path)
+    slot_predict_parser.add_argument("features", type=Path)
+    slot_predict_parser.add_argument("model", type=Path)
+    slot_predict_parser.add_argument("--output-json", type=Path, required=True)
+    slot_predict_parser.add_argument("--output-viewer", type=Path, default=None)
+    slot_predict_parser.add_argument("--device", default="auto")
+    slot_predict_parser.add_argument("--no-viewer", action="store_true")
+
+    pairwise_train_parser = subparsers.add_parser(
+        "train-pairwise-affinity",
+        help="Train a local same-rigid-part affinity head from simulation-labeled CoTracker tracks",
+    )
+    pairwise_train_parser.add_argument("manifest", type=Path)
+    pairwise_train_parser.add_argument("--output-dir", type=Path, required=True)
+    pairwise_train_parser.add_argument("--knn-k", type=int, default=12)
+    pairwise_train_parser.add_argument("--min-common-frames", type=int, default=3)
+    pairwise_train_parser.add_argument("--epochs", type=int, default=30)
+    pairwise_train_parser.add_argument("--batch-size", type=int, default=512)
+    pairwise_train_parser.add_argument("--learning-rate", type=float, default=1e-3)
+    pairwise_train_parser.add_argument("--weight-decay", type=float, default=1e-4)
+    pairwise_train_parser.add_argument("--hidden-dim", type=int, default=128)
+    pairwise_train_parser.add_argument("--hard-negative-weight", type=float, default=2.0)
+    pairwise_train_parser.add_argument(
+        "--hard-mining-k",
+        type=int,
+        default=8,
+        help="Per-track feature-hard and motion-hard cross-part candidates mined from simulator labels.",
+    )
+    pairwise_train_parser.add_argument(
+        "--max-positive-negative-ratio",
+        type=float,
+        default=2.0,
+        help="Downsample positives so they do not exceed this ratio to mined negatives; <=0 disables balancing.",
+    )
+    pairwise_train_parser.add_argument("--device", choices=["auto", "mps", "cpu", "cuda"], default="auto")
+    pairwise_train_parser.add_argument("--seed", type=int, default=0)
+
+    pairwise_eval_parser = subparsers.add_parser(
+        "evaluate-pairwise-affinity",
+        help="Evaluate a pairwise affinity checkpoint on an object-held-out manifest split",
+    )
+    pairwise_eval_parser.add_argument("manifest", type=Path)
+    pairwise_eval_parser.add_argument("model", type=Path)
+    pairwise_eval_parser.add_argument("--output-json", type=Path, required=True)
+    pairwise_eval_parser.add_argument("--split", choices=["train", "val", "test"], default="test")
+    pairwise_eval_parser.add_argument("--knn-k", type=int, default=12)
+    pairwise_eval_parser.add_argument("--min-common-frames", type=int, default=3)
+    pairwise_eval_parser.add_argument("--device", choices=["auto", "mps", "cpu", "cuda"], default="auto")
+
+    slot_train_parser = subparsers.add_parser(
+        "train-motion-part-slots",
+        help="Train a DETR-style episode-local rigid motion-part slot decoder",
+    )
+    slot_train_parser.add_argument("manifest", type=Path)
+    slot_train_parser.add_argument("--output-dir", type=Path, required=True)
+    slot_train_parser.add_argument("--max-slots", type=int, default=8)
+    slot_train_parser.add_argument("--hidden-dim", type=int, default=128)
+    slot_train_parser.add_argument("--encoder-layers", type=int, default=2)
+    slot_train_parser.add_argument("--decoder-layers", type=int, default=2)
+    slot_train_parser.add_argument("--attention-heads", type=int, default=4)
+    slot_train_parser.add_argument("--epochs", type=int, default=100)
+    slot_train_parser.add_argument("--learning-rate", type=float, default=3e-4)
+    slot_train_parser.add_argument("--weight-decay", type=float, default=1e-4)
+    slot_train_parser.add_argument("--rigid-loss-weight", type=float, default=0.1)
+    slot_train_parser.add_argument("--dice-loss-weight", type=float, default=0.5)
+    slot_train_parser.add_argument("--pairwise-loss-weight", type=float, default=0.25)
+    slot_train_parser.add_argument("--existence-loss-weight", type=float, default=0.25)
+    slot_train_parser.add_argument("--no-part-balanced-assignment", action="store_true")
+    slot_train_parser.add_argument("--no-canonicalize-geometry", action="store_true")
+    slot_train_parser.add_argument("--no-geometry-augmentation", action="store_true")
+    slot_train_parser.add_argument("--track-dropout-ratio", type=float, default=0.1)
+    slot_train_parser.add_argument("--pair-samples-per-object", type=int, default=4096)
+    slot_train_parser.add_argument("--no-topology-balanced-sampling", action="store_true")
+    slot_train_parser.add_argument("--device", choices=["auto", "mps", "cpu", "cuda"], default="auto")
+    slot_train_parser.add_argument("--seed", type=int, default=0)
+
+    slot_infer_parser = subparsers.add_parser(
+        "infer-motion-part-slots",
+        help="Infer episode-local rigid part IDs and optionally apply post-RANSAC refinement",
+    )
+    slot_infer_parser.add_argument("tracks", type=Path)
+    slot_infer_parser.add_argument("features_npz", type=Path)
+    slot_infer_parser.add_argument("model", type=Path)
+    slot_infer_parser.add_argument("--output-json", type=Path, required=True)
+    slot_infer_parser.add_argument("--device", choices=["auto", "mps", "cpu", "cuda"], default="auto")
+    slot_infer_parser.add_argument("--post-ransac-refine", action="store_true")
+    slot_infer_parser.add_argument("--ransac-iterations", type=int, default=128)
+    slot_infer_parser.add_argument("--ransac-inlier-threshold-m", type=float, default=0.025)
+    slot_infer_parser.add_argument("--ransac-min-inliers", type=int, default=8)
+    slot_infer_parser.add_argument("--slot-existence-threshold", type=float, default=0.5)
+    slot_infer_parser.add_argument("--seed", type=int, default=0)
 
     part_pose_parser = subparsers.add_parser(
         "estimate-part-poses",
@@ -592,9 +791,13 @@ def register(subparsers: Any) -> None:
     motion_seg_parser.add_argument("--output-json", type=Path, default=None, help="Output relabeled part_tracks.json")
     motion_seg_parser.add_argument(
         "--mode",
-        choices=["connected", "knn-spectral"],
+        choices=["connected", "knn-spectral", "sequential-ransac", "learned-connected"],
         default="connected",
-        help="Motion segmentation backend. 'connected' preserves the legacy rigidity connected-components baseline.",
+        help=(
+            "Motion segmentation backend. 'connected' preserves the legacy rigidity connected-components "
+            "baseline; 'sequential-ransac' extracts shared rigid-motion consensus models without a fixed K; "
+            "'learned-connected' thresholds dense learned affinities and does not require kNN or a fixed K."
+        ),
     )
     motion_seg_parser.add_argument(
         "--diagnostics-json",
@@ -736,9 +939,124 @@ def register(subparsers: Any) -> None:
         ),
     )
     motion_seg_parser.add_argument(
+        "--articulation-type-mismatch-penalty",
+        type=float,
+        default=0.65,
+        help="Penalty for confident non-static articulation type mismatch pairs.",
+    )
+    motion_seg_parser.add_argument(
+        "--articulation-static-mismatch-penalty",
+        type=float,
+        default=1.0,
+        help="Penalty for static-vs-articulated pairs. Defaults to neutral because hinge-near tracks can be static-like.",
+    )
+    motion_seg_parser.add_argument(
+        "--articulation-min-motion-for-type-penalty",
+        type=float,
+        default=0.03,
+        help="Minimum per-track endpoint motion before articulation type mismatch penalties are trusted.",
+    )
+    motion_seg_parser.add_argument(
+        "--articulation-min-confidence-for-type-penalty",
+        type=float,
+        default=0.75,
+        help="Minimum articulation score before articulation type mismatch penalties are trusted.",
+    )
+    motion_seg_parser.add_argument(
+        "--cotracker-features-npz",
+        type=Path,
+        default=None,
+        help="Experimental frozen CoTracker features used as a soft kNN affinity multiplier.",
+    )
+    motion_seg_parser.add_argument(
+        "--learned-affinity-floor",
+        type=float,
+        default=0.7,
+        help="Minimum learned-feature affinity multiplier; 1.0 makes the feature prior neutral.",
+    )
+    motion_seg_parser.add_argument(
+        "--pairwise-affinity-model",
+        type=Path,
+        default=None,
+        help="Experimental trained same-part affinity checkpoint for local kNN edges.",
+    )
+    motion_seg_parser.add_argument(
+        "--pairwise-affinity-floor",
+        type=float,
+        default=0.5,
+        help="Minimum multiplier applied to geometric affinity by the trained pairwise head.",
+    )
+    motion_seg_parser.add_argument(
+        "--pairwise-affinity-device",
+        choices=["cpu", "mps", "cuda", "auto"],
+        default="cpu",
+        help="Device used by the small pairwise affinity head during segmentation.",
+    )
+    motion_seg_parser.add_argument(
+        "--pairwise-connect-threshold",
+        type=float,
+        default=0.9,
+        help="Same-part probability threshold used by learned-connected mode.",
+    )
+    motion_seg_parser.add_argument(
         "--skip-base-bridge-checks",
         action="store_true",
         help="Skip expensive O(N^2) base-bridge diagnostics; useful for quick dense-track ablations.",
+    )
+    motion_seg_parser.add_argument(
+        "--ransac-iterations",
+        type=int,
+        default=128,
+        help="Rigid-model hypotheses evaluated per sequential RANSAC extraction.",
+    )
+    motion_seg_parser.add_argument(
+        "--ransac-sample-size",
+        type=int,
+        default=4,
+        help="Tracks sampled to fit each per-frame shared SE(3) hypothesis.",
+    )
+    motion_seg_parser.add_argument(
+        "--ransac-inlier-threshold-m",
+        type=float,
+        default=0.025,
+        help="Maximum trimmed shared-SE(3) replay RMSE for a RANSAC inlier.",
+    )
+    motion_seg_parser.add_argument(
+        "--ransac-min-inliers",
+        type=int,
+        default=12,
+        help="Minimum consensus size required to extract a moving rigid part.",
+    )
+    motion_seg_parser.add_argument(
+        "--ransac-max-models",
+        type=int,
+        default=8,
+        help="Maximum number of moving rigid models extracted sequentially.",
+    )
+    motion_seg_parser.add_argument(
+        "--ransac-spatial-link-m",
+        type=float,
+        default=0.35,
+        help="Maximum reference-space link used to retain a spatially coherent RANSAC consensus.",
+    )
+    motion_seg_parser.add_argument(
+        "--ransac-assignment-threshold-m",
+        type=float,
+        default=0.05,
+        help="Maximum model replay RMSE when assigning ambiguous or leftover tracks.",
+    )
+    motion_seg_parser.add_argument("--ransac-seed", type=int, default=0, help="Sequential RANSAC random seed.")
+    motion_seg_parser.add_argument(
+        "--no-ransac-base-stabilize",
+        action="store_false",
+        dest="ransac_base_stabilize",
+        help="Disable static-base SE(3) stabilization before rigid-model extraction.",
+    )
+    motion_seg_parser.set_defaults(ransac_base_stabilize=True)
+    motion_seg_parser.add_argument(
+        "--ransac-learned-seed",
+        action="store_true",
+        help="Use high-affinity local CoTracker pairs to propose RANSAC minimal samples; SE(3) inlier tests remain unchanged.",
     )
 
     local_split_parser = subparsers.add_parser(
