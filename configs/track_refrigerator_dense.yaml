@@ -8,3 +8,9 @@ args:
   seed-stride-px: 8
   max-tracks-per-part-view: 256
   visibility-threshold: 0.5
+  dynamic-reseeding: true
+  reseed-interval-frames: 5
+  reseed-coverage-radius-px: 12
+  reseed-bbox-scale: 1.2
+  reseed-max-tracks-per-frame-view: 64
+  reseed-max-tracks-per-view: 256
