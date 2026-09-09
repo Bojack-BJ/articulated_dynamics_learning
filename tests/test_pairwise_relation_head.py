@@ -423,12 +423,12 @@ class PairwiseRelationHeadTests(unittest.TestCase):
         except ImportError:
             self.skipTest("PyTorch is not installed")
         generator = torch.Generator().manual_seed(17)
-        tokens = torch.randn(1, 7, 9, 11, generator=generator)
+        tokens = torch.randn(4, 7, 9, 11, generator=generator)
         tokens[..., 9] = 1.0
         tokens[..., 10] = torch.linspace(0.0, 1.0, 9)
-        visibility = torch.ones(1, 7, 9)
+        visibility = torch.ones(4, 7, 9)
         probabilities = torch.softmax(
-            torch.randn(1, 7, 3, generator=generator), dim=-1
+            torch.randn(4, 7, 3, generator=generator), dim=-1
         )
         rotation = torch.tensor([
             [0.0, -1.0, 0.0],
@@ -440,7 +440,7 @@ class PairwiseRelationHeadTests(unittest.TestCase):
             rotated[..., start:start + 3] = tokens[..., start:start + 3] @ rotation.T
         first = _slot_motion_invariants(tokens, visibility, probabilities, torch)
         second = _slot_motion_invariants(rotated, visibility, probabilities, torch)
-        self.assertEqual(tuple(first.shape), (1, 3, 10))
+        self.assertEqual(tuple(first.shape), (4, 3, 10))
         self.assertTrue(torch.isfinite(first).all())
         self.assertTrue(torch.allclose(first, second, atol=1e-5, rtol=1e-5))
 

@@ -1128,7 +1128,9 @@ def _slot_motion_invariants(
         return (weights * expanded).sum(dim=(2, 3)) / total
 
     speed_mean = mean_scalar(speed)
-    speed_variance = mean_scalar((speed - speed_mean[:, :, None, None]) ** 2)
+    speed_variance = mean_scalar(
+        (speed[:, None, :, :] - speed_mean[:, :, None, None]) ** 2
+    )
     mean_velocity = (
         weights[..., None] * velocity[:, None, :, :, :]
     ).sum(dim=(2, 3)) / total[..., None]
