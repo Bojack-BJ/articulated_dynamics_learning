@@ -815,6 +815,129 @@ different slot's rigid replay residual is substantially lower. The initial slot
 ID and confidence remain in every output track for before/after diagnostics.
 Use object-held-out splits; same-object training only validates implementation.
 
+### Diagnostic Pairwise Joint Proposal Head
+
+The first feedforward articulation experiment learns an ordered relation for
+every `(parent_slot, child_slot)` pair. Each slot combines its learned token
+with a soft aggregation of the complete canonical 3D trajectory descriptor.
+The pair feature concatenates the parent and child representations, their
+difference, and their elementwise product. Independent heads predict edge
+existence, joint type, axis direction, and a point on the revolute axis line.
+
+This is intentionally an unconstrained diagnostic. It reports cycles, multiple
+parents, root count, and legal-tree rate, but does not repair the graph or alter
+the existing optimization pipeline. MuJoCo part/joint metadata is used only as
+simulation training/evaluation supervision.
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp train-slot-relation-head \
+  configs/motion_part_slots_refrigerator_microwave.tsv \
+  outputs/flow_tracking_eval/slot_benchmark_refrigerator_microwave/model/motion_part_slots.pt \
+  --output-dir outputs/flow_tracking_eval/slot_relation_head \
+  --epochs 50 \
+  --device mps
+
+PYTHONPATH=src python3 -m rgbd_urdf_mvp infer-slot-relation-head \
+  outputs/flow_tracking_eval/refrigerators_dense_mps_object_mask/refrigerator044/object_tracks.json \
+  outputs/flow_tracking_eval/refrigerators_dense_mps_object_mask/learning_features_v1/refrigerator044/cotracker_features.npz \
+  outputs/flow_tracking_eval/slot_benchmark_refrigerator_microwave/model/motion_part_slots.pt \
+  outputs/flow_tracking_eval/slot_relation_head/slot_relation_head.pt \
+  --output-json outputs/flow_tracking_eval/slot_relation_head/refrigerator044.json \
+  --device mps
+```
+
+Axis angular loss is sign invariant. For revolute joints, the position loss is
+the perpendicular distance to the GT axis line, not Euclidean distance between
+two arbitrary pivot points. Prismatic joints do not receive a pivot loss.
+
+The primary `axis_error_deg` metric is conditional on correct joint type. A
+revolute prediction classified as prismatic contributes to joint-type error,
+not axis error. `axis_error_deg_all_gt_pairs` preserves the unconditional value
+as a diagnostic for detecting type-confusion outliers.
+
+The relation head uses two distinct physical losses:
+
+- weighted Kabsch SE(3) replay belongs to the upstream slot model and teaches
+  track-to-part assignments to form rigid groups;
+- joint-model replay belongs to the relation head and replays child tracks with
+  the predicted revolute axis line or prismatic direction after fitting only
+  the per-frame joint coordinate.
+
+An experimental dual-branch axis estimator avoids compressing the 3D motion
+too early. Enable it with `--axis-geometry-branch`. Edge and joint-type
+prediction continue to use the fused slot-relation representation. Axis and
+pivot prediction instead use:
+
+1. ordered per-track tokens containing canonical reference position,
+   displacement, velocity, visibility, and normalized time;
+2. a shared temporal GRU over uniformly sampled trajectory frames;
+3. differentiable soft pooling with the slot assignment probabilities; and
+4. a separate parent-child geometry head.
+
+This keeps appearance-conditioned tracker features useful for part identity
+while forcing axis regression to consume explicit 3D motion. The default
+remains the original fused head for checkpoint compatibility.
+
+`--geometry-encoder-type track_gru_transformer` enables the cross-track
+ablation. It preserves the track dimension after temporal encoding, selects at
+most `--geometry-max-tracks` tracks per slot by soft assignment probability,
+applies a permutation-equivariant Transformer without track positional
+encoding, and pools only after cross-track interaction. The baseline
+`track_gru_average` mode remains the default. Training summaries report model
+parameter count, effective tracks per slot, and normalized pooling entropy.
+
+The first PartNet CoTracker ablation used 32 trajectory frames, at most 32
+tracks per slot, one cross-track Transformer layer, full SO(3) augmentation,
+and 50 epochs. The cross-track decoder-finetune model improved test axis mean
+from 54.52 to 47.67 degrees and median from 55.40 to 48.52 degrees relative to
+`track_gru_average`, but P90 worsened from 66.26 to 81.18 degrees. The frozen
+variant did not improve test median. Cross-track interaction is therefore
+still experimental: it helps central cases but does not control catastrophic
+axis failures and is not the default.
+
+```bash
+PYTHONPATH=src python3 -m rgbd_urdf_mvp train-slot-relation-head \
+  configs/relation_training_partnet_three_methods.tsv \
+  outputs/partnet_core_v1_training/cotracker_slots/motion_part_slots.pt \
+  --output-dir outputs/partnet_core_v1_training/cotracker_axis_trajectory \
+  --axis-geometry-branch \
+  --geometry-encoder-type track_gru_transformer \
+  --trajectory-samples 32 \
+  --trajectory-hidden-dim 128 \
+  --geometry-max-tracks 64 \
+  --rotation-augmentation \
+  --rotation-augmentation-probability 1.0 \
+  --rotation-augmentation-scope slot_and_relation_geometry \
+  --unfreeze-slot-backbone \
+  --slot-unfreeze-scope decoder \
+  --slot-learning-rate-scale 0.1 \
+  --device cuda
+```
+
+Direct angular axis loss is weighted more strongly than joint replay. This is
+important because replay can partially compensate an inaccurate axis through
+its fitted joint coordinate. Joint replay is therefore a physical consistency
+regularizer, not a replacement for axis supervision. Joint-type CE is balanced
+by the observed training-joint frequencies.
+
+The slot backbone remains frozen by default. `--unfreeze-slot-backbone` enables
+low-rate joint training with slot assignment and existence losses; use
+`--slot-learning-rate-scale` to control its optimizer group. Shared SO(3)
+augmentation is also experimental and disabled by default. Enable it with
+`--rotation-augmentation --rotation-augmentation-probability 0.25`. It rotates
+relation-level 3D evidence, axis lines, and replay points consistently while
+leaving the non-equivariant slot encoder input unchanged.
+
+On the current held-out refrigerator044/045 and microwave044/045 split, the
+recommended frozen/no-augmentation configuration reduced correctly typed axis
+error from approximately 4.08 degrees to 2.12 degrees. Fine-tuning slots gave
+2.02 degrees and better edge F1, but slightly worse axis-line error. With only
+eight training objects, 25% SO(3) augmentation degraded axis error to 6.63
+degrees, so more rotation-diverse data or an equivariant relation architecture
+is required before enabling it by default. The only held-out prismatic joint
+remains misclassified; this is reported as type error rather than contaminating
+the primary axis metric.
+
 # TAPIP3D Remote Tracking Experiment
 
 TAPIP3D is CUDA-only in its reference implementation (`xformers`, `torch-scatter`, and custom point operators). The local project therefore prepares the recorded RGB-D sequence and imports remote results; it does not attempt to run TAPIP3D on macOS/MPS.

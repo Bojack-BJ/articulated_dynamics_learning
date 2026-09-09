@@ -14,6 +14,8 @@ The current code is scaffold-first. It is meant to keep the full contract execut
 - Project overview: [docs/overview.md](docs/overview.md)
 - End-to-end model-to-joint-inference tutorial: [docs/end-to-end-articulation.md](docs/end-to-end-articulation.md)
 - MuJoCo recording and USD-to-MJCF conversion: [docs/mujoco-recording.md](docs/mujoco-recording.md)
+- GAPartNet asset conversion and dataset setup: [docs/gapartnet-integration.md](docs/gapartnet-integration.md)
+- PartNet-Mobility splits and recording policy: [docs/partnet-mobility-recording-strategy.md](docs/partnet-mobility-recording-strategy.md)
 - RGB-D fusion, part segmentation, and viewer workflow: [docs/pointcloud.md](docs/pointcloud.md)
 - Object-mask motion segmentation experiments: [docs/object-mask-motion-segmentation.md](docs/object-mask-motion-segmentation.md)
 - Dynamics identification and Lagrangian-network handoff: [docs/dynamics-identification.md](docs/dynamics-identification.md)
@@ -24,6 +26,8 @@ The current code is scaffold-first. It is meant to keep the full contract execut
 - MuJoCo MJX setup for differentiable rollouts: [docs/mjx-setup.md](docs/mjx-setup.md)
 - Remote 3D generation client/server setup: [docs/remote-generation.md](docs/remote-generation.md)
 - Research-stack replacement points: [docs/research-stack.md](docs/research-stack.md)
+- Whole-workspace change map: [docs/workspace-change-map.md](docs/workspace-change-map.md)
+- Bilingual method and experiment registry: [docs/method-experiment-registry.md](docs/method-experiment-registry.md)
 
 ## Installation
 
