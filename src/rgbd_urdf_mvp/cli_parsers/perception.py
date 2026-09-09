@@ -917,9 +917,15 @@ def register(subparsers: Any) -> None:
     relation_train_parser.add_argument("--joint-type-loss-weight", type=float, default=1.0)
     relation_train_parser.add_argument(
         "--joint-type-head-type",
-        choices=["pair_context", "child_motion"],
+        choices=["pair_context", "child_motion", "child_motion_temporal"],
         default="pair_context",
-        help="Predict type from the legacy ordered pair token or child-only invariant motion evidence.",
+        help="Predict type from pair context or child-only invariant motion evidence.",
+    )
+    relation_train_parser.add_argument(
+        "--relation-slot-source",
+        choices=["predicted", "oracle_gt"],
+        default="predicted",
+        help="Assignments consumed by relation heads; oracle_gt is diagnostic only.",
     )
     relation_train_parser.add_argument(
         "--edge-head-type",

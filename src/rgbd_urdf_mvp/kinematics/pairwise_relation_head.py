@@ -89,6 +89,7 @@ class SlotRelationTrainingConfig:
     axis_geometry_branch: bool = False
     axis_head_type: str = "direct"
     joint_type_head_type: str = "pair_context"
+    relation_slot_source: str = "predicted"
     edge_head_type: str = "pair_context"
     structured_parent_loss_weight: float = 0.0
     vector_pivot_parameterization: str = "analytic_plane_residual_v1"
@@ -219,6 +220,8 @@ class SlotRelationTrainer:
                 )
                 allowed_prefixes = (
                     "motion_node.", "child_motion_type.",
+                    "motion_temporal_input.", "motion_temporal_encoder.",
+                    "child_motion_temporal_type.",
                     "motion_edge_backbone.", "motion_edge.",
                 )
                 unexpected = [
@@ -434,6 +437,7 @@ class SlotRelationTrainer:
                         "axis_geometry_branch": bool(self.config.axis_geometry_branch),
                         "axis_head_type": str(self.config.axis_head_type),
                         "joint_type_head_type": str(self.config.joint_type_head_type),
+                        "relation_slot_source": str(self.config.relation_slot_source),
                         "edge_head_type": str(self.config.edge_head_type),
                         "structured_parent_loss_weight": float(
                             self.config.structured_parent_loss_weight
@@ -1205,6 +1209,69 @@ def _slot_motion_invariants(
     )
 
 
+def _slot_multiscale_motion_sequence(
+    trajectory_tokens: Any,
+    trajectory_visibility: Any,
+    slot_probabilities: Any,
+    torch: Any,
+    lags: tuple[int, ...] = (1, 2, 4, 8),
+) -> tuple[Any, Any]:
+    """Build an SO(3)-invariant sequence from multi-span track displacements."""
+    positions = trajectory_tokens[..., 3:6]
+    observation = trajectory_visibility.to(positions.dtype).clamp(0.0, 1.0)
+    membership = slot_probabilities.transpose(1, 2)
+    frame_count = int(positions.shape[2])
+    rows = []
+    valid_rows = []
+    for lag in (lag for lag in lags if lag < frame_count):
+        displacement = positions[:, :, lag:, :] - positions[:, :, :-lag, :]
+        pair_observation = observation[:, :, lag:] * observation[:, :, :-lag]
+        for start in range(frame_count - lag):
+            weights = membership * pair_observation[:, None, :, start]
+            total = weights.sum(dim=2)
+            normalized = weights / total[..., None].clamp_min(1e-6)
+            delta = displacement[:, :, start, :]
+            speed = torch.linalg.vector_norm(delta, dim=-1)
+            mean_delta = torch.einsum("bkn,bnd->bkd", normalized, delta)
+            mean_speed = torch.einsum("bkn,bn->bk", normalized, speed)
+            speed_variance = torch.einsum(
+                "bkn,bkn->bk",
+                normalized,
+                (speed[:, None, :] - mean_speed[..., None]) ** 2,
+            )
+            centered = delta[:, None, :, :] - mean_delta[:, :, None, :]
+            covariance = torch.einsum(
+                "bkn,bknd,bkne->bkde", normalized, centered, centered,
+            )
+            eigenvalues = torch.linalg.eigvalsh(covariance).clamp_min(0.0)
+            eigenvalues = eigenvalues / eigenvalues.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            coherence = (
+                torch.linalg.vector_norm(mean_delta, dim=-1)
+                / mean_speed.clamp_min(1e-6)
+            ).clamp(0.0, 1.0)
+            effective = 1.0 / normalized.square().sum(dim=2).clamp_min(1e-6)
+            effective = effective / max(1, membership.shape[2])
+            support = total / membership.sum(dim=2).clamp_min(1e-6)
+            rows.append(torch.stack([
+                mean_speed,
+                torch.sqrt(speed_variance.clamp_min(0.0)),
+                coherence,
+                eigenvalues[..., 0], eigenvalues[..., 1], eigenvalues[..., 2],
+                effective.clamp(0.0, 1.0), support.clamp(0.0, 1.0),
+                torch.full_like(total, lag / max(1, frame_count - 1)),
+                torch.full_like(
+                    total, (start + 0.5 * lag) / max(1, frame_count - 1)
+                ),
+            ], dim=-1))
+            valid_rows.append(total > 1e-4)
+    if not rows:
+        shape = (*membership.shape[:2], 1)
+        return positions.new_zeros((*shape, 10)), torch.zeros(
+            shape, dtype=torch.bool, device=positions.device,
+        )
+    return torch.stack(rows, dim=2), torch.stack(valid_rows, dim=2)
+
+
 def _build_relation_model(
     torch: Any, *, slot_dim: int, hidden_dim: int, motion_summary_dim: int = 0,
     axis_geometry_branch: bool = False,
@@ -1222,12 +1289,15 @@ def _build_relation_model(
         raise ValueError(f"Unsupported axis head type: {axis_head_type}")
     if axis_head_type != "direct" and not axis_geometry_branch:
         raise ValueError(f"{axis_head_type} requires axis_geometry_branch=True")
-    if joint_type_head_type not in {"pair_context", "child_motion"}:
+    if joint_type_head_type not in {
+        "pair_context", "child_motion", "child_motion_temporal"
+    }:
         raise ValueError(f"Unsupported joint type head: {joint_type_head_type}")
     if edge_head_type not in {"pair_context", "motion_residual"}:
         raise ValueError(f"Unsupported edge head: {edge_head_type}")
     if (
-        joint_type_head_type == "child_motion" or edge_head_type == "motion_residual"
+        joint_type_head_type in {"child_motion", "child_motion_temporal"}
+        or edge_head_type == "motion_residual"
     ) and not axis_geometry_branch:
         raise ValueError("Motion-aware type/edge heads require axis_geometry_branch=True")
     if vector_pivot_parameterization not in {
@@ -1274,6 +1344,18 @@ def _build_relation_model(
                 )
             if self.joint_type_head_type == "child_motion":
                 self.child_motion_type = torch.nn.Linear(hidden_dim, len(JOINT_TYPES))
+            if self.joint_type_head_type == "child_motion_temporal":
+                self.motion_temporal_input = torch.nn.Sequential(
+                    torch.nn.Linear(10, hidden_dim),
+                    torch.nn.LayerNorm(hidden_dim),
+                    torch.nn.GELU(),
+                )
+                self.motion_temporal_encoder = torch.nn.GRU(
+                    hidden_dim, hidden_dim, batch_first=True,
+                )
+                self.child_motion_temporal_type = torch.nn.Linear(
+                    hidden_dim, len(JOINT_TYPES)
+                )
             if self.edge_head_type == "motion_residual":
                 self.motion_edge_backbone = torch.nn.Sequential(
                     torch.nn.Linear(hidden_dim * 4, hidden_dim),
@@ -1365,6 +1447,7 @@ def _build_relation_model(
             geometry_hidden = hidden
             pair_geometry = None
             motion_node_hidden = None
+            motion_temporal_hidden = None
             if self.axis_geometry_branch:
                 if (
                     trajectory_tokens is None
@@ -1450,16 +1533,42 @@ def _build_relation_model(
                 )
                 geometry_hidden = self.geometry_backbone(geometry_pair)
                 if (
-                    self.joint_type_head_type == "child_motion"
+                    self.joint_type_head_type in {"child_motion", "child_motion_temporal"}
                     or self.edge_head_type == "motion_residual"
                 ):
-                    motion_invariants = _slot_motion_invariants(
-                        trajectory_tokens,
-                        trajectory_visibility,
-                        slot_probabilities,
-                        torch,
-                    )
-                    motion_node_hidden = self.motion_node(motion_invariants)
+                    if (
+                        self.joint_type_head_type == "child_motion"
+                        or self.edge_head_type == "motion_residual"
+                    ):
+                        motion_invariants = _slot_motion_invariants(
+                            trajectory_tokens,
+                            trajectory_visibility,
+                            slot_probabilities,
+                            torch,
+                        )
+                        motion_node_hidden = self.motion_node(motion_invariants)
+                    if self.joint_type_head_type == "child_motion_temporal":
+                        temporal_features, temporal_valid = (
+                            _slot_multiscale_motion_sequence(
+                                trajectory_tokens,
+                                trajectory_visibility,
+                                slot_probabilities,
+                                torch,
+                            )
+                        )
+                        batch_size, slot_count, step_count, _ = temporal_features.shape
+                        temporal_encoded, _ = self.motion_temporal_encoder(
+                            self.motion_temporal_input(temporal_features).reshape(
+                                batch_size * slot_count, step_count, hidden_dim
+                            )
+                        )
+                        temporal_encoded = temporal_encoded.reshape(
+                            batch_size, slot_count, step_count, hidden_dim
+                        )
+                        temporal_weight = temporal_valid.to(temporal_encoded.dtype)[..., None]
+                        motion_temporal_hidden = (
+                            temporal_encoded * temporal_weight
+                        ).sum(dim=2) / temporal_weight.sum(dim=2).clamp_min(1.0)
                 if self.axis_head_type != "direct":
                     pair_geometry = build_equivariant_pair_geometry(
                         trajectory_tokens,
@@ -1626,6 +1735,11 @@ def _build_relation_model(
                 type_logits = child_type[:, None, :, :].expand(
                     -1, slots.shape[1], -1, -1
                 )
+            elif self.joint_type_head_type == "child_motion_temporal":
+                child_type = self.child_motion_temporal_type(motion_temporal_hidden)
+                type_logits = child_type[:, None, :, :].expand(
+                    -1, slots.shape[1], -1, -1
+                )
             else:
                 type_logits = self.joint_type(relation_hidden)
             output = {
@@ -1776,6 +1890,22 @@ def _augment_slot_probabilities(
     return torch.stack(augmented, dim=0).reshape_as(probabilities)
 
 
+def _relation_slot_probabilities(
+    logits: Any, sample: dict[str, Any], torch: Any, source: str,
+) -> Any:
+    if source == "predicted":
+        return torch.softmax(logits, dim=-1)
+    if source != "oracle_gt":
+        raise ValueError(f"Unsupported relation slot source: {source}")
+    targets = _hungarian_slot_targets(
+        logits, sample["labels"], int(logits.shape[-1]), torch,
+    )
+    return torch.nn.functional.one_hot(
+        torch.as_tensor(targets, dtype=torch.long, device=logits.device),
+        num_classes=int(logits.shape[-1]),
+    ).to(logits.dtype)
+
+
 def _relation_sample_loss(
     sample: dict[str, Any], slot_model: Any, relation_model: Any,
     mean: Any, std: Any, torch: Any, device: str, config: SlotRelationTrainingConfig,
@@ -1788,7 +1918,9 @@ def _relation_sample_loss(
     else:
         with torch.no_grad():
             logits, existence_logits, slots = slot_model((slot_features - mean) / std, return_slots=True)
-    probabilities = torch.softmax(logits, dim=-1)
+    probabilities = _relation_slot_probabilities(
+        logits, sample, torch, str(config.relation_slot_source),
+    )
     probabilities = _augment_slot_probabilities(probabilities, torch, config)
     motion_summary = _slot_motion_summary(
         features, probabilities, int(sample["embedding_dim"]), torch
@@ -1869,7 +2001,17 @@ def _relation_batch_loss(
                 return_slots=True,
                 padding_mask=padding_mask,
             )
-    probabilities = torch.softmax(logits, dim=-1).masked_fill(padding_mask.unsqueeze(-1), 0.0)
+    if str(config.relation_slot_source) == "predicted":
+        probabilities = torch.softmax(logits, dim=-1)
+    else:
+        probabilities = torch.zeros_like(logits)
+        for index, sample in enumerate(samples):
+            count = counts[index]
+            probabilities[index, :count] = _relation_slot_probabilities(
+                logits[index, :count], sample, torch,
+                str(config.relation_slot_source),
+            )
+    probabilities = probabilities.masked_fill(padding_mask.unsqueeze(-1), 0.0)
     probabilities = _augment_slot_probabilities(probabilities, torch, config)
     motion_summary = _slot_motion_summary(
         batch_features, probabilities, int(samples[0]["embedding_dim"]), torch,
@@ -2187,8 +2329,12 @@ def _add_equivariance_loss(
     source_logits, _, source_slots = slot_model(
         (source_slot_features - mean) / std, return_slots=True
     )
-    source_probabilities = torch.softmax(source_logits, dim=-1)
-    augmented_probabilities = torch.softmax(augmented_logits, dim=-1)
+    source_probabilities = _relation_slot_probabilities(
+        source_logits, source, torch, str(config.relation_slot_source),
+    )
+    augmented_probabilities = _relation_slot_probabilities(
+        augmented_logits, sample, torch, str(config.relation_slot_source),
+    )
     source_trajectory_tokens, source_trajectory_visibility = _trajectory_tensors(
         source, torch, device, sample_count=int(config.trajectory_samples),
         quality_weighted=bool(config.quality_weighted_trajectories),

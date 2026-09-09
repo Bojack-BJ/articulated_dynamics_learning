@@ -24,7 +24,9 @@ from rgbd_urdf_mvp.kinematics.pairwise_relation_head import (
     _target_axis_excitation,
     _undirected_axis_equivariance_loss,
     _relation_batch_loss,
+    _relation_slot_probabilities,
     _slot_motion_invariants,
+    _slot_multiscale_motion_sequence,
     _structured_parent_selection_loss,
     _trajectory_tensors,
     extract_gt_relations,
@@ -385,6 +387,7 @@ class PairwiseRelationHeadTests(unittest.TestCase):
         self.assertEqual(train.geometry_encoder_type, "track_gru_average")
         self.assertEqual(train.trajectory_samples, 32)
         self.assertEqual(train.joint_type_head_type, "pair_context")
+        self.assertEqual(train.relation_slot_source, "predicted")
         self.assertEqual(train.edge_head_type, "pair_context")
         self.assertEqual(train.structured_parent_loss_weight, 0.0)
 
@@ -397,6 +400,15 @@ class PairwiseRelationHeadTests(unittest.TestCase):
         self.assertEqual(motion_heads.joint_type_head_type, "child_motion")
         self.assertEqual(motion_heads.edge_head_type, "motion_residual")
         self.assertEqual(motion_heads.structured_parent_loss_weight, 0.5)
+
+        temporal = parser.parse_args([
+            "train-slot-relation-head", "manifest.tsv", "slots.pt",
+            "--output-dir", "relations",
+            "--joint-type-head-type", "child_motion_temporal",
+            "--relation-slot-source", "oracle_gt",
+        ])
+        self.assertEqual(temporal.joint_type_head_type, "child_motion_temporal")
+        self.assertEqual(temporal.relation_slot_source, "oracle_gt")
 
         override = parser.parse_args([
             "infer-slot-relation-head", "tracks.json", "features.npz",
@@ -466,6 +478,64 @@ class PairwiseRelationHeadTests(unittest.TestCase):
         for child in range(3):
             expected = result["type_logits"][0, child]
             self.assertTrue(torch.allclose(result["type_logits"][:, child], expected[None]))
+
+    def test_multiscale_motion_sequence_is_so3_invariant(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("PyTorch is not installed")
+        generator = torch.Generator().manual_seed(31)
+        tokens = torch.randn(2, 9, 7, 11, generator=generator)
+        visibility = torch.rand(2, 9, 7, generator=generator)
+        probabilities = torch.softmax(torch.randn(2, 9, 3, generator=generator), dim=-1)
+        rotation = torch.tensor([
+            [0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0],
+        ])
+        rotated = tokens.clone()
+        rotated[..., 3:6] = tokens[..., 3:6] @ rotation.T
+        first, first_valid = _slot_multiscale_motion_sequence(
+            tokens, visibility, probabilities, torch,
+        )
+        second, second_valid = _slot_multiscale_motion_sequence(
+            rotated, visibility, probabilities, torch,
+        )
+        self.assertEqual(first.shape[-1], 10)
+        self.assertTrue(torch.equal(first_valid, second_valid))
+        self.assertTrue(torch.allclose(first, second, atol=1e-5, rtol=1e-5))
+
+    def test_temporal_child_type_is_independent_of_parent_candidate(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("PyTorch is not installed")
+        model = _build_relation_model(
+            torch, slot_dim=16, hidden_dim=32, axis_geometry_branch=True,
+            trajectory_hidden_dim=12,
+            joint_type_head_type="child_motion_temporal",
+        )
+        result = model(
+            torch.randn(3, 16),
+            trajectory_tokens=torch.randn(8, 7, 11),
+            trajectory_visibility=torch.ones(8, 7),
+            slot_probabilities=torch.softmax(torch.randn(8, 3), dim=-1),
+        )
+        self.assertTrue(torch.isfinite(result["type_logits"]).all())
+        for child in range(3):
+            self.assertTrue(torch.allclose(
+                result["type_logits"][:, child],
+                result["type_logits"][0, child][None],
+            ))
+
+    def test_oracle_relation_slots_are_one_hot_gt_assignments(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("PyTorch is not installed")
+        logits = torch.tensor([[5.0, 0.0], [4.0, 0.0], [0.0, 4.0]])
+        sample = {"labels": torch.tensor([7, 7, 9])}
+        probabilities = _relation_slot_probabilities(logits, sample, torch, "oracle_gt")
+        self.assertTrue(torch.equal(probabilities.sum(dim=-1), torch.ones(3)))
+        self.assertTrue(torch.equal(probabilities.argmax(dim=-1), torch.tensor([0, 0, 1])))
 
     def test_structured_parent_loss_prefers_true_parent(self) -> None:
         try:
