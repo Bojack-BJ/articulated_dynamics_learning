@@ -834,6 +834,9 @@ def main() -> int:
             relation_checkpoint.get("joint_type_head_type", "pair_context")
         ),
         edge_head_type=str(relation_checkpoint.get("edge_head_type", "pair_context")),
+        relation_context_source=str(
+            relation_checkpoint.get("relation_context_source", "decoded_slots")
+        ),
     ).to(device)
     relation_model.load_state_dict(relation_checkpoint["state_dict"])
     relation_model.trajectory_samples = int(

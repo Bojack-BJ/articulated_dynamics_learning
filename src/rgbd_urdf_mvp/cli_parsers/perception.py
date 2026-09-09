@@ -929,9 +929,18 @@ def register(subparsers: Any) -> None:
     )
     relation_train_parser.add_argument(
         "--edge-head-type",
-        choices=["pair_context", "motion_residual"],
+        choices=["pair_context", "motion_residual", "motion_only"],
         default="pair_context",
-        help="Optionally add invariant parent-child motion evidence to the legacy edge score.",
+        help="Use legacy pair context, add a motion residual, or score edges from motion only.",
+    )
+    relation_train_parser.add_argument(
+        "--relation-context-source",
+        choices=["decoded_slots", "track_motion"],
+        default="decoded_slots",
+        help=(
+            "Features consumed by relation heads. track_motion keeps slot assignments "
+            "but removes decoded query embeddings from edge, type, and axis prediction."
+        ),
     )
     relation_train_parser.add_argument(
         "--structured-parent-loss-weight",

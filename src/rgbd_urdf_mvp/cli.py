@@ -722,6 +722,7 @@ def main(argv: list[str] | None = None) -> int:
                 joint_type_loss_weight=max(0.0, float(args.joint_type_loss_weight)),
                 joint_type_head_type=str(args.joint_type_head_type),
                 relation_slot_source=str(args.relation_slot_source),
+                relation_context_source=str(args.relation_context_source),
                 edge_head_type=str(args.edge_head_type),
                 structured_parent_loss_weight=max(
                     0.0, float(args.structured_parent_loss_weight)

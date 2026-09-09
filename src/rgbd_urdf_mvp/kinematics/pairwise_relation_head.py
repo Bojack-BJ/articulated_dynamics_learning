@@ -90,6 +90,7 @@ class SlotRelationTrainingConfig:
     axis_head_type: str = "direct"
     joint_type_head_type: str = "pair_context"
     relation_slot_source: str = "predicted"
+    relation_context_source: str = "decoded_slots"
     edge_head_type: str = "pair_context"
     structured_parent_loss_weight: float = 0.0
     vector_pivot_parameterization: str = "analytic_plane_residual_v1"
@@ -194,6 +195,7 @@ class SlotRelationTrainer:
             geometry_transformer_layers=int(self.config.geometry_transformer_layers),
             joint_type_head_type=str(self.config.joint_type_head_type),
             edge_head_type=str(self.config.edge_head_type),
+            relation_context_source=str(self.config.relation_context_source),
         ).to(device)
         relation_model.trajectory_samples = int(self.config.trajectory_samples)
         relation_model.quality_weighted_trajectories = bool(
@@ -209,25 +211,32 @@ class SlotRelationTrainer:
             )
             initial_type_head = str(initial.get("joint_type_head_type", "pair_context"))
             initial_edge_head = str(initial.get("edge_head_type", "pair_context"))
+            initial_context_source = str(
+                initial.get("relation_context_source", "decoded_slots")
+            )
             if (
                 initial_type_head == self.config.joint_type_head_type
                 and initial_edge_head == self.config.edge_head_type
+                and initial_context_source == self.config.relation_context_source
             ):
                 relation_model.load_state_dict(initial["state_dict"])
             else:
+                current_state = relation_model.state_dict()
+                compatible_state = {
+                    key: value for key, value in initial["state_dict"].items()
+                    if key in current_state and current_state[key].shape == value.shape
+                }
                 load_result = relation_model.load_state_dict(
-                    initial["state_dict"], strict=False
+                    compatible_state, strict=False
                 )
                 allowed_prefixes = (
                     "motion_node.", "child_motion_type.",
                     "motion_temporal_input.", "motion_temporal_encoder.",
                     "child_motion_temporal_type.",
                     "motion_edge_backbone.", "motion_edge.",
+                    "equivariant_relation_backbone.", "edge.", "joint_type.",
                 )
-                unexpected = [
-                    key for key in load_result.unexpected_keys
-                    if not key.startswith(allowed_prefixes)
-                ]
+                unexpected = list(load_result.unexpected_keys)
                 missing = [
                     key for key in load_result.missing_keys
                     if not key.startswith(allowed_prefixes)
@@ -439,6 +448,7 @@ class SlotRelationTrainer:
                         "axis_head_type": str(self.config.axis_head_type),
                         "joint_type_head_type": str(self.config.joint_type_head_type),
                         "relation_slot_source": str(self.config.relation_slot_source),
+                        "relation_context_source": str(self.config.relation_context_source),
                         "edge_head_type": str(self.config.edge_head_type),
                         "structured_parent_loss_weight": float(
                             self.config.structured_parent_loss_weight
@@ -698,6 +708,9 @@ class SlotRelationInferencer:
             ),
             edge_head_type=str(
                 relation_checkpoint.get("edge_head_type", "pair_context")
+            ),
+            relation_context_source=str(
+                relation_checkpoint.get("relation_context_source", "decoded_slots")
             ),
         ).to(device)
         relation_model.load_state_dict(relation_checkpoint["state_dict"])
@@ -1286,6 +1299,7 @@ def _build_relation_model(
     geometry_transformer_layers: int = 1,
     joint_type_head_type: str = "pair_context",
     edge_head_type: str = "pair_context",
+    relation_context_source: str = "decoded_slots",
 ) -> Any:
     if axis_head_type not in {"direct", "equivariant_proposal", "vector_neuron"}:
         raise ValueError(f"Unsupported axis head type: {axis_head_type}")
@@ -1295,11 +1309,22 @@ def _build_relation_model(
         "pair_context", "child_motion", "child_motion_temporal"
     }:
         raise ValueError(f"Unsupported joint type head: {joint_type_head_type}")
-    if edge_head_type not in {"pair_context", "motion_residual"}:
+    if edge_head_type not in {"pair_context", "motion_residual", "motion_only"}:
         raise ValueError(f"Unsupported edge head: {edge_head_type}")
+    if relation_context_source not in {"decoded_slots", "track_motion"}:
+        raise ValueError(f"Unsupported relation context source: {relation_context_source}")
+    if relation_context_source == "track_motion":
+        if not axis_geometry_branch or axis_head_type == "direct":
+            raise ValueError(
+                "track_motion relation context requires a geometry-based axis head"
+            )
+        if joint_type_head_type == "pair_context" or edge_head_type != "motion_only":
+            raise ValueError(
+                "track_motion requires a child-motion type head and motion_only edge head"
+            )
     if (
         joint_type_head_type in {"child_motion", "child_motion_temporal"}
-        or edge_head_type == "motion_residual"
+        or edge_head_type in {"motion_residual", "motion_only"}
     ) and not axis_geometry_branch:
         raise ValueError("Motion-aware type/edge heads require axis_geometry_branch=True")
     if vector_pivot_parameterization not in {
@@ -1323,6 +1348,7 @@ def _build_relation_model(
             self.axis_head_type = str(axis_head_type)
             self.joint_type_head_type = str(joint_type_head_type)
             self.edge_head_type = str(edge_head_type)
+            self.relation_context_source = str(relation_context_source)
             self.vector_pivot_parameterization = str(vector_pivot_parameterization)
             self.geometry_encoder_type = str(geometry_encoder_type)
             self.geometry_max_tracks = max(1, int(geometry_max_tracks))
@@ -1336,7 +1362,7 @@ def _build_relation_model(
             )
             self.edge = torch.nn.Linear(hidden_dim, 1)
             self.joint_type = torch.nn.Linear(hidden_dim, len(JOINT_TYPES))
-            if self.joint_type_head_type == "child_motion" or self.edge_head_type == "motion_residual":
+            if self.joint_type_head_type == "child_motion" or self.edge_head_type in {"motion_residual", "motion_only"}:
                 self.motion_node = torch.nn.Sequential(
                     torch.nn.Linear(10, hidden_dim),
                     torch.nn.LayerNorm(hidden_dim),
@@ -1358,7 +1384,7 @@ def _build_relation_model(
                 self.child_motion_temporal_type = torch.nn.Linear(
                     hidden_dim, len(JOINT_TYPES)
                 )
-            if self.edge_head_type == "motion_residual":
+            if self.edge_head_type in {"motion_residual", "motion_only"}:
                 self.motion_edge_backbone = torch.nn.Sequential(
                     torch.nn.Linear(hidden_dim * 4, hidden_dim),
                     torch.nn.LayerNorm(hidden_dim),
@@ -1367,7 +1393,10 @@ def _build_relation_model(
                 self.motion_edge = torch.nn.Linear(hidden_dim, 1)
             if self.axis_head_type != "direct":
                 self.equivariant_relation_backbone = torch.nn.Sequential(
-                    torch.nn.Linear(slot_dim * 4 + 5, hidden_dim),
+                    torch.nn.Linear(
+                        5 if self.relation_context_source == "track_motion" else slot_dim * 4 + 5,
+                        hidden_dim,
+                    ),
                     torch.nn.LayerNorm(hidden_dim),
                     torch.nn.GELU(),
                     torch.nn.Linear(hidden_dim, hidden_dim),
@@ -1536,11 +1565,11 @@ def _build_relation_model(
                 geometry_hidden = self.geometry_backbone(geometry_pair)
                 if (
                     self.joint_type_head_type in {"child_motion", "child_motion_temporal"}
-                    or self.edge_head_type == "motion_residual"
+                    or self.edge_head_type in {"motion_residual", "motion_only"}
                 ):
                     if (
                         self.joint_type_head_type == "child_motion"
-                        or self.edge_head_type == "motion_residual"
+                        or self.edge_head_type in {"motion_residual", "motion_only"}
                     ):
                         motion_invariants = _slot_motion_invariants(
                             trajectory_tokens,
@@ -1586,9 +1615,10 @@ def _build_relation_model(
                 axis_observable = torch.ones_like(axis[..., 0], dtype=torch.bool)
                 axis_confidence = torch.ones_like(axis[..., 0])
             else:
-                scalar_hidden = self.equivariant_relation_backbone(
-                    torch.cat([slot_pair, pair_geometry["scalar_features"]], dim=-1)
-                )
+                scalar_input = pair_geometry["scalar_features"]
+                if self.relation_context_source == "decoded_slots":
+                    scalar_input = torch.cat([slot_pair, scalar_input], dim=-1)
+                scalar_hidden = self.equivariant_relation_backbone(scalar_input)
                 candidates = pair_geometry["candidate_axes"]
                 valid = pair_geometry["candidate_valid"]
                 if self.axis_head_type == "equivariant_proposal":
@@ -1713,7 +1743,7 @@ def _build_relation_model(
                 axis = torch.where(axis_observable[..., None], axis, torch.zeros_like(axis))
             relation_hidden = scalar_hidden if self.axis_head_type != "direct" else hidden
             edge_logits = self.edge(relation_hidden).squeeze(-1)
-            if self.edge_head_type == "motion_residual":
+            if self.edge_head_type in {"motion_residual", "motion_only"}:
                 motion_parent = motion_node_hidden[:, :, None, :].expand(
                     -1, -1, motion_node_hidden.shape[1], -1
                 )
@@ -1729,9 +1759,14 @@ def _build_relation_model(
                     ],
                     dim=-1,
                 )
-                edge_logits = edge_logits + self.motion_edge(
+                motion_edge_logits = self.motion_edge(
                     self.motion_edge_backbone(motion_pair)
                 ).squeeze(-1)
+                edge_logits = (
+                    motion_edge_logits
+                    if self.edge_head_type == "motion_only"
+                    else edge_logits + motion_edge_logits
+                )
             if self.joint_type_head_type == "child_motion":
                 child_type = self.child_motion_type(motion_node_hidden)
                 type_logits = child_type[:, None, :, :].expand(

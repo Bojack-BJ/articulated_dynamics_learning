@@ -388,6 +388,7 @@ class PairwiseRelationHeadTests(unittest.TestCase):
         self.assertEqual(train.trajectory_samples, 32)
         self.assertEqual(train.joint_type_head_type, "pair_context")
         self.assertEqual(train.relation_slot_source, "predicted")
+        self.assertEqual(train.relation_context_source, "decoded_slots")
         self.assertEqual(train.edge_head_type, "pair_context")
         self.assertEqual(train.structured_parent_loss_weight, 0.0)
 
@@ -400,6 +401,17 @@ class PairwiseRelationHeadTests(unittest.TestCase):
         self.assertEqual(motion_heads.joint_type_head_type, "child_motion")
         self.assertEqual(motion_heads.edge_head_type, "motion_residual")
         self.assertEqual(motion_heads.structured_parent_loss_weight, 0.5)
+
+        motion_only = parser.parse_args([
+            "train-slot-relation-head", "manifest.tsv", "slots.pt",
+            "--output-dir", "relations", "--axis-geometry-branch",
+            "--axis-head-type", "vector_neuron",
+            "--joint-type-head-type", "child_motion_temporal",
+            "--edge-head-type", "motion_only",
+            "--relation-context-source", "track_motion",
+        ])
+        self.assertEqual(motion_only.relation_context_source, "track_motion")
+        self.assertEqual(motion_only.edge_head_type, "motion_only")
 
         temporal = parser.parse_args([
             "train-slot-relation-head", "manifest.tsv", "slots.pt",
@@ -478,6 +490,31 @@ class PairwiseRelationHeadTests(unittest.TestCase):
         for child in range(3):
             expected = result["type_logits"][0, child]
             self.assertTrue(torch.allclose(result["type_logits"][:, child], expected[None]))
+
+    def test_track_motion_context_is_independent_of_decoded_slot_features(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("PyTorch is not installed")
+        model = _build_relation_model(
+            torch, slot_dim=16, hidden_dim=32,
+            axis_geometry_branch=True, axis_head_type="vector_neuron",
+            trajectory_hidden_dim=12,
+            joint_type_head_type="child_motion_temporal",
+            edge_head_type="motion_only", relation_context_source="track_motion",
+        )
+        trajectory_tokens = torch.randn(8, 7, 11)
+        trajectory_visibility = torch.ones(8, 7)
+        slot_probabilities = torch.softmax(torch.randn(8, 3), dim=-1)
+        kwargs = {
+            "trajectory_tokens": trajectory_tokens,
+            "trajectory_visibility": trajectory_visibility,
+            "slot_probabilities": slot_probabilities,
+        }
+        first = model(torch.randn(3, 16), **kwargs)
+        second = model(torch.randn(3, 16) * 100.0, **kwargs)
+        for key in ("edge_logits", "type_logits", "axes", "pivots"):
+            self.assertTrue(torch.allclose(first[key], second[key], atol=1e-6, rtol=1e-6))
 
     def test_multiscale_motion_sequence_is_so3_invariant(self) -> None:
         try:
