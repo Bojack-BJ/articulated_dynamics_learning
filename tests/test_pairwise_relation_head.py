@@ -24,6 +24,8 @@ from rgbd_urdf_mvp.kinematics.pairwise_relation_head import (
     _target_axis_excitation,
     _undirected_axis_equivariance_loss,
     _relation_batch_loss,
+    _slot_motion_invariants,
+    _structured_parent_selection_loss,
     _trajectory_tensors,
     extract_gt_relations,
     graph_legality_diagnostics,
@@ -382,6 +384,19 @@ class PairwiseRelationHeadTests(unittest.TestCase):
         self.assertFalse(train.axis_geometry_branch)
         self.assertEqual(train.geometry_encoder_type, "track_gru_average")
         self.assertEqual(train.trajectory_samples, 32)
+        self.assertEqual(train.joint_type_head_type, "pair_context")
+        self.assertEqual(train.edge_head_type, "pair_context")
+        self.assertEqual(train.structured_parent_loss_weight, 0.0)
+
+        motion_heads = parser.parse_args([
+            "train-slot-relation-head", "manifest.tsv", "slots.pt",
+            "--output-dir", "relations", "--joint-type-head-type", "child_motion",
+            "--edge-head-type", "motion_residual",
+            "--structured-parent-loss-weight", "0.5",
+        ])
+        self.assertEqual(motion_heads.joint_type_head_type, "child_motion")
+        self.assertEqual(motion_heads.edge_head_type, "motion_residual")
+        self.assertEqual(motion_heads.structured_parent_loss_weight, 0.5)
 
         override = parser.parse_args([
             "infer-slot-relation-head", "tracks.json", "features.npz",
@@ -401,6 +416,73 @@ class PairwiseRelationHeadTests(unittest.TestCase):
         self.assertEqual(tuple(result["type_logits"].shape), (4, 4, 3))
         self.assertEqual(tuple(result["axes"].shape), (4, 4, 3))
         self.assertEqual(tuple(result["pivots"].shape), (4, 4, 3))
+
+    def test_slot_motion_invariants_are_so3_invariant(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("PyTorch is not installed")
+        generator = torch.Generator().manual_seed(17)
+        tokens = torch.randn(1, 7, 9, 11, generator=generator)
+        tokens[..., 9] = 1.0
+        tokens[..., 10] = torch.linspace(0.0, 1.0, 9)
+        visibility = torch.ones(1, 7, 9)
+        probabilities = torch.softmax(
+            torch.randn(1, 7, 3, generator=generator), dim=-1
+        )
+        rotation = torch.tensor([
+            [0.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        rotated = tokens.clone()
+        for start in (0, 3, 6):
+            rotated[..., start:start + 3] = tokens[..., start:start + 3] @ rotation.T
+        first = _slot_motion_invariants(tokens, visibility, probabilities, torch)
+        second = _slot_motion_invariants(rotated, visibility, probabilities, torch)
+        self.assertEqual(tuple(first.shape), (1, 3, 10))
+        self.assertTrue(torch.isfinite(first).all())
+        self.assertTrue(torch.allclose(first, second, atol=1e-5, rtol=1e-5))
+
+    def test_child_motion_type_is_independent_of_parent_candidate(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("PyTorch is not installed")
+        model = _build_relation_model(
+            torch, slot_dim=16, hidden_dim=32,
+            axis_geometry_branch=True, trajectory_hidden_dim=12,
+            joint_type_head_type="child_motion", edge_head_type="motion_residual",
+        )
+        result = model(
+            torch.randn(3, 16),
+            trajectory_tokens=torch.randn(8, 6, 11),
+            trajectory_visibility=torch.ones(8, 6),
+            slot_probabilities=torch.softmax(torch.randn(8, 3), dim=-1),
+        )
+        self.assertEqual(tuple(result["edge_logits"].shape), (3, 3))
+        self.assertEqual(tuple(result["type_logits"].shape), (3, 3, 3))
+        self.assertTrue(torch.isfinite(result["edge_logits"]).all())
+        for child in range(3):
+            expected = result["type_logits"][0, child]
+            self.assertTrue(torch.allclose(result["type_logits"][:, child], expected[None]))
+
+    def test_structured_parent_loss_prefers_true_parent(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("PyTorch is not installed")
+        valid_pair = ~torch.eye(3, dtype=torch.bool)
+        positive = torch.zeros((3, 3), dtype=torch.bool)
+        positive[0, 2] = True
+        target = {"valid_pair": valid_pair, "positive": positive}
+        correct = torch.zeros((3, 3))
+        correct[0, 2] = 4.0
+        wrong = torch.zeros((3, 3))
+        wrong[1, 2] = 4.0
+        correct_loss = _structured_parent_selection_loss(correct, target, torch)
+        wrong_loss = _structured_parent_selection_loss(wrong, target, torch)
+        self.assertLess(float(correct_loss), float(wrong_loss))
 
     def test_relation_model_supports_padded_object_batches(self) -> None:
         try:

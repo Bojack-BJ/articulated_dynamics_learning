@@ -15,6 +15,7 @@ from rgbd_urdf_mvp.kinematics.pairwise_relation_head import (
     _load_slot_model,
     _relation_targets,
     _slot_motion_summary,
+    _trajectory_tensors,
 )
 from rgbd_urdf_mvp.perception.motion_part_slots import _require_torch, _resolve_device
 from rgbd_urdf_mvp.perception.pairwise_affinity import load_pairwise_manifest
@@ -44,6 +45,24 @@ def main() -> int:
         slot_dim=int(relation_checkpoint["slot_dim"]),
         hidden_dim=int(relation_checkpoint["hidden_dim"]),
         motion_summary_dim=int(relation_checkpoint.get("motion_summary_dim", 0)),
+        axis_geometry_branch=bool(relation_checkpoint.get("axis_geometry_branch", False)),
+        axis_head_type=str(relation_checkpoint.get("axis_head_type", "direct")),
+        vector_pivot_parameterization=str(
+            relation_checkpoint.get("vector_pivot_parameterization", "legacy_center_delta")
+        ),
+        geometry_encoder_type=str(
+            relation_checkpoint.get("geometry_encoder_type", "track_gru_average")
+        ),
+        trajectory_hidden_dim=int(relation_checkpoint.get("trajectory_hidden_dim", 128)),
+        geometry_max_tracks=int(relation_checkpoint.get("geometry_max_tracks", 64)),
+        geometry_attention_heads=int(relation_checkpoint.get("geometry_attention_heads", 4)),
+        geometry_transformer_layers=int(
+            relation_checkpoint.get("geometry_transformer_layers", 1)
+        ),
+        joint_type_head_type=str(
+            relation_checkpoint.get("joint_type_head_type", "pair_context")
+        ),
+        edge_head_type=str(relation_checkpoint.get("edge_head_type", "pair_context")),
     ).to(device)
     relation_model.load_state_dict(relation_checkpoint["state_dict"])
     relation_model.eval()
@@ -62,7 +81,27 @@ def main() -> int:
             motion_summary = _slot_motion_summary(
                 features, probabilities, int(sample["embedding_dim"]), torch
             )
-            prediction = relation_model(slots, motion_summary)
+            trajectory_tokens = trajectory_visibility = None
+            if relation_model.axis_geometry_branch:
+                trajectory_tokens, trajectory_visibility = _trajectory_tensors(
+                    sample,
+                    torch,
+                    device,
+                    sample_count=int(relation_checkpoint.get("trajectory_samples", 32)),
+                    quality_weighted=bool(
+                        relation_checkpoint.get("quality_weighted_trajectories", False)
+                    ),
+                    robust_segment_weights=bool(
+                        relation_checkpoint.get("robust_segment_weights", False)
+                    ),
+                )
+            prediction = relation_model(
+                slots,
+                motion_summary,
+                trajectory_tokens=trajectory_tokens,
+                trajectory_visibility=trajectory_visibility,
+                slot_probabilities=probabilities if relation_model.axis_geometry_branch else None,
+            )
             target = _relation_targets(sample, logits, int(slots.shape[0]), torch, device)
             for relation in target["relations"]:
                 parent, child = int(relation["parent_slot"]), int(relation["child_slot"])

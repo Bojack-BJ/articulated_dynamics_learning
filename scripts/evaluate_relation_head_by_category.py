@@ -95,6 +95,10 @@ def main() -> int:
         geometry_transformer_layers=int(
             relation_checkpoint.get("geometry_transformer_layers", 1)
         ),
+        joint_type_head_type=str(
+            relation_checkpoint.get("joint_type_head_type", "pair_context")
+        ),
+        edge_head_type=str(relation_checkpoint.get("edge_head_type", "pair_context")),
     ).to(device)
     relation_model.trajectory_samples = int(relation_checkpoint.get("trajectory_samples", 32))
     relation_model.quality_weighted_trajectories = bool(

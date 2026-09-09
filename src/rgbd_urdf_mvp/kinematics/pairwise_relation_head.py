@@ -88,6 +88,9 @@ class SlotRelationTrainingConfig:
     hard_axis_max_weight: float = 2.0
     axis_geometry_branch: bool = False
     axis_head_type: str = "direct"
+    joint_type_head_type: str = "pair_context"
+    edge_head_type: str = "pair_context"
+    structured_parent_loss_weight: float = 0.0
     vector_pivot_parameterization: str = "analytic_plane_residual_v1"
     relation_train_scope: str = "all"
     geometry_encoder_type: str = "track_gru_average"
@@ -188,6 +191,8 @@ class SlotRelationTrainer:
             geometry_max_tracks=int(self.config.geometry_max_tracks),
             geometry_attention_heads=int(self.config.geometry_attention_heads),
             geometry_transformer_layers=int(self.config.geometry_transformer_layers),
+            joint_type_head_type=str(self.config.joint_type_head_type),
+            edge_head_type=str(self.config.edge_head_type),
         ).to(device)
         relation_model.trajectory_samples = int(self.config.trajectory_samples)
         relation_model.quality_weighted_trajectories = bool(
@@ -201,7 +206,34 @@ class SlotRelationTrainer:
                 map_location="cpu",
                 weights_only=True,
             )
-            relation_model.load_state_dict(initial["state_dict"])
+            initial_type_head = str(initial.get("joint_type_head_type", "pair_context"))
+            initial_edge_head = str(initial.get("edge_head_type", "pair_context"))
+            if (
+                initial_type_head == self.config.joint_type_head_type
+                and initial_edge_head == self.config.edge_head_type
+            ):
+                relation_model.load_state_dict(initial["state_dict"])
+            else:
+                load_result = relation_model.load_state_dict(
+                    initial["state_dict"], strict=False
+                )
+                allowed_prefixes = (
+                    "motion_node.", "child_motion_type.",
+                    "motion_edge_backbone.", "motion_edge.",
+                )
+                unexpected = [
+                    key for key in load_result.unexpected_keys
+                    if not key.startswith(allowed_prefixes)
+                ]
+                missing = [
+                    key for key in load_result.missing_keys
+                    if not key.startswith(allowed_prefixes)
+                ]
+                if unexpected or missing:
+                    raise RuntimeError(
+                        "Initial relation checkpoint is incompatible beyond the new "
+                        f"motion heads: missing={missing}, unexpected={unexpected}"
+                    )
             if self.config.load_initial_slot_state and initial.get("slot_state_dict") is not None:
                 slot_model.load_state_dict(initial["slot_state_dict"])
                 inherited_slot_state = True
@@ -401,6 +433,11 @@ class SlotRelationTrainer:
                         "motion_summary_dim": motion_summary_dim,
                         "axis_geometry_branch": bool(self.config.axis_geometry_branch),
                         "axis_head_type": str(self.config.axis_head_type),
+                        "joint_type_head_type": str(self.config.joint_type_head_type),
+                        "edge_head_type": str(self.config.edge_head_type),
+                        "structured_parent_loss_weight": float(
+                            self.config.structured_parent_loss_weight
+                        ),
                         "vector_pivot_parameterization": str(
                             self.config.vector_pivot_parameterization
                         ),
@@ -617,6 +654,7 @@ class SlotRelationInferencer:
             object_id=str(artifact.get("object_instance_id", tracks_path.parent.name)),
             require_labels=False,
             canonicalize_geometry=bool(slot_checkpoint.get("canonicalize_geometry", False)),
+            feature_schema=str(slot_checkpoint.get("feature_schema", "legacy_v1")),
         )
         sample = _apply_slot_geometry_representation(
             [sample], str(relation_checkpoint.get("slot_geometry_representation", "raw")), np
@@ -648,6 +686,12 @@ class SlotRelationInferencer:
             ),
             geometry_transformer_layers=int(
                 relation_checkpoint.get("geometry_transformer_layers", 1)
+            ),
+            joint_type_head_type=str(
+                relation_checkpoint.get("joint_type_head_type", "pair_context")
+            ),
+            edge_head_type=str(
+                relation_checkpoint.get("edge_head_type", "pair_context")
             ),
         ).to(device)
         relation_model.load_state_dict(relation_checkpoint["state_dict"])
@@ -916,6 +960,7 @@ def _load_relation_samples(
             collapse_fixed_connected_labels=bool(
                 slot_checkpoint.get("collapse_fixed_connected_labels", False)
             ),
+            feature_schema=str(slot_checkpoint.get("feature_schema", "legacy_v1")),
         )
         relations = (
             extract_manual_gt_relations(load_json(row["relation_gt_path"]), sample)
@@ -1062,6 +1107,102 @@ def _load_slot_model(checkpoint: dict[str, Any], torch: Any, device: str) -> Any
     return model
 
 
+def _slot_motion_invariants(
+    trajectory_tokens: Any,
+    trajectory_visibility: Any,
+    slot_probabilities: Any,
+    torch: Any,
+) -> Any:
+    """Aggregate child-motion evidence without emitting world-frame vectors."""
+    observation = trajectory_visibility.to(trajectory_tokens.dtype).clamp(0.0, 1.0)
+    membership = slot_probabilities.transpose(1, 2)
+    weights = membership[..., None] * observation[:, None, :, :]
+    total = weights.sum(dim=(2, 3)).clamp_min(1e-6)
+    positions = trajectory_tokens[..., 3:6]
+    velocity = trajectory_tokens[..., 6:9]
+    references = trajectory_tokens[..., :3]
+    speed = torch.linalg.vector_norm(velocity, dim=-1)
+
+    def mean_scalar(values: Any) -> Any:
+        expanded = values[:, None, :, :] if values.ndim == 3 else values
+        return (weights * expanded).sum(dim=(2, 3)) / total
+
+    speed_mean = mean_scalar(speed)
+    speed_variance = mean_scalar((speed - speed_mean[:, :, None, None]) ** 2)
+    mean_velocity = (
+        weights[..., None] * velocity[:, None, :, :, :]
+    ).sum(dim=(2, 3)) / total[..., None]
+    translation_coherence = (
+        torch.linalg.vector_norm(mean_velocity, dim=-1) / speed_mean.clamp_min(1e-6)
+    ).clamp(0.0, 1.0)
+
+    reference_weights = weights.sum(dim=3)
+    reference_total = reference_weights.sum(dim=2).clamp_min(1e-6)
+    reference_center = (
+        reference_weights[..., None] * references[:, None, :, 0, :]
+    ).sum(dim=2) / reference_total[..., None]
+    radius = references[:, None, :, :, :] - reference_center[:, :, None, None, :]
+    rotational = torch.linalg.cross(
+        radius.expand(-1, -1, -1, velocity.shape[2], -1),
+        velocity[:, None, :, :, :].expand(-1, membership.shape[1], -1, -1, -1),
+        dim=-1,
+    )
+    rotational_norm = torch.linalg.vector_norm(rotational, dim=-1)
+    mean_rotational = (
+        weights[..., None] * rotational
+    ).sum(dim=(2, 3)) / total[..., None]
+    rotational_coherence = (
+        torch.linalg.vector_norm(mean_rotational, dim=-1)
+        / mean_scalar(rotational_norm).clamp_min(1e-6)
+    ).clamp(0.0, 1.0)
+    radius_norm = torch.linalg.vector_norm(radius, dim=-1)
+    radial_speed = torch.abs(torch.sum(radius * velocity[:, None, :, :, :], dim=-1))
+    radial_ratio = (
+        mean_scalar(radial_speed)
+        / mean_scalar(radius_norm * speed[:, None, :, :]).clamp_min(1e-6)
+    ).clamp(0.0, 1.0)
+
+    position_mean = (
+        weights[..., None] * positions[:, None, :, :, :]
+    ).sum(dim=(2, 3)) / total[..., None]
+    position_variance = mean_scalar(
+        torch.sum(
+            (positions[:, None, :, :, :] - position_mean[:, :, None, None, :]) ** 2,
+            dim=-1,
+        )
+    )
+    visible_fraction = total / (
+        membership.sum(dim=2).clamp_min(1e-6) * observation.shape[-1]
+    )
+    normalized_membership = membership / membership.sum(dim=2, keepdim=True).clamp_min(1e-6)
+    effective_tracks = 1.0 / normalized_membership.square().sum(dim=2).clamp_min(1e-6)
+    effective_tracks = effective_tracks / max(1, membership.shape[2])
+
+    velocity_covariance = torch.einsum(
+        "bknt,bntd,bnte->bkde",
+        weights,
+        velocity,
+        velocity,
+    ) / total[..., None, None]
+    eigenvalues = torch.linalg.eigvalsh(velocity_covariance).clamp_min(0.0)
+    eigenvalues = eigenvalues / eigenvalues.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    return torch.stack(
+        [
+            speed_mean,
+            torch.sqrt(speed_variance.clamp_min(0.0)),
+            translation_coherence,
+            rotational_coherence,
+            radial_ratio,
+            torch.sqrt(position_variance.clamp_min(0.0)),
+            visible_fraction.clamp(0.0, 1.0),
+            effective_tracks.clamp(0.0, 1.0),
+            eigenvalues[..., 1],
+            eigenvalues[..., 2],
+        ],
+        dim=-1,
+    )
+
+
 def _build_relation_model(
     torch: Any, *, slot_dim: int, hidden_dim: int, motion_summary_dim: int = 0,
     axis_geometry_branch: bool = False,
@@ -1072,11 +1213,21 @@ def _build_relation_model(
     geometry_max_tracks: int = 64,
     geometry_attention_heads: int = 4,
     geometry_transformer_layers: int = 1,
+    joint_type_head_type: str = "pair_context",
+    edge_head_type: str = "pair_context",
 ) -> Any:
     if axis_head_type not in {"direct", "equivariant_proposal", "vector_neuron"}:
         raise ValueError(f"Unsupported axis head type: {axis_head_type}")
     if axis_head_type != "direct" and not axis_geometry_branch:
         raise ValueError(f"{axis_head_type} requires axis_geometry_branch=True")
+    if joint_type_head_type not in {"pair_context", "child_motion"}:
+        raise ValueError(f"Unsupported joint type head: {joint_type_head_type}")
+    if edge_head_type not in {"pair_context", "motion_residual"}:
+        raise ValueError(f"Unsupported edge head: {edge_head_type}")
+    if (
+        joint_type_head_type == "child_motion" or edge_head_type == "motion_residual"
+    ) and not axis_geometry_branch:
+        raise ValueError("Motion-aware type/edge heads require axis_geometry_branch=True")
     if vector_pivot_parameterization not in {
         "legacy_center_delta", "analytic_plane_residual_v1", "pure_plane_residual_v1"
     }:
@@ -1096,6 +1247,8 @@ def _build_relation_model(
             super().__init__()
             self.axis_geometry_branch = bool(axis_geometry_branch)
             self.axis_head_type = str(axis_head_type)
+            self.joint_type_head_type = str(joint_type_head_type)
+            self.edge_head_type = str(edge_head_type)
             self.vector_pivot_parameterization = str(vector_pivot_parameterization)
             self.geometry_encoder_type = str(geometry_encoder_type)
             self.geometry_max_tracks = max(1, int(geometry_max_tracks))
@@ -1109,6 +1262,23 @@ def _build_relation_model(
             )
             self.edge = torch.nn.Linear(hidden_dim, 1)
             self.joint_type = torch.nn.Linear(hidden_dim, len(JOINT_TYPES))
+            if self.joint_type_head_type == "child_motion" or self.edge_head_type == "motion_residual":
+                self.motion_node = torch.nn.Sequential(
+                    torch.nn.Linear(10, hidden_dim),
+                    torch.nn.LayerNorm(hidden_dim),
+                    torch.nn.GELU(),
+                    torch.nn.Linear(hidden_dim, hidden_dim),
+                    torch.nn.GELU(),
+                )
+            if self.joint_type_head_type == "child_motion":
+                self.child_motion_type = torch.nn.Linear(hidden_dim, len(JOINT_TYPES))
+            if self.edge_head_type == "motion_residual":
+                self.motion_edge_backbone = torch.nn.Sequential(
+                    torch.nn.Linear(hidden_dim * 4, hidden_dim),
+                    torch.nn.LayerNorm(hidden_dim),
+                    torch.nn.GELU(),
+                )
+                self.motion_edge = torch.nn.Linear(hidden_dim, 1)
             if self.axis_head_type != "direct":
                 self.equivariant_relation_backbone = torch.nn.Sequential(
                     torch.nn.Linear(slot_dim * 4 + 5, hidden_dim),
@@ -1192,6 +1362,7 @@ def _build_relation_model(
             hidden = self.backbone(pair)
             geometry_hidden = hidden
             pair_geometry = None
+            motion_node_hidden = None
             if self.axis_geometry_branch:
                 if (
                     trajectory_tokens is None
@@ -1276,6 +1447,17 @@ def _build_relation_model(
                     dim=-1,
                 )
                 geometry_hidden = self.geometry_backbone(geometry_pair)
+                if (
+                    self.joint_type_head_type == "child_motion"
+                    or self.edge_head_type == "motion_residual"
+                ):
+                    motion_invariants = _slot_motion_invariants(
+                        trajectory_tokens,
+                        trajectory_visibility,
+                        slot_probabilities,
+                        torch,
+                    )
+                    motion_node_hidden = self.motion_node(motion_invariants)
                 if self.axis_head_type != "direct":
                     pair_geometry = build_equivariant_pair_geometry(
                         trajectory_tokens,
@@ -1416,13 +1598,37 @@ def _build_relation_model(
                         )
                 axis_observable = valid.any(dim=-1)
                 axis = torch.where(axis_observable[..., None], axis, torch.zeros_like(axis))
+            relation_hidden = scalar_hidden if self.axis_head_type != "direct" else hidden
+            edge_logits = self.edge(relation_hidden).squeeze(-1)
+            if self.edge_head_type == "motion_residual":
+                motion_parent = motion_node_hidden[:, :, None, :].expand(
+                    -1, -1, motion_node_hidden.shape[1], -1
+                )
+                motion_child = motion_node_hidden[:, None, :, :].expand(
+                    -1, motion_node_hidden.shape[1], -1, -1
+                )
+                motion_pair = torch.cat(
+                    [
+                        motion_parent,
+                        motion_child,
+                        motion_child - motion_parent,
+                        motion_child * motion_parent,
+                    ],
+                    dim=-1,
+                )
+                edge_logits = edge_logits + self.motion_edge(
+                    self.motion_edge_backbone(motion_pair)
+                ).squeeze(-1)
+            if self.joint_type_head_type == "child_motion":
+                child_type = self.child_motion_type(motion_node_hidden)
+                type_logits = child_type[:, None, :, :].expand(
+                    -1, slots.shape[1], -1, -1
+                )
+            else:
+                type_logits = self.joint_type(relation_hidden)
             output = {
-                "edge_logits": self.edge(
-                    scalar_hidden if self.axis_head_type != "direct" else hidden
-                ).squeeze(-1),
-                "type_logits": self.joint_type(
-                    scalar_hidden if self.axis_head_type != "direct" else hidden
-                ),
+                "edge_logits": edge_logits,
+                "type_logits": type_logits,
                 "axes": axis,
                 "pivots": pivot,
                 "axis_observable": axis_observable,
@@ -1771,6 +1977,9 @@ def _relation_loss_from_outputs(
         if bool(valid_pair.any())
         else prediction["edge_logits"].sum() * 0.0
     )
+    structured_parent_loss = _structured_parent_selection_loss(
+        prediction["edge_logits"], target, torch
+    )
     positive = target["positive"]
     if bool(positive.any()):
         positive_types = target["joint_type"][positive]
@@ -1888,6 +2097,7 @@ def _relation_loss_from_outputs(
         slot_existence_loss = existence_logits.sum() * 0.0
     relation_total = (
         edge_loss
+        + float(config.structured_parent_loss_weight) * structured_parent_loss
         + float(config.joint_type_loss_weight) * type_loss
         + float(config.axis_loss_weight) * axis_loss
         + float(config.axis_line_loss_weight) * line_loss
@@ -1904,6 +2114,7 @@ def _relation_loss_from_outputs(
     return {
         "total": total,
         "edge": edge_loss,
+        "structured_parent": structured_parent_loss,
         "type": type_loss,
         "axis": axis_loss,
         "axis_line": line_loss,
@@ -1919,6 +2130,33 @@ def _relation_loss_from_outputs(
         "equivariance_type": prediction["edge_logits"].sum() * 0.0,
         "slot_consistency": prediction["edge_logits"].sum() * 0.0,
     }
+
+
+def _structured_parent_selection_loss(edge_logits: Any, target: dict[str, Any], torch: Any) -> Any:
+    """Select one parent among valid candidates for every supervised child slot."""
+    valid_pair = target["valid_pair"]
+    positive = target["positive"]
+    losses = []
+    for child in range(int(edge_logits.shape[1])):
+        true_parents = torch.nonzero(positive[:, child], as_tuple=False).flatten()
+        if int(true_parents.numel()) != 1:
+            continue
+        candidates = torch.nonzero(valid_pair[:, child], as_tuple=False).flatten()
+        if int(candidates.numel()) < 2:
+            continue
+        target_index = torch.nonzero(
+            candidates == true_parents[0], as_tuple=False
+        ).flatten()
+        if int(target_index.numel()) != 1:
+            continue
+        losses.append(torch.nn.functional.cross_entropy(
+            edge_logits[candidates, child][None], target_index,
+        ))
+    return (
+        torch.stack(losses).mean()
+        if losses
+        else edge_logits.sum() * 0.0
+    )
 
 
 def _add_equivariance_loss(
