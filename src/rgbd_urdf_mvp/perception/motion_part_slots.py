@@ -58,6 +58,7 @@ class MotionPartSlotTrainingConfig:
     data_loader_workers: int = 0
     topology_balanced_sampling: bool = True
     collapse_fixed_connected_labels: bool = False
+    feature_schema: str = "legacy_v1"
     device: str = "auto"
     seed: int = 0
 
@@ -91,12 +92,14 @@ class MotionPartSlotTrainer:
         train_samples = _load_samples(
             rows, "train", canonicalize_geometry=self.config.canonicalize_geometry,
             collapse_fixed_connected_labels=self.config.collapse_fixed_connected_labels,
+            feature_schema=self.config.feature_schema,
             workers=self.config.data_loader_workers,
         )
         validation_split = "val" if any(row["split"] == "val" for row in rows) else "train"
         val_samples = _load_samples(
             rows, validation_split, canonicalize_geometry=self.config.canonicalize_geometry,
             collapse_fixed_connected_labels=self.config.collapse_fixed_connected_labels,
+            feature_schema=self.config.feature_schema,
             workers=self.config.data_loader_workers,
         )
         if not train_samples:
@@ -286,6 +289,7 @@ class MotionPartSlotTrainer:
                         "feature_std": torch.from_numpy(std),
                         "canonicalize_geometry": self.config.canonicalize_geometry,
                         "collapse_fixed_connected_labels": self.config.collapse_fixed_connected_labels,
+                        "feature_schema": self.config.feature_schema,
                     },
                     checkpoint_path,
                 )
@@ -329,6 +333,7 @@ class MotionPartSlotInferencer:
             object_id=str(artifact.get("object_instance_id", Path(self.config.tracks_path).parent.name)),
             require_labels=False,
             canonicalize_geometry=bool(checkpoint.get("canonicalize_geometry", False)),
+            feature_schema=str(checkpoint.get("feature_schema", "legacy_v1")),
         )
         input_s = time.perf_counter() - input_started
         device = _resolve_device(torch, self.config.device)
@@ -465,7 +470,8 @@ def _filter_inference_tracks(
 
 def _load_samples(
     rows: list[dict[str, str]], split: str, *, canonicalize_geometry: bool = True,
-    collapse_fixed_connected_labels: bool = False, workers: int = 0,
+    collapse_fixed_connected_labels: bool = False, feature_schema: str = "legacy_v1",
+    workers: int = 0,
 ) -> list[dict[str, Any]]:
     selected = [row for row in rows if row["split"] == split]
 
@@ -477,6 +483,7 @@ def _load_samples(
             require_labels=True,
             canonicalize_geometry=canonicalize_geometry,
             collapse_fixed_connected_labels=collapse_fixed_connected_labels,
+            feature_schema=feature_schema,
         )
     if int(workers) <= 1:
         return [load(row) for row in selected]
@@ -487,8 +494,11 @@ def _load_samples(
 def _sample_from_artifact(
     artifact: dict[str, Any], feature_map: dict[int, Any], *, object_id: str, require_labels: bool,
     canonicalize_geometry: bool = True, collapse_fixed_connected_labels: bool = False,
+    feature_schema: str = "legacy_v1",
 ) -> dict[str, Any]:
     np = _require_numpy()
+    if feature_schema not in {"legacy_v1", "quality_temporal_v2"}:
+        raise ValueError(f"Unsupported slot feature schema: {feature_schema}")
     tracks = [
         track for track in artifact.get("tracks", [])
         if isinstance(track, dict)
@@ -543,6 +553,19 @@ def _sample_from_artifact(
             [*reference_feature.tolist(), *endpoint_feature.tolist(), motion_feature, len(frames) / (max_frame + 1), *sampled_feature],
             dtype=np.float32,
         )
+        if feature_schema == "quality_temporal_v2":
+            scalar = np.concatenate([
+                scalar,
+                _quality_temporal_features(
+                    frames,
+                    observation_quality[index],
+                    float(track_quality[index]),
+                    trajectory,
+                    max_frame=max_frame,
+                    scale=scale if canonicalize_geometry else 1.0,
+                    np=np,
+                ),
+            ])
         features.append(np.concatenate([embedding, scalar]))
     original_raw_labels = [
         int(track.get("original_part_id", track.get("part_id", 0))) for track in tracks
@@ -606,10 +629,50 @@ def _sample_from_artifact(
         "observation_quality": observation_quality,
         "track_quality": track_quality,
         "embedding_dim": int(len(np.asarray(feature_map[int(tracks[0]["track_id"])]))),
+        "feature_schema": feature_schema,
         "canonical_center_m": center.astype(np.float32),
         "canonical_scale_m": scale,
         "raw_part_to_label": raw_part_to_label,
     }
+
+
+def _quality_temporal_features(
+    frames: list[int], observation_quality: Any, track_quality: float,
+    trajectory: dict[int, Any], *, max_frame: int, scale: float, np: Any,
+) -> Any:
+    """Summarize reliability and temporal fragmentation without encoding world axes."""
+    frame_count = max(1, int(max_frame) + 1)
+    sorted_frames = np.asarray(sorted(frames), dtype=np.int64)
+    qualities = np.asarray(observation_quality, dtype=np.float32)[sorted_frames]
+    gaps = np.diff(sorted_frames) if len(sorted_frames) > 1 else np.asarray([], dtype=np.int64)
+    segment_lengths = []
+    segment_start = 0
+    for index, gap in enumerate(gaps.tolist(), start=1):
+        if int(gap) > 1:
+            segment_lengths.append(index - segment_start)
+            segment_start = index
+    segment_lengths.append(len(sorted_frames) - segment_start)
+    positions = np.asarray([trajectory[int(frame)] for frame in sorted_frames], dtype=np.float32)
+    speeds = (
+        np.linalg.norm(np.diff(positions, axis=0), axis=1) / max(float(scale), 1e-6)
+        if len(positions) > 1
+        else np.zeros((1,), dtype=np.float32)
+    )
+    speed_median = float(np.median(speeds))
+    speed_mad = float(np.median(np.abs(speeds - speed_median)))
+    return np.asarray(
+        [
+            np.clip(track_quality, 0.0, 1.0),
+            float(np.mean(qualities)) if len(qualities) else 0.0,
+            float(np.quantile(qualities, 0.1)) if len(qualities) else 0.0,
+            max(segment_lengths) / frame_count,
+            float(np.count_nonzero(gaps > 1)) / max(1, len(sorted_frames) - 1),
+            float(sorted_frames[0]) / max(1, max_frame),
+            float(sorted_frames[-1]) / max(1, max_frame),
+            speed_mad,
+        ],
+        dtype=np.float32,
+    )
 
 
 def _build_slot_model(torch: Any, *, input_dim: int, hidden_dim: int, max_slots: int, encoder_layers: int, decoder_layers: int, attention_heads: int) -> Any:

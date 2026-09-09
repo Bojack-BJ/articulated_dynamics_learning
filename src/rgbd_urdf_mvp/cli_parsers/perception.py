@@ -859,6 +859,12 @@ def register(subparsers: Any) -> None:
         action="store_true",
         help="Train against maximal fixed-joint-connected kinematic parts instead of raw simulator bodies",
     )
+    slot_train_parser.add_argument(
+        "--slot-feature-schema",
+        choices=["legacy_v1", "quality_temporal_v2"],
+        default="legacy_v1",
+        help="Optionally append track reliability and temporal-fragmentation features.",
+    )
     slot_train_parser.add_argument("--device", choices=["auto", "mps", "cpu", "cuda"], default="auto")
     slot_train_parser.add_argument("--seed", type=int, default=0)
 
@@ -909,6 +915,24 @@ def register(subparsers: Any) -> None:
     relation_train_parser.add_argument("--weight-decay", type=float, default=1e-4)
     relation_train_parser.add_argument("--edge-positive-weight", type=float, default=4.0)
     relation_train_parser.add_argument("--joint-type-loss-weight", type=float, default=1.0)
+    relation_train_parser.add_argument(
+        "--joint-type-head-type",
+        choices=["pair_context", "child_motion"],
+        default="pair_context",
+        help="Predict type from the legacy ordered pair token or child-only invariant motion evidence.",
+    )
+    relation_train_parser.add_argument(
+        "--edge-head-type",
+        choices=["pair_context", "motion_residual"],
+        default="pair_context",
+        help="Optionally add invariant parent-child motion evidence to the legacy edge score.",
+    )
+    relation_train_parser.add_argument(
+        "--structured-parent-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight for per-child softmax selection of a unique parent among active slots.",
+    )
     relation_train_parser.add_argument("--axis-loss-weight", type=float, default=2.0)
     relation_train_parser.add_argument("--axis-line-loss-weight", type=float, default=1.0)
     relation_train_parser.add_argument("--joint-replay-loss-weight", type=float, default=0.1)

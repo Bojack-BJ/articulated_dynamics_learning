@@ -673,6 +673,7 @@ def main(argv: list[str] | None = None) -> int:
                 data_loader_workers=max(0, int(args.data_loader_workers)),
                 topology_balanced_sampling=not bool(args.no_topology_balanced_sampling),
                 collapse_fixed_connected_labels=bool(args.collapse_fixed_connected_labels),
+                feature_schema=str(args.slot_feature_schema),
                 device=str(args.device),
                 seed=int(args.seed),
             )
@@ -719,6 +720,11 @@ def main(argv: list[str] | None = None) -> int:
                 weight_decay=max(0.0, float(args.weight_decay)),
                 edge_positive_weight=max(1.0, float(args.edge_positive_weight)),
                 joint_type_loss_weight=max(0.0, float(args.joint_type_loss_weight)),
+                joint_type_head_type=str(args.joint_type_head_type),
+                edge_head_type=str(args.edge_head_type),
+                structured_parent_loss_weight=max(
+                    0.0, float(args.structured_parent_loss_weight)
+                ),
                 axis_loss_weight=max(0.0, float(args.axis_loss_weight)),
                 axis_line_loss_weight=max(0.0, float(args.axis_line_loss_weight)),
                 joint_replay_loss_weight=max(0.0, float(args.joint_replay_loss_weight)),

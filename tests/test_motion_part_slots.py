@@ -13,6 +13,7 @@ from rgbd_urdf_mvp.perception.motion_part_slots import (
     _hungarian_slot_targets,
     _matched_slot_dice_loss,
     _part_balanced_cross_entropy,
+    _sample_from_artifact,
     _topology_balanced_object_order,
     _training_track_indices,
     _weighted_rigid_replay_loss,
@@ -147,9 +148,40 @@ class MotionPartSlotTests(unittest.TestCase):
         self.assertEqual(training.command, "train-motion-part-slots")
         self.assertEqual(training.object_batch_size, 4)
         self.assertTrue(training.collapse_fixed_connected_labels)
+        self.assertEqual(training.slot_feature_schema, "legacy_v1")
         self.assertEqual(inference.command, "infer-motion-part-slots")
         self.assertTrue(inference.post_ransac_refine)
         self.assertAlmostEqual(inference.slot_existence_threshold, 0.6)
+
+    def test_quality_temporal_schema_appends_reliability_features(self) -> None:
+        track = {
+            "track_id": 1,
+            "part_id": 3,
+            "reference_xyz_world": [0.0, 0.0, 0.0],
+            "track_quality_score": 0.8,
+            "samples": [
+                {"frame_index": 1, "xyz_world": [0.0, 0.0, 0.0], "visible": True,
+                 "timestep_quality_score": 0.9},
+                {"frame_index": 2, "xyz_world": [0.1, 0.0, 0.0], "visible": True,
+                 "timestep_quality_score": 0.7},
+                {"frame_index": 5, "xyz_world": [0.2, 0.0, 0.0], "visible": True,
+                 "timestep_quality_score": 0.5},
+            ],
+        }
+        artifact = {"tracks": [track]}
+        legacy = _sample_from_artifact(
+            artifact, {1: np.ones(4)}, object_id="quality", require_labels=True,
+        )
+        enriched = _sample_from_artifact(
+            artifact, {1: np.ones(4)}, object_id="quality", require_labels=True,
+            feature_schema="quality_temporal_v2",
+        )
+        self.assertEqual(enriched["features"].shape[1], legacy["features"].shape[1] + 8)
+        self.assertEqual(enriched["feature_schema"], "quality_temporal_v2")
+        self.assertTrue(np.all(np.isfinite(enriched["features"])))
+        quality_features = enriched["features"][0, -8:]
+        self.assertGreater(float(quality_features[0]), 0.0)
+        self.assertGreater(float(quality_features[4]), 0.0)
 
     def test_slot_model_supports_padded_object_batches(self) -> None:
         import torch
