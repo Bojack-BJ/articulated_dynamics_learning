@@ -14,6 +14,8 @@ class GroupMotionProposal:
     translation: list[float]
     rotation_vector: list[float]
     axis: list[float] | None
+    translation_axis: list[float] | None
+    translation_magnitude: float
     line_point: list[float] | None
     rigid_residual: float
     effective_tracks: float
@@ -76,11 +78,19 @@ def build_group_motion_proposals(
             rotvec = _rotation_vector(rotation)
             angle = float(np.linalg.norm(rotvec))
             axis = rotvec / angle if angle > np.deg2rad(0.5) else None
+            translation_magnitude = float(np.linalg.norm(translation))
+            translation_axis = (
+                translation / translation_magnitude
+                if translation_magnitude > 1e-4
+                else None
+            )
             line_point = _axis_line_point(rotation, translation, axis) if axis is not None else None
             effective = float(weights.sum() ** 2 / max(float(np.sum(weights * weights)), 1e-12))
             proposals.append(GroupMotionProposal(
                 start, end, rotation.tolist(), translation.tolist(), rotvec.tolist(),
                 axis.tolist() if axis is not None else None,
+                translation_axis.tolist() if translation_axis is not None else None,
+                translation_magnitude,
                 line_point.tolist() if line_point is not None else None,
                 float(np.average(residual, weights=np.maximum(weights, 1e-12))),
                 effective, float(np.average(quality[selected, start] * quality[selected, end], weights=membership[selected])),
@@ -90,15 +100,26 @@ def build_group_motion_proposals(
 
 
 def consensus_group_axis(
-    proposals: list[GroupMotionProposal], *, learned_logits: np.ndarray | None = None
+    proposals: list[GroupMotionProposal], joint_type: str = "revolute", *,
+    learned_logits: np.ndarray | None = None,
+    residual_floor: float = 0.01,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Fuse proposal axes; learned logits may calibrate but cannot create a world vector."""
-    valid = [proposal for proposal in proposals if proposal.valid and proposal.axis is not None]
+    if joint_type == "revolute":
+        axis_field = "axis"
+    elif joint_type == "prismatic":
+        axis_field = "translation_axis"
+    else:
+        raise ValueError(f"unsupported joint type: {joint_type}")
+    valid = [
+        proposal for proposal in proposals
+        if proposal.valid and getattr(proposal, axis_field) is not None
+    ]
     if not valid:
         return None, None
     base = np.asarray([
         proposal.effective_tracks * proposal.mean_quality
-        / max(proposal.rigid_residual, 1e-4) for proposal in valid
+        / max(proposal.rigid_residual, residual_floor) for proposal in valid
     ])
     if learned_logits is not None:
         logits = np.asarray(learned_logits, float)
@@ -106,9 +127,11 @@ def consensus_group_axis(
             raise ValueError("learned_logits must match the valid proposal count")
         base *= np.exp(logits - np.max(logits))
     base /= max(float(base.sum()), 1e-12)
-    axes = np.asarray([proposal.axis for proposal in valid])
+    axes = np.asarray([getattr(proposal, axis_field) for proposal in valid])
     moment = np.einsum("n,ni,nj->ij", base, axes, axes)
     axis = np.linalg.eigh(moment)[1][:, -1]
+    if joint_type == "prismatic":
+        return axis, None
     systems, targets = [], []
     for weight, proposal in zip(base, valid):
         rotation = np.asarray(proposal.rotation)

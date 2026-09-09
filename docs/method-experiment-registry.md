@@ -50,8 +50,9 @@
 | VN + Pivot-B | Equivariant vector-neuron relation geometry and revolute pivot refinement | type, axis and line | Aligned 32-joint oracle geometry mean `16.13 deg`, line `0.0418`; did not beat child analytic / 消融 |
 | Child-only analytic / 仅 child 解析拟合 | GT or predicted child tracks, visibility and quality; no parent centroid | prismatic/revolute axis and revolute line | Aligned 32 joints: coverage `30/32`, axis mean `10.70 deg`, line `0.0185`; strong baseline / 强基线 |
 | Child-only equivariant feedforward pilot / 仅 child 等变前馈 pilot | Child track vectors and invariant scalar features | type, candidate weights, axis and line | Type `93.75%`, axis mean `41.04 deg`; simple construction fails especially revolute / 暂不采用 |
-| Multi-scale group Kabsch proposals / 多尺度小组 Kabsch proposals | Same-track correspondences over several frame strides, quality/membership weights | local `R,t`, rotation-axis and line proposals | Implemented with IRLS/Huber; 85 related tests pass; aligned benchmark pending / 待对齐评估 |
-| Track-motion line/circle voting / 单轨迹直线/圆投票 | Independently segmented child trajectories; slot only supplies membership | prismatic PCA votes, revolute circle-normal/center votes, confidence | Implemented without part-pose recovery; 85 related tests pass; aligned benchmark pending / 待对齐评估 |
+| Multi-scale group Kabsch proposals / 多尺度小组 Kabsch proposals | Same-track correspondences over several frame strides, quality/membership weights | local `R,t`, rotation-axis and line proposals | Aligned GT-child 32-joint pilot: coverage `81.2%`, axis mean `28.00 deg`, line `0.0152`; strong high-support revolute proposals but weak low-support/prismatic cases / 诊断候选 |
+| Track-motion line/circle voting / 单轨迹直线/圆投票 | Independently segmented child trajectories; slot only supplies membership | prismatic PCA votes, revolute circle-normal/center votes, confidence | Aligned GT-child pilot: coverage `87.5%`, axis mean `24.04 deg`; prismatic coverage `100%`, mean `14.47 deg`, but revolute mean `33.61 deg` / 诊断候选 |
+| Type-routed proposal fusion / 按类型路由的候选融合 | Track voting for prismatic; group Kabsch for revolute | axis and revolute line | GT-child: coverage `90.6%`, mean `18.83 deg`, penalized mean `25.50 deg`, line `0.0152`; predicted child slot: coverage `87.5%`, mean `17.28 deg`, penalized mean `26.37 deg` / 尚未超过 child-only analytic |
 
 The last two routes deliberately separate assignment from motion inference. Group Kabsch uses local rigid consistency as an auxiliary proposal generator. Track voting treats every continuous trajectory segment as an independent motion hypothesis and uses rigidity only as optional supervision or proposal-consistency evidence.
 
@@ -93,8 +94,8 @@ External results are object-aligned and metric-aligned but protocol-specific. Ca
 
 ## 7. Immediate Aligned Tests / 下一步统一测试
 
-1. Evaluate multi-scale group Kabsch and track-motion voting on the same 32-joint oracle set used for child-only analytic, VN + Pivot-B, and direct feedforward comparisons.
-2. Repeat with predicted child slots to measure assignment sensitivity separately from geometry sensitivity.
-3. Report coverage, type accuracy, axis mean/median/P90, revolute line distance, and failure-penalized metrics.
+1. The aligned 32-joint GT-child and predicted-child-slot proposal tests are complete. Neither raw proposal method nor the type-routed hybrid replaces child-only analytic (`30/32` coverage, `10.70 deg` mean, `0.0185` line).
+2. If proposal learning continues, train only invariant confidence/calibration over existing world-vector candidates. Preserve the type routing and use child-only analytic as an explicit missing-proposal fallback.
+3. Evaluate any learned calibration on a separate held-out split; do not select thresholds and report the same 32-joint pilot as a final test result.
 4. Run coordinate SO(3) equivariance first; only then run fixed-camera object rotation for the surviving learned method.
 5. On real data, report per-dataset and per-sequence results before any aggregate, with mask, depth, camera-pose and track-quality gates recorded.

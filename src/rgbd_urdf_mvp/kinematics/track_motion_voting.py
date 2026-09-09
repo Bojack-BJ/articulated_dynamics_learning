@@ -90,7 +90,10 @@ def consensus_track_axes(
         centers = None
         coverage = np.ones(len(proposals))
     elif joint_type == "revolute":
-        selected = [row for row in proposals if row.circle_center is not None]
+        selected = [
+            row for row in proposals
+            if row.circle_center is not None and row.angular_coverage_rad > 1e-4
+        ]
         if not selected:
             return None, None
         proposals = selected
@@ -107,7 +110,10 @@ def consensus_track_axes(
         if logits.shape != weights.shape:
             raise ValueError("learned_logits must match proposal count")
         weights *= np.exp(logits - np.max(logits))
-    weights /= max(float(weights.sum()), 1e-12)
+    weight_sum = float(weights.sum())
+    if not np.isfinite(weight_sum) or weight_sum <= 1e-12:
+        return None, None
+    weights /= weight_sum
     moment = np.einsum("n,ni,nj->ij", weights, axes, axes)
     axis = np.linalg.eigh(moment)[1][:, -1]
     if centers is None:

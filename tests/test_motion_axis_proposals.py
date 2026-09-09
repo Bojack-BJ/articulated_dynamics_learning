@@ -32,7 +32,7 @@ def _revolute_tracks():
 def test_group_proposals_recover_revolute_axis():
     points, axis = _revolute_tracks()
     proposals = build_group_motion_proposals(points, np.ones(points.shape[:2], bool), strides=(2, 4))
-    predicted, _ = consensus_group_axis(proposals)
+    predicted, _ = consensus_group_axis(proposals, "revolute")
     assert _error(predicted, axis) < 0.1
 
 
@@ -51,6 +51,35 @@ def test_track_voting_recovers_prismatic_axis():
     proposals = build_track_motion_proposals(points, np.ones(points.shape[:2], bool))
     predicted, _ = consensus_track_axes(proposals, "prismatic")
     assert _error(predicted, axis) < 0.1
+
+
+def test_group_proposals_recover_prismatic_axis():
+    rng = np.random.default_rng(11)
+    reference = rng.normal(size=(24, 3))
+    axis = np.asarray([0.4, 0.8, -0.2]); axis /= np.linalg.norm(axis)
+    points = np.stack([reference + value * axis for value in np.linspace(0, 0.5, 12)], axis=1)
+    proposals = build_group_motion_proposals(
+        points, np.ones(points.shape[:2], bool), strides=(1, 2, 4)
+    )
+    predicted, _ = consensus_group_axis(proposals, "prismatic")
+    assert _error(predicted, axis) < 0.1
+
+
+def test_group_consensus_does_not_let_exact_low_support_fit_dominate():
+    from rgbd_urdf_mvp.kinematics.group_motion_axis import GroupMotionProposal
+
+    def proposal(axis, tracks, residual):
+        return GroupMotionProposal(
+            0, 1, np.eye(3).tolist(), [0.0, 0.0, 0.0], axis, axis, axis,
+            0.1, [0.0, 0.0, 0.0], residual, tracks, 1.0, 1.0, True,
+        )
+
+    proposals = [
+        proposal([1.0, 0.0, 0.0], 20.0, 0.01),
+        proposal([0.0, 1.0, 0.0], 3.0, 1e-12),
+    ]
+    predicted, _ = consensus_group_axis(proposals, "revolute")
+    assert _error(predicted, np.asarray([1.0, 0.0, 0.0])) < 1.0
 
 
 def test_track_voting_splits_visibility_gaps():
@@ -74,3 +103,11 @@ def test_motion_proposals_reject_mismatched_visibility():
             assert "visibility" in str(error)
         else:
             raise AssertionError("mismatched visibility should fail")
+
+
+def test_track_voting_rejects_zero_motion_revolute_proposals():
+    points = np.zeros((1, 6, 3), dtype=float)
+    proposals = build_track_motion_proposals(points, np.ones((1, 6), dtype=bool))
+    axis, point = consensus_track_axes(proposals, "revolute")
+    assert axis is None
+    assert point is None
