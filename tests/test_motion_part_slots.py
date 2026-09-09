@@ -9,6 +9,7 @@ from rgbd_urdf_mvp.cli import build_parser
 from rgbd_urdf_mvp.perception.motion_part_slots import (
     MotionPartSlotInferenceConfig,
     _build_slot_model,
+    _augment_geometry_features,
     _filter_inference_tracks,
     _hungarian_slot_targets,
     _matched_slot_dice_loss,
@@ -182,6 +183,18 @@ class MotionPartSlotTests(unittest.TestCase):
         quality_features = enriched["features"][0, -8:]
         self.assertGreater(float(quality_features[0]), 0.0)
         self.assertGreater(float(quality_features[4]), 0.0)
+
+    def test_geometry_augmentation_preserves_quality_temporal_tail(self) -> None:
+        features = np.arange(2 * 44, dtype=np.float32).reshape(2, 44)
+        expected_tail = features[:, -8:].copy()
+        augmented = _augment_geometry_features(
+            features.copy(), 4, random.Random(7), np,
+            noise_std=0.01,
+            depth_bias_probability=1.0,
+            sampled_depth_spike_probability=1.0,
+            feature_schema="quality_temporal_v2",
+        )
+        np.testing.assert_array_equal(augmented[:, -8:], expected_tail)
 
     def test_slot_model_supports_padded_object_batches(self) -> None:
         import torch

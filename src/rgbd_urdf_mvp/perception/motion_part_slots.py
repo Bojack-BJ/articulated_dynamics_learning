@@ -165,6 +165,7 @@ class MotionPartSlotTrainer:
                     if self.config.geometry_augmentation:
                         values = _augment_geometry_features(
                             values, sample["embedding_dim"], rng, np,
+                            feature_schema=str(sample.get("feature_schema", "legacy_v1")),
                             noise_std=float(self.config.geometry_noise_std),
                             depth_bias_probability=float(self.config.depth_bias_probability),
                             depth_bias_std=float(self.config.depth_bias_std),
@@ -857,16 +858,32 @@ def _augment_geometry_features(
     features: Any, embedding_dim: int, rng: random.Random, np: Any, *,
     noise_std: float = 0.003, depth_bias_probability: float = 0.0,
     depth_bias_std: float = 0.01, sampled_depth_spike_probability: float = 0.0,
+    feature_schema: str = "legacy_v1",
 ) -> Any:
     """Apply a shared random rigid transform to canonical geometric token channels."""
     angle = rng.uniform(-math.pi, math.pi)
     cosine, sine = math.cos(angle), math.sin(angle)
     rotation = np.asarray([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
     geometry = features[:, embedding_dim:]
+    geometry_motion_end = 32
+    if geometry.shape[1] < geometry_motion_end:
+        raise ValueError(
+            f"Slot geometry block has {geometry.shape[1]} channels; expected at least 32."
+        )
+    if feature_schema == "legacy_v1" and geometry.shape[1] != geometry_motion_end:
+        raise ValueError(
+            f"legacy_v1 slot geometry has unexpected width {geometry.shape[1]}."
+        )
+    if feature_schema == "quality_temporal_v2" and geometry.shape[1] != 40:
+        raise ValueError(
+            f"quality_temporal_v2 slot geometry has unexpected width {geometry.shape[1]}."
+        )
     geometry[:, 0:3] = geometry[:, 0:3] @ rotation.T
     geometry[:, 3:6] = geometry[:, 3:6] @ rotation.T
-    sampled = geometry[:, 8:].reshape(len(features), -1, 3)
-    geometry[:, 8:] = (sampled @ rotation.T).reshape(len(features), -1)
+    sampled = geometry[:, 8:geometry_motion_end].reshape(len(features), -1, 3)
+    geometry[:, 8:geometry_motion_end] = (
+        sampled @ rotation.T
+    ).reshape(len(features), -1)
     generator = np.random.default_rng(rng.randrange(2**32))
     if noise_std > 0.0 and rng.random() < 0.5:
         geometry[:, 0:6] += generator.normal(0.0, noise_std, geometry[:, 0:6].shape)
@@ -878,11 +895,15 @@ def _augment_geometry_features(
         bias = float(generator.normal(0.0, depth_bias_std))
         geometry[selected, 2] += bias
         geometry[selected, 5] += bias
-        selected_samples = geometry[selected, 8:].reshape(len(selected), -1, 3).copy()
+        selected_samples = geometry[
+            selected, 8:geometry_motion_end
+        ].reshape(len(selected), -1, 3).copy()
         selected_samples[:, :, 2] += bias
-        geometry[selected, 8:] = selected_samples.reshape(len(selected), -1)
+        geometry[selected, 8:geometry_motion_end] = selected_samples.reshape(
+            len(selected), -1
+        )
     if sampled_depth_spike_probability > 0.0:
-        sampled = geometry[:, 8:].reshape(len(features), -1, 3)
+        sampled = geometry[:, 8:geometry_motion_end].reshape(len(features), -1, 3)
         mask = generator.random(sampled.shape[:2]) < sampled_depth_spike_probability
         sampled[:, :, 2] += mask * generator.normal(0.0, 3.0 * max(depth_bias_std, noise_std), mask.shape)
     return features
