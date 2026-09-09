@@ -139,7 +139,13 @@ class ObjectMaskFlowHtmlBuilder:
             "mjcf_replay": mjcf_replay,
             "bounds": object_bounds,
             "scene_bounds": _combined_bounds(object_bounds, background_frames),
-            "joints": _joint_payload(config.joint_inference, config.evaluation_json, transform=transform),
+            "joints": _joint_payload(
+                config.joint_inference,
+                config.evaluation_json,
+                raw_tracks=raw_tracks,
+                motion_segmentation=artifact.get("motion_segmentation", {}),
+                transform=transform,
+            ),
             "gt_joints": _ground_truth_joint_payload(config.gt_joint_annotation, transform=transform),
             "metadata": {
                 "track_count_input": len(raw_tracks),
@@ -353,6 +359,8 @@ def _joint_payload(
     joint_inference_path: str | Path | None,
     evaluation_path: str | Path | None,
     *,
+    raw_tracks: list[dict[str, Any]] | None = None,
+    motion_segmentation: dict[str, Any] | None = None,
     transform: _AxisRemap,
 ) -> list[dict[str, Any]]:
     if joint_inference_path is None:
@@ -374,6 +382,7 @@ def _joint_payload(
                 except (TypeError, ValueError):
                     continue
 
+    raw_slot_to_part_id = _raw_slot_to_part_id(raw_tracks or [], motion_segmentation or {})
     out = []
     artifact = load_json(joint_path)
     joints = artifact.get("joints", [])
@@ -393,14 +402,19 @@ def _joint_payload(
     for joint in joints:
         if not isinstance(joint, dict):
             continue
-        child_id = int(joint.get("child_part_id", -1))
+        raw_child_id = int(joint.get("child_part_id", -1))
+        raw_parent_id = int(joint.get("parent_part_id", -1))
+        child_id = raw_slot_to_part_id.get(raw_child_id, raw_child_id)
+        parent_id = raw_slot_to_part_id.get(raw_parent_id, raw_parent_id)
         row = eval_by_child.get(child_id, {})
         out.append(
             {
-                "name": str(joint.get("name", f"joint_{child_id}")),
+                "name": f"motion_part_{child_id}_joint",
                 "joint_type": str(joint.get("joint_type", "unknown")),
-                "parent_part_id": int(joint.get("parent_part_id", -1)),
+                "parent_part_id": parent_id,
                 "child_part_id": child_id,
+                "raw_parent_slot_id": raw_parent_id,
+                "raw_child_slot_id": raw_child_id,
                 "pivot": transform.point(_vec3(joint.get("pivot"), [0.0, 0.0, 0.0])),
                 "axis": transform.vector(_vec3(joint.get("axis"), [0.0, 0.0, 1.0])),
                 "axis_error_deg": row.get("axis_angle_error_deg"),
@@ -408,6 +422,26 @@ def _joint_payload(
             }
         )
     return out
+
+
+def _raw_slot_to_part_id(
+    tracks: list[dict[str, Any]], motion_segmentation: dict[str, Any]
+) -> dict[int, int]:
+    explicit = motion_segmentation.get("raw_slot_to_part_id", {})
+    if isinstance(explicit, dict) and explicit:
+        return {int(raw): int(part) for raw, part in explicit.items()}
+    candidates: dict[int, set[int]] = {}
+    for track in tracks:
+        raw_slot = track.get("slot_initial_id")
+        part_id = track.get("part_id")
+        if raw_slot is None or part_id is None:
+            continue
+        candidates.setdefault(int(raw_slot), set()).add(int(part_id))
+    return {
+        raw_slot: next(iter(part_ids))
+        for raw_slot, part_ids in candidates.items()
+        if len(part_ids) == 1
+    }
 
 
 def _ground_truth_joint_payload(

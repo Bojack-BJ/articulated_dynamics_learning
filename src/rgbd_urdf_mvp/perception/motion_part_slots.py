@@ -375,6 +375,10 @@ class MotionPartSlotInferencer:
         if self.config.post_ransac_refine:
             refined, refinement = _post_ransac_refine(sample["tracks"], initial, self.config)
         slot_ids = _compact_ids(refined)
+        raw_slot_to_part_id = {
+            int(raw_slot): int(part_id)
+            for raw_slot, part_id in zip(refined, slot_ids)
+        }
         relabeled_tracks = []
         for index, track in enumerate(sample["tracks"]):
             row = dict(track)
@@ -395,6 +399,10 @@ class MotionPartSlotInferencer:
                     "part_count": len(set(slot_ids)),
                     "slot_existence_probabilities": [float(value) for value in existence_probabilities],
                     "active_slots": active_slots,
+                    "raw_slot_to_part_id": {
+                        str(raw_slot): part_id
+                        for raw_slot, part_id in sorted(raw_slot_to_part_id.items())
+                    },
                     "slot_existence_threshold": self.config.slot_existence_threshold,
                     "post_ransac_refine": self.config.post_ransac_refine,
                     "refinement": refinement,

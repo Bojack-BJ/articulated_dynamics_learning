@@ -898,10 +898,58 @@ class MotionSegmentationTests(unittest.TestCase):
                 )
             )
             html = html_path.read_text(encoding="utf-8")
-            self.assertIn('"name":"motion_slot_2_joint"', html)
+            self.assertIn('"name":"motion_part_2_joint"', html)
             self.assertIn('"parent_part_id":1', html)
             self.assertIn('"child_part_id":2', html)
             self.assertIn('"pivot":[0.1,0.2,0.3]', html)
+
+    def test_object_mask_flow_html_aligns_raw_relation_slots_to_compact_parts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tracks_path = root / "motion_part_tracks.json"
+            tracks_path.write_text(
+                json.dumps(
+                    {
+                        "motion_segmentation": {
+                            "raw_slot_to_part_id": {"12": 1, "7": 2},
+                        },
+                        "tracks": [
+                            {**_track(1, [0.0, 0.0, 0.0], [[0.0, 0.0, 0.0]]), "part_id": 1},
+                            {**_track(2, [0.1, 0.0, 0.0], [[0.1, 0.0, 0.0]]), "part_id": 2},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            joints_path = root / "relation.json"
+            joints_path.write_text(
+                json.dumps(
+                    {
+                        "selected_edges": [
+                            {
+                                "parent_slot_id": 12,
+                                "child_slot_id": 7,
+                                "joint_type": "revolute",
+                                "axis_world": [0.0, 0.0, 1.0],
+                                "axis_line_point_world": [0.0, 0.0, 0.0],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            html = ObjectMaskFlowHtmlBuilder().build(
+                ObjectMaskFlowHtmlConfig(
+                    motion_tracks=tracks_path,
+                    joint_inference=joints_path,
+                    output_html=root / "flow.html",
+                )
+            ).read_text(encoding="utf-8")
+            self.assertIn('"name":"motion_part_2_joint"', html)
+            self.assertIn('"parent_part_id":1', html)
+            self.assertIn('"child_part_id":2', html)
+            self.assertIn('"raw_parent_slot_id":12', html)
+            self.assertIn('"raw_child_slot_id":7', html)
 
     def test_object_mask_flow_html_embeds_source_aligned_background_geometry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
