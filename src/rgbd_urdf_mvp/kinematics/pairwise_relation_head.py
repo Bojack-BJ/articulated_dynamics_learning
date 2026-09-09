@@ -374,6 +374,7 @@ class SlotRelationTrainer:
                 epoch_rows.append({key: float(value.detach().cpu()) for key, value in losses.items()})
             validation = _evaluate_relation_samples(
                 val_samples, slot_model, relation_model, mean, std, torch, device,
+                slot_source=str(self.config.relation_slot_source),
             )
             validation_objective = _evaluate_training_objective(
                 val_samples, slot_model, relation_model, mean, std, torch, device,
@@ -566,6 +567,7 @@ class SlotRelationTrainer:
             slot_model.load_state_dict(best_checkpoint["slot_state_dict"])
         test_metrics = _evaluate_relation_samples(
             test_samples, slot_model, relation_model, mean, std, torch, device,
+            slot_source=str(self.config.relation_slot_source),
         ) if test_samples else None
         save_json(
             {
@@ -2881,6 +2883,7 @@ def _joint_model_replay_loss(
 def _evaluate_relation_samples(
     samples: list[dict[str, Any]], slot_model: Any, relation_model: Any,
     mean: Any, std: Any, torch: Any, device: str,
+    slot_source: str = "predicted",
 ) -> dict[str, float]:
     if not samples:
         return {
@@ -2927,7 +2930,9 @@ def _evaluate_relation_samples(
             logits, existence_logits, slots = slot_model(
                 (slot_features - mean) / std, return_slots=True
             )
-            probabilities = torch.softmax(logits, dim=-1)
+            probabilities = _relation_slot_probabilities(
+                logits, sample, torch, slot_source,
+            )
             labels = sample.get("labels")
             if labels is not None:
                 ari, ri = _clustering_pair_metrics(
