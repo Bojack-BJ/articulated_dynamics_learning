@@ -164,8 +164,9 @@ class KinematicModelEvaluator:
             for item in matched
             if "joint_type_correct" in item
         ]
-        axis_errors = _finite_values(item.get("axis_angle_error_deg") for item in matched)
-        pivot_errors = _finite_values(item.get("pivot_error_m") for item in matched)
+        geometry_rows = [item for item in matched if bool(item.get("joint_type_correct", False))]
+        axis_errors = _finite_values(item.get("axis_angle_error_deg") for item in geometry_rows)
+        pivot_errors = _finite_values(item.get("pivot_error_m") for item in geometry_rows)
         limit_abs_errors = []
         q_rmse = []
         q_rmse_aligned = []
@@ -188,8 +189,11 @@ class KinematicModelEvaluator:
                 else None
             ),
             "axis_angle_error_deg_mean": _mean_or_none(axis_errors),
+            "axis_angle_error_deg_median": _median_or_none(axis_errors),
             "axis_angle_error_deg_max": max(axis_errors) if axis_errors else None,
+            "axis_evaluable_joint_count": len(axis_errors),
             "pivot_error_m_mean": _mean_or_none(pivot_errors),
+            "pivot_error_m_median": _median_or_none(pivot_errors),
             "pivot_error_m_max": max(pivot_errors) if pivot_errors else None,
             "limit_abs_error_mean": _mean_or_none(limit_abs_errors),
             "q_rmse_mean": _mean_or_none(q_rmse),
@@ -789,8 +793,13 @@ def _object_mask_summary(
         for item in directed_matches
         if "joint_type_correct" in item
     ]
-    directed_axis_errors = _finite_values(item.get("axis_angle_error_deg") for item in directed_matches)
-    directed_pivot_errors = _finite_values(item.get("pivot_error_m") for item in directed_matches)
+    geometry_matches = [
+        item for item in directed_matches if bool(item.get("joint_type_correct", False))
+    ]
+    directed_axis_errors = _finite_values(
+        item.get("axis_angle_error_deg") for item in geometry_matches
+    )
+    directed_pivot_errors = _finite_values(item.get("pivot_error_m") for item in geometry_matches)
     return {
         "predicted_joint_count": len(predicted_joints),
         "ground_truth_joint_count": len(gt_priors),
@@ -806,9 +815,13 @@ def _object_mask_summary(
             else None
         ),
         "axis_angle_error_deg_mean": _mean_or_none(directed_axis_errors),
+        "axis_angle_error_deg_median": _median_or_none(directed_axis_errors),
         "axis_angle_error_deg_max": max(directed_axis_errors) if directed_axis_errors else None,
+        "axis_evaluable_joint_count": len(directed_axis_errors),
         "pivot_error_m_mean": _mean_or_none(directed_pivot_errors),
+        "pivot_error_m_median": _median_or_none(directed_pivot_errors),
         "pivot_error_m_max": max(directed_pivot_errors) if directed_pivot_errors else None,
+        "by_ground_truth_joint_type": _summary_by_joint_type(directed_matches),
         "mean_cluster_purity": overlap.get("mean_purity"),
         "mean_gt_coverage": overlap.get("mean_gt_coverage"),
         "largest_cluster_ratio": overlap.get("largest_cluster_ratio"),
@@ -1044,8 +1057,9 @@ def _summary_by_joint_type(matched: list[dict[str, Any]]) -> dict[str, dict[str,
             for item in rows
             if "joint_type_correct" in item
         ]
-        axis_errors = _finite_values(item.get("axis_angle_error_deg") for item in rows)
-        pivot_errors = _finite_values(item.get("pivot_error_m") for item in rows)
+        geometry_rows = [item for item in rows if bool(item.get("joint_type_correct", False))]
+        axis_errors = _finite_values(item.get("axis_angle_error_deg") for item in geometry_rows)
+        pivot_errors = _finite_values(item.get("pivot_error_m") for item in geometry_rows)
         q_rmse_aligned = []
         for item in rows:
             q_error = item.get("q_error")
@@ -1059,8 +1073,11 @@ def _summary_by_joint_type(matched: list[dict[str, Any]]) -> dict[str, dict[str,
                 else None
             ),
             "axis_angle_error_deg_mean": _mean_or_none(axis_errors),
+            "axis_angle_error_deg_median": _median_or_none(axis_errors),
             "axis_angle_error_deg_max": max(axis_errors) if axis_errors else None,
+            "axis_evaluable_joint_count": len(axis_errors),
             "pivot_error_m_mean": _mean_or_none(pivot_errors),
+            "pivot_error_m_median": _median_or_none(pivot_errors),
             "pivot_error_m_max": max(pivot_errors) if pivot_errors else None,
             "q_rmse_offset_aligned_mean": _mean_or_none(q_rmse_aligned),
         }
@@ -1069,6 +1086,10 @@ def _summary_by_joint_type(matched: list[dict[str, Any]]) -> dict[str, dict[str,
 
 def _mean_or_none(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
+
+
+def _median_or_none(values: list[float]) -> float | None:
+    return _median(values) if values else None
 
 
 def _rmse(errors: list[float]) -> float:

@@ -1,0 +1,3 @@
+object_id	recording_id	category	paper_object_label	interaction_frames	fps	source_frame_index	recording_protocol	aim_static_scan_views	aim_end_scan_views	protocol_note
+partnet_47024	partnet_47024_start100	door	Storage-47024	200	15	199	aim_style_fixed_end	100	12	Paper-count start scan with unchanged 200-frame interaction and fixed end scan
+partnet_47648	partnet_47648_start100	door	Storage-47648	500	15	499	aim_style_fixed_end	100	12	Paper-count start scan with unchanged 500-frame interaction and fixed end scan

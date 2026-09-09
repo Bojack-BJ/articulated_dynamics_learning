@@ -260,6 +260,8 @@ def register(subparsers: Any) -> None:
         help="Save accelerator memory by keeping SAM2 state on CPU; slower but useful for long videos",
     )
     propagate_masks_parser.add_argument("--reference-frame", type=int, default=0)
+    propagate_masks_parser.add_argument("--start-frame", type=int, default=0)
+    propagate_masks_parser.add_argument("--end-frame", type=int, default=None)
     propagate_masks_parser.add_argument("--frame-stride", type=int, default=1)
     propagate_masks_parser.add_argument("--view-indices", type=int, nargs="+", default=None)
     propagate_masks_parser.add_argument("--device", choices=["auto", "mps", "cpu", "cuda"], default="auto")
@@ -417,6 +419,12 @@ def register(subparsers: Any) -> None:
     object_mask_flow_html_parser.add_argument("motion_tracks", type=Path, help="Path to motion_part_tracks.json")
     object_mask_flow_html_parser.add_argument("--output-html", type=Path, default=None, help="Output HTML path")
     object_mask_flow_html_parser.add_argument("--joint-inference", type=Path, default=None, help="Optional joint_inference.json")
+    object_mask_flow_html_parser.add_argument(
+        "--gt-joint-annotation",
+        type=Path,
+        default=None,
+        help="Optional relation_gt.json rendered as a separately toggleable GT axis layer",
+    )
     object_mask_flow_html_parser.add_argument("--evaluation-json", type=Path, default=None, help="Optional object_mask_kinematic_evaluation.json")
     object_mask_flow_html_parser.add_argument(
         "--background-fusion-manifest",
@@ -425,10 +433,32 @@ def register(subparsers: Any) -> None:
         help="Optional fusion_manifest.json whose per-frame RGB-D geometry is shown behind the tracks",
     )
     object_mask_flow_html_parser.add_argument(
+        "--background-episode",
+        type=Path,
+        default=None,
+        help="Optional episode.json used to embed full-scene RGB-D geometry behind the predicted object",
+    )
+    object_mask_flow_html_parser.add_argument(
+        "--background-exclude-object-mask",
+        action="store_true",
+        help="Exclude object-mask pixels from --background-episode so predicted tracks replace the observed object",
+    )
+    object_mask_flow_html_parser.add_argument(
         "--background-max-points",
         type=int,
         default=3000,
         help="Maximum background RGB-D points embedded per displayed frame",
+    )
+    object_mask_flow_html_parser.add_argument(
+        "--background-persistent",
+        action="store_true",
+        help="Accumulate background RGB-D observations in the shared world frame",
+    )
+    object_mask_flow_html_parser.add_argument(
+        "--background-voxel-size-m",
+        type=float,
+        default=0.02,
+        help="Voxel size used by persistent background fusion",
     )
     object_mask_flow_html_parser.add_argument(
         "--mjcf-replay-episode",
@@ -444,6 +474,10 @@ def register(subparsers: Any) -> None:
     )
     object_mask_flow_html_parser.add_argument("--max-tracks", type=int, default=1000, help="Maximum tracks embedded in the HTML")
     object_mask_flow_html_parser.add_argument("--frame-stride", type=int, default=2, help="Embed every Nth frame in the time slider")
+    object_mask_flow_html_parser.add_argument(
+        "--full-timeline", action="store_true",
+        help="Include the complete episode timeline, including frames with no visible predicted tracks.",
+    )
     object_mask_flow_html_parser.add_argument("--trail-length", type=int, default=10, help="Default temporal trail length in frames")
     object_mask_flow_html_parser.add_argument(
         "--axis-remap",
@@ -458,6 +492,7 @@ def register(subparsers: Any) -> None:
             "motion_magnitude",
             "track_quality",
             "timestep_quality",
+            "timestep",
             "step_length",
             "acceleration",
             "smooth_residual",
@@ -482,6 +517,55 @@ def register(subparsers: Any) -> None:
     track_quality_parser.add_argument("--output-dir", type=Path, required=True, help="Output directory for quality artifacts")
     track_quality_parser.add_argument("--bad-track-threshold", type=float, default=0.35)
     track_quality_parser.add_argument("--bad-timestep-threshold", type=float, default=0.35)
+    track_quality_parser.add_argument(
+        "--mask-bad-timesteps",
+        action="store_true",
+        help="Mark rejected samples invisible in the enriched track artifact used downstream",
+    )
+    track_quality_parser.add_argument(
+        "--max-step-m",
+        type=float,
+        default=None,
+        help="Optional hard upper bound for one lifted 3D step, used to reject depth surface jumps",
+    )
+    track_quality_parser.add_argument(
+        "--keep-query-connected-segment",
+        action="store_true",
+        help=(
+            "Keep only the contiguous valid segment containing each track's query/seed frame. "
+            "This prevents a track that jumps to another depth surface from re-entering downstream fitting."
+        ),
+    )
+    track_quality_parser.add_argument(
+        "--min-query-connected-frames",
+        type=int,
+        default=2,
+        help="Reject the whole track when its query-connected valid segment is shorter than this many frames.",
+    )
+    track_quality_parser.add_argument(
+        "--query-connected-max-gap-frames",
+        type=int,
+        default=0,
+        help=(
+            "Allow the query-connected run to span this many consecutive missing frames. "
+            "Missing samples remain invisible; only later observations of the same track are retained."
+        ),
+    )
+    track_quality_parser.add_argument(
+        "--spatial-dbscan-eps-m",
+        type=float,
+        default=None,
+        help=(
+            "Optional per-frame, per-part DBSCAN radius. Isolated samples are marked as "
+            "spatial outliers; use --mask-bad-timesteps to hide them downstream."
+        ),
+    )
+    track_quality_parser.add_argument(
+        "--spatial-dbscan-min-samples",
+        type=int,
+        default=5,
+        help="Minimum local sample count (including the point itself) for spatial DBSCAN.",
+    )
 
     # Part-level perception and kinematics from pointclouds.
     part_tracker_parser = subparsers.add_parser(
@@ -543,15 +627,46 @@ def register(subparsers: Any) -> None:
         help="Maximum seed tracks per part per view",
     )
     part_tracker_parser.add_argument(
+        "--max-queries-per-forward",
+        type=int,
+        default=512,
+        help="Batch seed queries from all parts in one view, splitting only above this limit",
+    )
+    part_tracker_parser.add_argument(
         "--visibility-threshold",
         type=float,
         default=0.5,
         help="Minimum CoTracker visibility score required for a valid 3D sample",
     )
     part_tracker_parser.add_argument(
+        "--depth-consistency-window-radius-px",
+        type=int,
+        default=0,
+        help="Use a mask-constrained local depth window of this radius; 0 preserves nearest-pixel behavior.",
+    )
+    part_tracker_parser.add_argument(
+        "--depth-consistency-max-delta-m",
+        type=float,
+        default=0.08,
+        help="Maximum depth change from the previous valid timestep when depth consistency is enabled.",
+    )
+    part_tracker_parser.add_argument(
+        "--repair-temporal-depth-spikes",
+        action="store_true",
+        help="Repair only short A-B-A depth toggles; persistent depth changes remain untouched.",
+    )
+    part_tracker_parser.add_argument("--depth-spike-jump-threshold-m", type=float, default=0.08)
+    part_tracker_parser.add_argument("--depth-spike-neighbor-tolerance-m", type=float, default=0.03)
+    part_tracker_parser.add_argument("--depth-spike-max-run-frames", type=int, default=2)
+    part_tracker_parser.add_argument(
         "--no-part-mask-consistency",
         action="store_true",
         help="Do not require tracked pixels to remain inside the same part mask before backprojection",
+    )
+    part_tracker_parser.add_argument(
+        "--strict-object-mask-consistency",
+        action="store_true",
+        help="Require tracked samples to remain inside each per-frame object mask. Use only with reliable masks.",
     )
     part_tracker_parser.add_argument(
         "--no-backward-tracking",
@@ -578,6 +693,11 @@ def register(subparsers: Any) -> None:
         "--dynamic-reseeding",
         action="store_true",
         help="In object-mask mode, add birth-time-aware seeds in newly visible uncovered regions.",
+    )
+    part_tracker_parser.add_argument(
+        "--dynamic-reseed-bidirectional",
+        action="store_true",
+        help="Keep CoTracker results before each dynamic seed frame when backward tracking is enabled",
     )
     part_tracker_parser.add_argument("--reseed-interval-frames", type=int, default=5)
     part_tracker_parser.add_argument("--reseed-coverage-radius-px", type=float, default=12.0)
@@ -717,9 +837,28 @@ def register(subparsers: Any) -> None:
     slot_train_parser.add_argument("--no-part-balanced-assignment", action="store_true")
     slot_train_parser.add_argument("--no-canonicalize-geometry", action="store_true")
     slot_train_parser.add_argument("--no-geometry-augmentation", action="store_true")
+    slot_train_parser.add_argument("--geometry-noise-std", type=float, default=0.003)
+    slot_train_parser.add_argument("--depth-bias-probability", type=float, default=0.0)
+    slot_train_parser.add_argument("--depth-bias-std", type=float, default=0.01)
+    slot_train_parser.add_argument("--sampled-depth-spike-probability", type=float, default=0.0)
     slot_train_parser.add_argument("--track-dropout-ratio", type=float, default=0.1)
+    slot_train_parser.add_argument("--view-dropout-probability", type=float, default=0.0)
+    slot_train_parser.add_argument("--max-dropped-views", type=int, default=2)
     slot_train_parser.add_argument("--pair-samples-per-object", type=int, default=4096)
+    slot_train_parser.add_argument(
+        "--object-batch-size", type=int, default=1,
+        help="Number of similarly sized objects padded into one Transformer training batch",
+    )
+    slot_train_parser.add_argument(
+        "--data-loader-workers", type=int, default=0,
+        help="Threads used to preload per-object JSON/NPZ artifacts before training",
+    )
     slot_train_parser.add_argument("--no-topology-balanced-sampling", action="store_true")
+    slot_train_parser.add_argument(
+        "--collapse-fixed-connected-labels",
+        action="store_true",
+        help="Train against maximal fixed-joint-connected kinematic parts instead of raw simulator bodies",
+    )
     slot_train_parser.add_argument("--device", choices=["auto", "mps", "cpu", "cuda"], default="auto")
     slot_train_parser.add_argument("--seed", type=int, default=0)
 
@@ -737,7 +876,285 @@ def register(subparsers: Any) -> None:
     slot_infer_parser.add_argument("--ransac-inlier-threshold-m", type=float, default=0.025)
     slot_infer_parser.add_argument("--ransac-min-inliers", type=int, default=8)
     slot_infer_parser.add_argument("--slot-existence-threshold", type=float, default=0.5)
+    slot_infer_parser.add_argument(
+        "--min-visible-frames", type=int, default=0,
+        help="Drop tracks with fewer valid 3D samples before slot inference (disabled at 0).",
+    )
+    slot_infer_parser.add_argument(
+        "--min-visible-ratio", type=float, default=0.0,
+        help="Drop tracks visible for less than this fraction of the episode.",
+    )
+    slot_infer_parser.add_argument(
+        "--max-trajectory-jump-m", type=float, default=0.0,
+        help="Drop tracks containing a consecutive 3D jump above this threshold (disabled at 0).",
+    )
     slot_infer_parser.add_argument("--seed", type=int, default=0)
+
+    relation_train_parser = subparsers.add_parser(
+        "train-slot-relation-head",
+        help="Train an unconstrained pairwise joint proposal head on frozen motion-part slots",
+    )
+    relation_train_parser.add_argument("manifest", type=Path)
+    relation_train_parser.add_argument("slot_model", type=Path)
+    relation_train_parser.add_argument("--output-dir", type=Path, required=True)
+    relation_train_parser.add_argument("--epochs", type=int, default=50)
+    relation_train_parser.add_argument(
+        "--object-batch-size",
+        type=int,
+        default=1,
+        help="Number of variable-size objects padded into one Relation Head training batch.",
+    )
+    relation_train_parser.add_argument("--hidden-dim", type=int, default=256)
+    relation_train_parser.add_argument("--learning-rate", type=float, default=3e-4)
+    relation_train_parser.add_argument("--weight-decay", type=float, default=1e-4)
+    relation_train_parser.add_argument("--edge-positive-weight", type=float, default=4.0)
+    relation_train_parser.add_argument("--joint-type-loss-weight", type=float, default=1.0)
+    relation_train_parser.add_argument("--axis-loss-weight", type=float, default=2.0)
+    relation_train_parser.add_argument("--axis-line-loss-weight", type=float, default=1.0)
+    relation_train_parser.add_argument("--joint-replay-loss-weight", type=float, default=0.1)
+    relation_train_parser.add_argument("--slot-assignment-loss-weight", type=float, default=1.0)
+    relation_train_parser.add_argument(
+        "--slot-dice-loss-weight", type=float, default=0.5,
+        help="Matched per-part Dice loss used when the slot backbone is unfrozen.",
+    )
+    relation_train_parser.add_argument(
+        "--slot-pairwise-loss-weight", type=float, default=0.25,
+        help=(
+            "Supervised same-part pairwise loss with spatially nearest cross-part hard "
+            "negatives, used when the slot backbone is unfrozen."
+        ),
+    )
+    relation_train_parser.add_argument("--slot-pair-samples-per-object", type=int, default=4096)
+    relation_train_parser.add_argument("--slot-rigid-loss-weight", type=float, default=0.1)
+    relation_train_parser.add_argument("--slot-existence-loss-weight", type=float, default=0.25)
+    relation_train_parser.add_argument(
+        "--slot-assignment-consistency-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Hungarian-aligned consistency between original and SO(3)-rotated track-to-slot "
+            "assignments. Intended for slot_and_relation_geometry fine-tuning."
+        ),
+    )
+    relation_train_parser.add_argument("--no-joint-type-balanced-loss", action="store_true")
+    rotation_group = relation_train_parser.add_mutually_exclusive_group()
+    rotation_group.add_argument(
+        "--rotation-augmentation", action="store_true",
+        help="Experimentally rotate relation-level 3D evidence and GT joints with shared SO(3)",
+    )
+    rotation_group.add_argument(
+        "--no-rotation-augmentation", action="store_true", help="Deprecated explicit opt-out",
+    )
+    relation_train_parser.add_argument("--rotation-augmentation-probability", type=float, default=0.5)
+    relation_train_parser.add_argument(
+        "--rotation-augmentation-mode",
+        choices=[
+            "uniform_quaternion", "euler", "yaw", "limited_xyz_15",
+            "limited_xyz_30", "identity",
+        ],
+        default="uniform_quaternion",
+        help=(
+            "Haar-uniform quaternion sampling is the default; yaw and bounded random-axis "
+            "rotations support explicit augmentation-difficulty ablations."
+        ),
+    )
+    relation_train_parser.add_argument(
+        "--rotation-augmentation-scope",
+        choices=["relation_geometry", "slot_and_relation_geometry"],
+        default="relation_geometry",
+        help=(
+            "Choose whether SO(3) augmentation rotates only relation-head geometry or also "
+            "the explicit 3D geometry used to recompute slot tokens. Cached tracker embeddings "
+            "are unchanged."
+        ),
+    )
+    relation_train_parser.add_argument(
+        "--slot-input-mode",
+        choices=["full", "geometry_only", "embedding_only"],
+        default="full",
+        help="Training ablation for the slot encoder input; masked channels are replaced by their feature mean.",
+    )
+    relation_train_parser.add_argument(
+        "--slot-geometry-representation",
+        choices=["raw", "invariant_v1"],
+        default="raw",
+        help=(
+            "Representation used only by the slot identity branch. invariant_v1 replaces "
+            "world-frame vectors with norm, dot-product, and path-length invariants while "
+            "preserving raw vector trajectories for relation and axis prediction."
+        ),
+    )
+    relation_train_parser.add_argument("--temporal-occlusion-augmentation", action="store_true")
+    relation_train_parser.add_argument("--temporal-occlusion-probability", type=float, default=0.5)
+    relation_train_parser.add_argument("--temporal-occlusion-min-fraction", type=float, default=0.15)
+    relation_train_parser.add_argument("--temporal-occlusion-max-fraction", type=float, default=0.45)
+    relation_train_parser.add_argument("--temporal-occlusion-track-fraction", type=float, default=0.5)
+    relation_train_parser.add_argument("--trajectory-corruption-augmentation", action="store_true")
+    relation_train_parser.add_argument("--trajectory-corruption-probability", type=float, default=0.5)
+    relation_train_parser.add_argument("--trajectory-corruption-track-fraction", type=float, default=0.25)
+    relation_train_parser.add_argument("--trajectory-drift-scale-fraction", type=float, default=0.03)
+    relation_train_parser.add_argument("--trajectory-spike-probability", type=float, default=0.15)
+    relation_train_parser.add_argument("--coherent-drift-probability", type=float, default=0.0)
+    relation_train_parser.add_argument("--recovery-offset-probability", type=float, default=0.0)
+    relation_train_parser.add_argument("--track-id-switch-probability", type=float, default=0.0)
+    relation_train_parser.add_argument("--slot-contamination-probability", type=float, default=0.0)
+    relation_train_parser.add_argument("--slot-contamination-fraction", type=float, default=0.1)
+    relation_train_parser.add_argument(
+        "--excitation-weighted-axis-loss", action="store_true",
+        help="Downweight axis supervision for GT joints with negligible full-path motion.",
+    )
+    relation_train_parser.add_argument("--min-axis-excitation", type=float, default=0.01)
+    relation_train_parser.add_argument("--full-axis-excitation", type=float, default=0.05)
+    relation_train_parser.add_argument(
+        "--hard-axis-focal-gamma", type=float, default=0.0,
+        help="Boost high-angular-error observable joints; zero disables focal weighting.",
+    )
+    relation_train_parser.add_argument("--hard-axis-max-weight", type=float, default=2.0)
+    relation_train_parser.add_argument(
+        "--axis-geometry-branch",
+        action="store_true",
+        help=(
+            "Predict axis/pivot from ordered raw 3D trajectories softly pooled by slot "
+            "assignments; edge/type remain on the fused slot-relation branch."
+        ),
+    )
+    relation_train_parser.add_argument(
+        "--axis-head-type",
+        choices=["direct", "equivariant_proposal", "vector_neuron"],
+        default="direct",
+        help=(
+            "Axis architecture. Equivariant heads require --axis-geometry-branch and "
+            "cannot emit an axis from a free world-coordinate bias."
+        ),
+    )
+    relation_train_parser.add_argument(
+        "--vector-pivot-parameterization",
+        choices=[
+            "legacy_center_delta",
+            "analytic_plane_residual_v1",
+            "pure_plane_residual_v1",
+        ],
+        default="analytic_plane_residual_v1",
+        help=(
+            "Vector-Neuron pivot geometry. The new default starts from the analytic "
+            "hinge line and learns an SO(3)-equivariant residual in its normal plane."
+        ),
+    )
+    relation_train_parser.add_argument(
+        "--relation-train-scope",
+        choices=["all", "vector_pivot_only", "frozen", "slot_only"],
+        default="all",
+        help=(
+            "Train the full relation model, only the VN pivot residual, or freeze the "
+            "relation model for an isolated slot-backbone fine-tune."
+        ),
+    )
+    relation_train_parser.add_argument(
+        "--geometry-encoder-type",
+        choices=["track_gru_average", "track_gru_transformer"],
+        default="track_gru_average",
+        help="Choose the existing independent-track average or cross-track attention ablation.",
+    )
+    relation_train_parser.add_argument("--trajectory-hidden-dim", type=int, default=128)
+    relation_train_parser.add_argument(
+        "--trajectory-samples",
+        type=int,
+        default=32,
+        help="Uniformly sampled ordered frames used by the trajectory encoder.",
+    )
+    relation_train_parser.add_argument(
+        "--quality-weighted-trajectories",
+        action="store_true",
+        help=(
+            "Weight trajectory pooling and geometric fitting by existing per-track "
+            "and per-timestep quality scores instead of binary visibility only."
+        ),
+    )
+    relation_train_parser.add_argument(
+        "--robust-segment-weights", action="store_true",
+        help="Apply invariant Huber weighting and hard jump boundaries to trajectory evidence.",
+    )
+    relation_train_parser.add_argument("--geometry-max-tracks", type=int, default=64)
+    relation_train_parser.add_argument("--geometry-attention-heads", type=int, default=4)
+    relation_train_parser.add_argument("--geometry-transformer-layers", type=int, default=1)
+    relation_train_parser.add_argument(
+        "--axis-equivariance-loss-weight",
+        type=float,
+        default=0.0,
+        help="Optional undirected f(Qx)=Qf(x) consistency loss; disabled by default.",
+    )
+    relation_train_parser.add_argument("--axis-line-equivariance-loss-weight", type=float, default=0.0)
+    relation_train_parser.add_argument("--edge-consistency-loss-weight", type=float, default=0.0)
+    relation_train_parser.add_argument("--type-consistency-loss-weight", type=float, default=0.0)
+    relation_train_parser.add_argument("--unfreeze-slot-backbone", action="store_true")
+    relation_train_parser.add_argument(
+        "--slot-unfreeze-scope",
+        choices=["decoder", "all"],
+        default="decoder",
+        help="When unfreezing, update only slot queries/decoder by default or the full backbone",
+    )
+    relation_train_parser.add_argument("--slot-learning-rate-scale", type=float, default=0.1)
+    relation_train_parser.add_argument(
+        "--initial-relation-model",
+        type=Path,
+        default=None,
+        help="Continue relation-head training from a previous phase checkpoint",
+    )
+    relation_train_parser.add_argument(
+        "--ignore-initial-slot-state", action="store_true",
+        help="Warm-start only the relation head and retain the explicitly supplied slot model.",
+    )
+    relation_train_parser.add_argument("--device", choices=["auto", "mps", "cpu", "cuda"], default="auto")
+    relation_train_parser.add_argument("--seed", type=int, default=0)
+
+    relation_infer_parser = subparsers.add_parser(
+        "infer-slot-relation-head",
+        help="Predict unconstrained directed joint proposals between active motion-part slots",
+    )
+    relation_infer_parser.add_argument("tracks", type=Path)
+    relation_infer_parser.add_argument("features_npz", type=Path)
+    relation_infer_parser.add_argument("slot_model", type=Path)
+    relation_infer_parser.add_argument("relation_model", type=Path)
+    relation_infer_parser.add_argument("--output-json", type=Path, required=True)
+    relation_infer_parser.add_argument("--device", choices=["auto", "mps", "cpu", "cuda"], default="auto")
+    relation_infer_parser.add_argument("--slot-existence-threshold", type=float, default=0.5)
+    relation_infer_parser.add_argument("--edge-threshold", type=float, default=0.5)
+    relation_infer_parser.add_argument("--min-axis-confidence", type=float, default=0.0)
+    relation_infer_parser.add_argument("--min-axis-observability", type=float, default=0.0)
+    relation_infer_parser.add_argument("--min-edge-observability", type=float, default=0.0)
+    relation_infer_parser.add_argument(
+        "--gate-selected-edges", action="store_true",
+        help=(
+            "Decode only proposals passing edge and observability thresholds, "
+            "allowing a legal forest instead of forcing K-1 edges."
+        ),
+    )
+    relation_infer_parser.add_argument(
+        "--quality-weighted-trajectories",
+        action="store_true",
+        default=None,
+        help="Override the checkpoint and enable quality-weighted trajectory evidence.",
+    )
+    relation_infer_parser.add_argument(
+        "--min-trajectory-quality",
+        type=float,
+        default=0.0,
+        help=(
+            "Hard-reject observations whose combined track/timestep quality weight "
+            "is below this threshold. Requires quality weighting."
+        ),
+    )
+    relation_infer_parser.add_argument(
+        "--robust-segment-weights", action="store_true", default=None,
+        help="Override the checkpoint and enable robust segment trajectory weights.",
+    )
+    relation_infer_parser.add_argument(
+        "--trajectory-assignment-override", type=Path, default=None,
+        help=(
+            "Diagnostic-only JSON mapping track IDs to slot indices. Replaces trajectory "
+            "aggregation assignments while retaining predicted slot latents."
+        ),
+    )
 
     part_pose_parser = subparsers.add_parser(
         "estimate-part-poses",
@@ -771,6 +1188,12 @@ def register(subparsers: Any) -> None:
         type=int,
         default=None,
         help="Optional part id to use as the relative-pose anchor instead of auto-selecting the base/static part",
+    )
+    part_pose_parser.add_argument(
+        "--anchor-selection",
+        choices=["metadata", "lowest-motion"],
+        default="metadata",
+        help="How to select the anchor when --anchor-part-id is omitted. Use lowest-motion for unlabeled real scenes.",
     )
     part_pose_parser.add_argument(
         "--min-tracks-per-part",

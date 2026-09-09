@@ -1,0 +1,21 @@
+{
+  "scene_id": "scene30_small_box",
+  "category": "cardboard_box",
+  "scene_root": "data/track2art_real_20260814/scenes/scene30_small_box",
+  "anchor_frame": 66,
+  "parts": [{"id": 1, "name": "base"}, {"id": 2, "name": "lid"}],
+  "views": [
+    {"view": 0, "parts": [
+      {"id": 1, "prompts": [{"type":"bbox","x1":275,"y1":165,"x2":500,"y2":320},{"type":"point_pos","x":390,"y":260}]},
+      {"id": 2, "prompts": [{"type":"bbox","x1":285,"y1":80,"x2":390,"y2":235},{"type":"point_pos","x":335,"y":145},{"type":"point_neg","x":390,"y":265}]}
+    ]},
+    {"view": 1, "parts": [
+      {"id": 1, "prompts": [{"type":"bbox","x1":360,"y1":115,"x2":575,"y2":315},{"type":"point_pos","x":460,"y":245}]},
+      {"id": 2, "prompts": [{"type":"bbox","x1":475,"y1":35,"x2":625,"y2":225},{"type":"point_pos","x":550,"y":130},{"type":"point_neg","x":460,"y":245}]}
+    ]},
+    {"view": 2, "parts": [
+      {"id": 1, "prompts": [{"type":"bbox","x1":285,"y1":80,"x2":590,"y2":360},{"type":"point_pos","x":430,"y":230}]},
+      {"id": 2, "prompts": [{"type":"bbox","x1":435,"y1":0,"x2":760,"y2":190},{"type":"point_pos","x":600,"y":90},{"type":"point_neg","x":430,"y":230}]}
+    ]}
+  ]
+}

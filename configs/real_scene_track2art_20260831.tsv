@@ -1,0 +1,7 @@
+scene_id	scene_dir_name	dataset_root	camera_pose_order	output_name	object_group	protocol_role	status
+microwave_hand_close_2	microwave_hand_close_2	/lumos-vePFS/suzhou/Users/lixiaotong/datasets/track2art_real_20260831/extracted	0,1,2	real_0831_microwave_hand_close_2_track2art_v1	microwave_0831	unlabeled_audit	ready
+microwave_hand_open_2	microwave_hand_open_2	/lumos-vePFS/suzhou/Users/lixiaotong/datasets/track2art_real_20260831/extracted	0,1,2	real_0831_microwave_hand_open_2_track2art_v1	microwave_0831	unlabeled_audit	ready
+ofen_freefall	ofen_freefall	/lumos-vePFS/suzhou/Users/lixiaotong/datasets/track2art_real_20260831/extracted	0,1,2	real_0831_oven_freefall_track2art_v1	oven_0831	unlabeled_audit	ready
+ofen_freefall_2	ofen_freefall_2	/lumos-vePFS/suzhou/Users/lixiaotong/datasets/track2art_real_20260831/extracted	0,1,2	real_0831_oven_freefall_2_track2art_v1	oven_0831	unlabeled_audit	ready
+ofen_hand_close	ofen_hand_close	/lumos-vePFS/suzhou/Users/lixiaotong/datasets/track2art_real_20260831/extracted	0,1,2	real_0831_oven_hand_close_track2art_v1	oven_0831	unlabeled_audit	ready
+ofen_hand_open	ofen_hand_open	/lumos-vePFS/suzhou/Users/lixiaotong/datasets/track2art_real_20260831/extracted	0,1,2	real_0831_oven_hand_open_track2art_v1	oven_0831	unlabeled_audit	ready

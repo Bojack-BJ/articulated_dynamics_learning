@@ -100,7 +100,31 @@ def _load_depth_u16(path: Path) -> list[list[int]]:
         return _read_pgm_u16(path)
     if path.suffix.lower() == ".png":
         return _read_png_depth_u16(path)
+    if path.suffix.lower() == ".npy":
+        try:
+            import numpy as np
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError("NPY depth loading requires NumPy.") from exc
+        values = np.load(path, allow_pickle=False)
+        if values.ndim != 2:
+            raise ValueError(f"Expected a 2D depth array in {path}, got shape {values.shape}.")
+        return values.astype(np.uint16, copy=False).tolist()
     raise ValueError(f"Unsupported depth format: {path.suffix}")
+
+
+def _resolve_view_intrinsics(
+    default_intrinsics: dict[str, float], metadata: dict[str, object], view_index: int
+) -> dict[str, float]:
+    per_view = metadata.get("camera_intrinsics_by_view")
+    if not isinstance(per_view, list) or view_index >= len(per_view):
+        return default_intrinsics
+    values = per_view[view_index]
+    if not isinstance(values, dict):
+        raise ValueError(f"camera_intrinsics_by_view[{view_index}] must be an object.")
+    required = ("fx", "fy", "cx", "cy")
+    if any(key not in values for key in required):
+        raise ValueError(f"camera_intrinsics_by_view[{view_index}] is missing fx/fy/cx/cy.")
+    return {key: float(values[key]) for key in required}
 
 
 def _image_shape(depth_u16: list[list[int]]) -> tuple[int, int]:
@@ -123,7 +147,8 @@ def _camera_to_world_point(
     cy = float(intrinsics["cy"])
 
     ray_x = (float(u_coord) - cx) / fx
-    ray_y = -(float(v_coord) - cy) / fy
+    image_y = (float(v_coord) - cy) / fy
+    ray_y = image_y if depth_convention == "opencv-z-depth" else -image_y
     if depth_convention == "ray-length":
         ray_norm = math.sqrt(ray_x * ray_x + ray_y * ray_y + 1.0)
         x_cam = depth_m * ray_x / ray_norm
@@ -310,13 +335,14 @@ def _estimate_object_bounds(
         camera_poses, pose_mode = _resolve_view_camera_poses(frame, episode_metadata, len(depth_paths))
         pose_modes.add(pose_mode)
         for view_index, (depth_path, camera_pose) in enumerate(zip(depth_paths, camera_poses)):
+            view_intrinsics = _resolve_view_intrinsics(intrinsics, episode_metadata, view_index)
             depth_u16 = _load_depth_u16(depth_path)
             if view_index < len(mask_paths):
                 mask_u16 = _load_depth_u16(mask_paths[view_index])
                 masked = _bootstrap_candidates_from_mask(
                     depth_u16,
                     mask_u16,
-                    intrinsics,
+                    view_intrinsics,
                     camera_pose,
                     config,
                     depth_convention,
@@ -326,7 +352,7 @@ def _estimate_object_bounds(
                 candidates.extend(
                     _bootstrap_candidates(
                         depth_u16,
-                        intrinsics,
+                        view_intrinsics,
                         camera_pose,
                         config,
                         depth_convention,
@@ -550,6 +576,9 @@ class EpisodePointCloudFuser:
             merged_points: list[tuple[float, float, float, int]] = []
             used_masks_for_frame = 0
             for view_index, (depth_path, camera_pose) in enumerate(zip(depth_paths, camera_poses)):
+                view_intrinsics = _resolve_view_intrinsics(
+                    episode.camera_intrinsics, episode.metadata, view_index
+                )
                 depth_u16 = _load_depth_u16(depth_path)
                 mask_u16 = (
                     _load_depth_u16(mask_paths[view_index])
@@ -587,7 +616,7 @@ class EpisodePointCloudFuser:
                             u_coord=u_coord,
                             v_coord=v_coord,
                             depth_m=depth_m,
-                            intrinsics=episode.camera_intrinsics,
+                            intrinsics=view_intrinsics,
                             camera_pose=camera_pose,
                             depth_convention=depth_convention,
                         )

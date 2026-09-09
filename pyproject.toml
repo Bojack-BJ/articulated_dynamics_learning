@@ -21,6 +21,7 @@ viz = [
 	"imageio>=2.34.0",
 	"imageio-ffmpeg>=0.5.0",
 	"matplotlib>=3.8",
+	"plotly>=5.24",
 ]
 
 tracking = [
@@ -28,6 +29,7 @@ tracking = [
 	"torchvision>=0.16",
 	"pillow>=10.0.0",
 	"numpy>=1.26",
+	"scipy>=1.11",
 ]
 
 imitation = [
@@ -46,8 +48,16 @@ remote-server = [
 	"uvicorn>=0.29",
 ]
 
+external-baselines = [
+	"remotezip>=0.12.3",
+]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["backups", "outputs", "data", ".tmp", "tmp", ".venv", ".venvs"]

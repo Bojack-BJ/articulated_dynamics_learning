@@ -1,0 +1,21 @@
+{
+  "scene_id": "scene32",
+  "category": "oven",
+  "scene_root": "data/track2art_real_20260814/scenes/scene32",
+  "anchor_frame": 145,
+  "parts": [{"id": 1, "name": "base"}, {"id": 2, "name": "door"}],
+  "views": [
+    {"view": 0, "parts": [
+      {"id": 1, "prompts": [{"type":"bbox","x1":485,"y1":0,"x2":847,"y2":280},{"type":"point_pos","x":700,"y":100}]},
+      {"id": 2, "prompts": [{"type":"bbox","x1":465,"y1":165,"x2":820,"y2":479},{"type":"point_pos","x":635,"y":330},{"type":"point_neg","x":700,"y":100}]}
+    ]},
+    {"view": 1, "parts": [
+      {"id": 1, "prompts": [{"type":"bbox","x1":270,"y1":45,"x2":655,"y2":335},{"type":"point_pos","x":470,"y":170}]},
+      {"id": 2, "prompts": [{"type":"bbox","x1":245,"y1":195,"x2":625,"y2":345},{"type":"point_pos","x":430,"y":270},{"type":"point_neg","x":470,"y":120},{"type":"point_neg","x":500,"y":390}]}
+    ]},
+    {"view": 2, "parts": [
+      {"id": 1, "prompts": [{"type":"bbox","x1":205,"y1":55,"x2":690,"y2":345},{"type":"point_pos","x":450,"y":170}]},
+      {"id": 2, "prompts": [{"type":"bbox","x1":245,"y1":170,"x2":620,"y2":335},{"type":"point_pos","x":430,"y":245},{"type":"point_neg","x":450,"y":100},{"type":"point_neg","x":610,"y":390}]}
+    ]}
+  ]
+}

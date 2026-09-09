@@ -7,7 +7,8 @@ import unittest
 from pathlib import Path
 
 from rgbd_urdf_mvp.cli import build_parser
-from rgbd_urdf_mvp.perception.part_pose import PartPoseEstimationConfig, PartPoseEstimator
+from rgbd_urdf_mvp.perception.part_pose import PartPoseEstimationConfig, PartPoseEstimator, _choose_anchor_part_id
+from rgbd_urdf_mvp.perception.part_tracking import _track_cluster_motion_range
 
 
 def _rotation_z(angle_rad: float) -> list[list[float]]:
@@ -47,6 +48,34 @@ def _box_grid(size: list[float], steps: tuple[int, int, int]) -> list[list[float
 
 
 class PartPoseTests(unittest.TestCase):
+    def test_track_cluster_motion_range_detects_round_trip(self) -> None:
+        tracks = [
+            {
+                "samples": [
+                    {
+                        "frame_index": frame_index,
+                        "visible": True,
+                        "depth_valid": True,
+                        "xyz_world": [0.01 * track_id, offset, 0.0],
+                    }
+                    for frame_index, offset in enumerate([0.0, 0.05, 0.10, 0.05, 0.0])
+                ]
+            }
+            for track_id in range(6)
+        ]
+        self.assertAlmostEqual(_track_cluster_motion_range(tracks, 3), 0.10, places=5)
+
+    def test_fixed_child_is_preferred_as_static_anchor(self) -> None:
+        meta = {
+            "part_segmentation": {
+                "parts": [
+                    {"part_id": 2, "role": "fixed_child"},
+                    {"part_id": 3, "role": "articulated"},
+                ]
+            }
+        }
+        self.assertEqual(_choose_anchor_part_id(meta, {2: 20, 3: 100}, None), 2)
+
     def test_estimate_part_poses_parser_accepts_arguments(self) -> None:
         parser = build_parser()
         args = parser.parse_args(
@@ -59,11 +88,14 @@ class PartPoseTests(unittest.TestCase):
                 "32",
                 "--anchor-part-id",
                 "2",
+                "--anchor-selection",
+                "lowest-motion",
             ]
         )
         self.assertEqual(args.command, "estimate-part-poses")
         self.assertEqual(args.min_points_per_part, 32)
         self.assertEqual(args.anchor_part_id, 2)
+        self.assertEqual(args.anchor_selection, "lowest-motion")
 
     def test_estimate_part_poses_from_part_labeled_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

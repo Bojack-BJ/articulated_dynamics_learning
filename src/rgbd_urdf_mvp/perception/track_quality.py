@@ -8,6 +8,7 @@ from statistics import median
 from typing import Any
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 from ..core.serialization import load_json, save_json
 from .quality_weights import compute_articulation_trace_diagnostics
@@ -19,6 +20,13 @@ class TrackQualityConfig:
     output_dir: str | Path
     bad_track_threshold: float = 0.35
     bad_timestep_threshold: float = 0.35
+    mask_bad_timesteps: bool = False
+    max_step_m: float | None = None
+    keep_query_connected_segment: bool = False
+    min_query_connected_frames: int = 2
+    query_connected_max_gap_frames: int = 0
+    spatial_dbscan_eps_m: float | None = None
+    spatial_dbscan_min_samples: int = 5
 
 
 class TrackQualityAnalyzer:
@@ -71,9 +79,54 @@ class TrackQualityAnalyzer:
                     enriched_sample["motion_model_type"] = row["motion_model_type"]
                     enriched_sample["residual_score"] = row["residual_score"]
                     enriched_sample["articulation_residual_score"] = row["articulation_residual_score"]
-                    if float(row["timestep_quality_score"]) < float(config.bad_timestep_threshold):
+                    quality_rejected = float(row["timestep_quality_score"]) < float(
+                        config.bad_timestep_threshold
+                    )
+                    step = row.get("step_length_m")
+                    step_rejected = (
+                        config.max_step_m is not None
+                        and step is not None
+                        and float(step) > float(config.max_step_m)
+                    )
+                    if quality_rejected or step_rejected:
                         bad_frames.append(frame_index)
+                    if config.mask_bad_timesteps and (quality_rejected or step_rejected):
+                        enriched_sample["quality_original_visible"] = bool(
+                            enriched_sample.get("visible", False)
+                        )
+                        enriched_sample["visible"] = False
+                        enriched_sample["confidence"] = 0.0
+                        enriched_sample["quality_rejected"] = True
+                        enriched_sample["quality_rejection_reasons"] = [
+                            reason
+                            for reason, rejected in (
+                                ("low_timestep_quality", quality_rejected),
+                                ("step_too_large", step_rejected),
+                            )
+                            if rejected
+                        ]
                 enriched_samples.append(enriched_sample)
+            if config.keep_query_connected_segment:
+                connected_frames = _keep_query_connected_segment(
+                    enriched_samples,
+                    query_frame_index=int(track.get("query_frame_index", 0)),
+                    min_frames=max(1, int(config.min_query_connected_frames)),
+                    max_gap_frames=max(0, int(config.query_connected_max_gap_frames)),
+                )
+                for enriched_sample in enriched_samples:
+                    frame_index = int(enriched_sample.get("frame_index", 0))
+                    if frame_index in connected_frames:
+                        continue
+                    if bool(enriched_sample.get("visible", False)):
+                        enriched_sample["quality_original_visible"] = True
+                    enriched_sample["visible"] = False
+                    enriched_sample["confidence"] = 0.0
+                    enriched_sample["quality_rejected"] = True
+                    reasons = list(enriched_sample.get("quality_rejection_reasons", []))
+                    if "outside_query_connected_segment" not in reasons:
+                        reasons.append("outside_query_connected_segment")
+                    enriched_sample["quality_rejection_reasons"] = reasons
+                    bad_frames.append(frame_index)
             enriched_track["samples"] = enriched_samples
             enriched_track["track_quality"] = {
                 key: value
@@ -90,6 +143,32 @@ class TrackQualityAnalyzer:
             if bad_frames:
                 bad_timestep_mask[str(summary["track_id"])] = sorted(set(bad_frames))
 
+        spatial_outlier_count = 0
+        if config.spatial_dbscan_eps_m is not None:
+            spatial_outliers = _spatial_dbscan_outliers(
+                enriched_tracks,
+                eps_m=max(1e-9, float(config.spatial_dbscan_eps_m)),
+                min_samples=max(2, int(config.spatial_dbscan_min_samples)),
+            )
+            spatial_outlier_count = len(spatial_outliers)
+            for track_index, sample_index in spatial_outliers:
+                track = enriched_tracks[track_index]
+                sample = track["samples"][sample_index]
+                frame_index = int(sample.get("frame_index", 0))
+                if config.mask_bad_timesteps:
+                    sample["quality_original_visible"] = bool(sample.get("visible", False))
+                    sample["visible"] = False
+                    sample["confidence"] = 0.0
+                    sample["quality_rejected"] = True
+                    reasons = list(sample.get("quality_rejection_reasons", []))
+                    if "spatial_dbscan_outlier" not in reasons:
+                        reasons.append("spatial_dbscan_outlier")
+                    sample["quality_rejection_reasons"] = reasons
+                track_id = str(track.get("track_id", track_index))
+                bad_timestep_mask.setdefault(track_id, []).append(frame_index)
+            for track_id, frames in bad_timestep_mask.items():
+                bad_timestep_mask[track_id] = sorted(set(frames))
+
         enriched_payload = dict(payload)
         enriched_payload["tracks"] = enriched_tracks
         enriched_payload["track_quality"] = {
@@ -97,12 +176,22 @@ class TrackQualityAnalyzer:
             "track_count": len(tracks),
             "bad_track_threshold": float(config.bad_track_threshold),
             "bad_timestep_threshold": float(config.bad_timestep_threshold),
+            "mask_bad_timesteps": bool(config.mask_bad_timesteps),
+            "max_step_m": config.max_step_m,
+            "keep_query_connected_segment": bool(config.keep_query_connected_segment),
+            "min_query_connected_frames": max(1, int(config.min_query_connected_frames)),
+            "query_connected_max_gap_frames": max(
+                0, int(config.query_connected_max_gap_frames)
+            ),
+            "spatial_dbscan_eps_m": config.spatial_dbscan_eps_m,
+            "spatial_dbscan_min_samples": max(2, int(config.spatial_dbscan_min_samples)),
             "notes": {
                 "track_quality_score": "Whole-trajectory reliability aggregated from visibility, evidence, median timestep quality, and low-quality timestep ratio.",
                 "timestep_quality_score": "Local per-frame contribution weight; it penalizes invalid samples, outlier steps/accelerations, and local smooth residuals.",
                 "articulation_score": "Whole-trajectory diagnostic score from the best static/prismatic/revolute model residual. It is separate from the default track quality score.",
                 "articulation_residual_m": "Per-frame residual to the best simple articulated motion model.",
                 "direction_change_deg": "Diagnostic only. It can be high for valid revolute arcs and is not a main quality penalty.",
+                "quality_rejected": "Rejected samples remain in the artifact but are invisible to downstream geometry and replay.",
             },
         }
 
@@ -137,6 +226,22 @@ class TrackQualityAnalyzer:
                 "motion_tracks_with_quality": str(enriched_json),
             },
             "summary": summarize_quality(track_rows, timestep_rows),
+            "filtering": {
+                "mask_bad_timesteps": bool(config.mask_bad_timesteps),
+                "bad_timestep_threshold": float(config.bad_timestep_threshold),
+                "max_step_m": config.max_step_m,
+                "keep_query_connected_segment": bool(config.keep_query_connected_segment),
+                "min_query_connected_frames": max(1, int(config.min_query_connected_frames)),
+                "query_connected_max_gap_frames": max(
+                    0, int(config.query_connected_max_gap_frames)
+                ),
+                "spatial_dbscan_eps_m": config.spatial_dbscan_eps_m,
+                "spatial_dbscan_min_samples": max(2, int(config.spatial_dbscan_min_samples)),
+                "spatial_dbscan_outlier_count": spatial_outlier_count,
+                "masked_timestep_count": sum(len(frames) for frames in bad_timestep_mask.values())
+                if config.mask_bad_timesteps
+                else 0,
+            },
             "notes": {
                 "track_quality_score": "Whole-trajectory reliability.",
                 "timestep_quality_score": "Local per-frame contribution weight.",
@@ -326,6 +431,72 @@ def summarize_quality(track_rows: list[dict[str, Any]], timestep_rows: list[dict
 def _ordered_samples(track: dict[str, Any]) -> list[dict[str, Any]]:
     samples = [sample for sample in track.get("samples", []) if isinstance(sample, dict)]
     return sorted(samples, key=lambda sample: int(sample.get("frame_index", 0)))
+
+
+def _spatial_dbscan_outliers(
+    tracks: list[dict[str, Any]],
+    *,
+    eps_m: float,
+    min_samples: int,
+) -> set[tuple[int, int]]:
+    """Find isolated per-timestep samples without collapsing valid dense components."""
+    groups: dict[tuple[int, int], list[tuple[int, int, np.ndarray]]] = {}
+    for track_index, track in enumerate(tracks):
+        try:
+            part_id = int(track.get("part_id", track.get("pred_cluster", 0)))
+        except (TypeError, ValueError):
+            part_id = 0
+        for sample_index, sample in enumerate(track.get("samples", []) or []):
+            if not _valid_sample(sample):
+                continue
+            frame_index = int(sample.get("frame_index", 0))
+            groups.setdefault((frame_index, part_id), []).append(
+                (track_index, sample_index, _xyz(sample))
+            )
+
+    outliers: set[tuple[int, int]] = set()
+    min_samples = max(2, int(min_samples))
+    for members in groups.values():
+        if len(members) < min_samples:
+            # A sparse visible part is not sufficient evidence of an outlier.
+            continue
+        points = np.stack([member[2] for member in members], axis=0)
+        neighborhoods = cKDTree(points).query_ball_point(points, r=float(eps_m))
+        core = np.asarray([len(neighbors) >= min_samples for neighbors in neighborhoods])
+        clustered = core.copy()
+        for index, neighbors in enumerate(neighborhoods):
+            if core[index]:
+                clustered[np.asarray(neighbors, dtype=int)] = True
+        for index in np.flatnonzero(~clustered):
+            outliers.add((members[int(index)][0], members[int(index)][1]))
+    return outliers
+
+
+def _keep_query_connected_segment(
+    samples: list[dict[str, Any]],
+    *,
+    query_frame_index: int,
+    min_frames: int,
+    max_gap_frames: int = 0,
+) -> set[int]:
+    """Return the seed-anchored run, optionally spanning short visibility gaps."""
+    valid_frames = sorted(
+        int(sample.get("frame_index", 0))
+        for sample in samples
+        if _valid_sample(sample) and not bool(sample.get("quality_rejected", False))
+    )
+    if not valid_frames:
+        return set()
+    anchor = min(valid_frames, key=lambda frame: abs(frame - int(query_frame_index)))
+    runs: list[list[int]] = []
+    for frame in valid_frames:
+        missing_frames = frame - runs[-1][-1] - 1 if runs else None
+        if not runs or missing_frames is None or missing_frames > max(0, int(max_gap_frames)):
+            runs.append([frame])
+        else:
+            runs[-1].append(frame)
+    selected = next((run for run in runs if anchor in run), [])
+    return set(selected) if len(selected) >= max(1, int(min_frames)) else set()
 
 
 def _valid_sample(sample: dict[str, Any]) -> bool:

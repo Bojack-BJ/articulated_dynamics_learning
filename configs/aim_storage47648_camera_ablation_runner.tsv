@@ -1,0 +1,3 @@
+object_id	category	source_frame_index	camera_trajectory	protocol_note
+partnet_47648_current_orbit	door	499	current_orbit	Storage-47648 control with one current uniform-like orbit
+partnet_47648_front_loaded_orbit_v3	door	499	front_loaded_orbit	Storage-47648 corrected left-front-to-right-front observation with slower backside completion

@@ -90,6 +90,12 @@ def register(subparsers: Any) -> None:
         ),
     )
     batch_parser.add_argument(
+        "--stop-after",
+        choices=["recording", "tracking", "full"],
+        default="full",
+        help="Stop after dataset recording or pixel tracking instead of running the full pipeline",
+    )
+    batch_parser.add_argument(
         "--fuse-pixel-stride",
         type=int,
         default=8,
@@ -129,6 +135,17 @@ def register(subparsers: Any) -> None:
         "--no-generate-viewer",
         action="store_true",
         help="Skip the final visualize-pointcloud stage",
+    )
+    batch_parser.add_argument(
+        "--viewer-mode",
+        choices=["advanced", "classic"],
+        default="advanced",
+        help="Viewer implementation. Advanced includes flow controls, fused geometry, and MJCF mesh replay.",
+    )
+    batch_parser.add_argument(
+        "--viewer-axis-remap",
+        default="x,z,-y",
+        help="Visualization-only axis remap for the advanced viewer (default: x,z,-y).",
     )
     batch_parser.add_argument(
         "--dynamics-backend",

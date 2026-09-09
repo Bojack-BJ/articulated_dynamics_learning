@@ -1,0 +1,25 @@
+command: record-mujoco
+args:
+  model: outputs/gapartnet_pilot/models/gapartnet_7304.xml
+  category: microwave
+  object-id: gapartnet_microwave_7304
+  output-dir: outputs/gapartnet_recordings
+  duration-s: 2
+  fps: 15
+  width: 480
+  height: 352
+  control-mode: track
+  disable-gravity: true
+  disable-target-collision: true
+  perturbation-scale: 0.0
+  rgb-format: png
+  depth-format: png
+  mask-format: png
+  camera-distance: 3.0
+  camera-mode: triview
+  camera-triview-spacing-deg: 60
+  camera-elevation-deg: -15
+  camera-fovy-deg: 60
+  lookat: [0.0, 0.0, 0.0]
+  segmentation-masks: true
+  part-segmentation-masks: true

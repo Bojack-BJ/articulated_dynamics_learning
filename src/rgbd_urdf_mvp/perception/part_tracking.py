@@ -5,6 +5,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 from .part_pose import _centroid, _matvec3, _pose_payload, _relative_pose, _rotation_angle_from_matrix
@@ -16,6 +17,7 @@ from .pointcloud_fusion import (
     _load_depth_u16,
     _resolve_view_camera_poses,
     _resolve_view_depth_paths,
+    _resolve_view_intrinsics,
     _resolve_view_mask_paths,
     _resolve_view_part_mask_paths,
 )
@@ -35,15 +37,24 @@ class PartPixelTrackingConfig:
     frame_stride: int = 1
     seed_stride_px: int = 16
     max_tracks_per_part_view: int = 128
+    max_queries_per_forward: int = 512
     min_depth_m: float = 0.05
     max_depth_m: float = 6.0
     visibility_threshold: float = 0.5
+    depth_consistency_window_radius_px: int = 0
+    depth_consistency_max_delta_m: float = 0.08
+    repair_temporal_depth_spikes: bool = False
+    depth_spike_jump_threshold_m: float = 0.08
+    depth_spike_neighbor_tolerance_m: float = 0.03
+    depth_spike_max_run_frames: int = 2
     require_part_mask_consistency: bool = True
+    strict_object_mask_consistency: bool = False
     allow_backward_tracking: bool = True
     show_progress: bool = True
     export_cotracker_features: bool = False
     cotracker_features_output: str | Path | None = None
     dynamic_reseeding: bool = False
+    dynamic_reseed_bidirectional: bool = False
     reseed_interval_frames: int = 5
     reseed_coverage_radius_px: float = 12.0
     reseed_bbox_scale: float = 1.2
@@ -57,6 +68,7 @@ class TrackPartPoseEstimationConfig:
     output_json: str | Path | None = None
     min_tracks_per_part: int = 4
     anchor_part_id: int | None = None
+    anchor_selection: str = "metadata"
     quality_weighted: bool = False
     quality_weight_field: str = "timestep_quality_score"
     track_quality_field: str = "track_quality_score"
@@ -503,6 +515,153 @@ def _backproject_track_sample(
     return [float(value) for value in xyz_world], True, mask_consistent
 
 
+def _backproject_track_sample_depth_consistent(
+    u_float: float,
+    v_float: float,
+    depth_u16: list[list[int]],
+    part_mask_u16: list[list[int]] | None,
+    expected_part_id: int,
+    intrinsics: dict[str, float],
+    camera_pose: list[list[float]],
+    depth_convention: str,
+    min_depth_m: float,
+    max_depth_m: float,
+    require_part_mask_consistency: bool,
+    window_radius_px: int,
+    previous_depth_m: float | None,
+    max_delta_m: float,
+) -> tuple[list[float] | None, bool, bool, float | None]:
+    radius = max(0, int(window_radius_px))
+    if radius == 0:
+        xyz, valid, mask_consistent = _backproject_track_sample(
+            u_float,
+            v_float,
+            depth_u16,
+            part_mask_u16,
+            expected_part_id,
+            intrinsics,
+            camera_pose,
+            depth_convention,
+            min_depth_m,
+            max_depth_m,
+            require_part_mask_consistency,
+        )
+        u_coord = int(round(float(u_float)))
+        v_coord = int(round(float(v_float)))
+        depth_m = float(depth_u16[v_coord][u_coord]) / 1000.0 if valid else None
+        return xyz, valid, mask_consistent, depth_m
+
+    height = len(depth_u16)
+    width = len(depth_u16[0]) if height else 0
+    center_u = int(round(float(u_float)))
+    center_v = int(round(float(v_float)))
+    if center_u < 0 or center_v < 0 or center_u >= width or center_v >= height:
+        return None, False, False, None
+
+    def mask_matches(u_coord: int, v_coord: int) -> bool:
+        if part_mask_u16 is None:
+            return True
+        value = int(part_mask_u16[v_coord][u_coord])
+        return value > 0 if int(expected_part_id) < 0 else value == int(expected_part_id)
+
+    center_mask_consistent = mask_matches(center_u, center_v)
+    if require_part_mask_consistency and not center_mask_consistent:
+        return None, False, False, None
+
+    candidates: list[float] = []
+    for v_coord in range(max(0, center_v - radius), min(height, center_v + radius + 1)):
+        for u_coord in range(max(0, center_u - radius), min(width, center_u + radius + 1)):
+            if not mask_matches(u_coord, v_coord):
+                continue
+            depth_m = float(depth_u16[v_coord][u_coord]) / 1000.0
+            if min_depth_m <= depth_m <= max_depth_m:
+                candidates.append(depth_m)
+    if previous_depth_m is not None:
+        candidates = [value for value in candidates if abs(value - previous_depth_m) <= max_delta_m]
+    if not candidates:
+        return None, False, center_mask_consistent, None
+
+    candidates.sort()
+    selected_depth_m = candidates[len(candidates) // 2]
+    xyz_world = _camera_to_world_point(
+        u_coord=center_u,
+        v_coord=center_v,
+        depth_m=selected_depth_m,
+        intrinsics=intrinsics,
+        camera_pose=camera_pose,
+        depth_convention=depth_convention,
+    )
+    return [float(value) for value in xyz_world], True, center_mask_consistent, selected_depth_m
+
+
+def _repair_temporal_depth_spikes(
+    samples: list[dict[str, Any]],
+    *,
+    intrinsics: dict[str, float],
+    camera_poses: list[list[list[float]]],
+    depth_convention: str,
+    jump_threshold_m: float,
+    neighbor_tolerance_m: float,
+    max_run_frames: int,
+) -> int:
+    """Repair short A-B-A depth toggles without constraining persistent motion."""
+    if len(samples) < 3 or max_run_frames < 1:
+        return 0
+    repaired = 0
+    index = 1
+    while index < len(samples) - 1:
+        before_depth = samples[index - 1].get("selected_depth_m")
+        if before_depth is None:
+            index += 1
+            continue
+        accepted_end: int | None = None
+        for run_length in range(1, max_run_frames + 1):
+            after_index = index + run_length
+            if after_index >= len(samples):
+                break
+            after_depth = samples[after_index].get("selected_depth_m")
+            run_depths = [samples[offset].get("selected_depth_m") for offset in range(index, after_index)]
+            if after_depth is None or any(value is None for value in run_depths):
+                continue
+            if abs(float(before_depth) - float(after_depth)) > neighbor_tolerance_m:
+                continue
+            baseline = 0.5 * (float(before_depth) + float(after_depth))
+            if all(abs(float(value) - baseline) > jump_threshold_m for value in run_depths):
+                accepted_end = after_index
+                break
+        if accepted_end is None:
+            index += 1
+            continue
+        before_value = float(before_depth)
+        after_value = float(samples[accepted_end]["selected_depth_m"])
+        interpolation_span = accepted_end - index + 1
+        for offset in range(index, accepted_end):
+            alpha = (offset - index + 1) / interpolation_span
+            replacement_depth = (1.0 - alpha) * before_value + alpha * after_value
+            sample = samples[offset]
+            uv = sample.get("uv")
+            frame_index = int(sample.get("frame_index", offset))
+            if not isinstance(uv, list) or len(uv) != 2 or not 0 <= frame_index < len(camera_poses):
+                continue
+            sample["raw_selected_depth_m"] = sample.get("selected_depth_m")
+            sample["selected_depth_m"] = replacement_depth
+            sample["xyz_world"] = [
+                float(value)
+                for value in _camera_to_world_point(
+                    u_coord=int(round(float(uv[0]))),
+                    v_coord=int(round(float(uv[1]))),
+                    depth_m=replacement_depth,
+                    intrinsics=intrinsics,
+                    camera_pose=camera_poses[frame_index],
+                    depth_convention=depth_convention,
+                )
+            ]
+            sample["depth_spike_repaired"] = True
+            repaired += 1
+        index = accepted_end
+    return repaired
+
+
 def _choose_reference_frame_for_part(
     part_id: int,
     requested_reference_frame: int,
@@ -581,11 +740,37 @@ def _choose_anchor_part_id(part_metadata: dict[int, dict[str, Any]], track_count
     if override is not None and override in track_counts:
         return int(override)
     for part_id, raw_part in sorted(part_metadata.items()):
-        if str(raw_part.get("role")) in {"base", "static"} and part_id in track_counts:
+        if str(raw_part.get("role")) in {"base", "static", "fixed_child"} and part_id in track_counts:
             return part_id
     if not track_counts:
         return 0
     return max(sorted(track_counts), key=lambda part_id: track_counts[part_id])
+
+
+def _track_cluster_motion_range(tracks: list[dict[str, Any]], min_tracks_per_frame: int) -> float:
+    positions_by_frame: dict[int, list[list[float]]] = {}
+    for track in tracks:
+        for sample in track.get("samples", []):
+            if not bool(sample.get("visible", False)) or not bool(sample.get("depth_valid", True)):
+                continue
+            xyz_world = sample.get("xyz_world")
+            if not isinstance(xyz_world, list) or len(xyz_world) != 3:
+                continue
+            positions_by_frame.setdefault(int(sample.get("frame_index", 0)), []).append(
+                [float(value) for value in xyz_world]
+            )
+    centroids = [
+        [float(median(point[axis] for point in positions_by_frame[frame_index])) for axis in range(3)]
+        for frame_index in sorted(positions_by_frame)
+        if len(positions_by_frame[frame_index]) >= min_tracks_per_frame
+    ]
+    if len(centroids) < 2:
+        return math.inf
+    return max(
+        math.sqrt(sum((first[axis] - second[axis]) ** 2 for axis in range(3)))
+        for first in centroids
+        for second in centroids
+    )
 
 
 class PartPixelTracker:
@@ -593,6 +778,7 @@ class PartPixelTracker:
         self.config = config
 
     def track(self) -> Path:
+        total_started = time.perf_counter()
         try:
             import torch
         except ImportError as exc:  # pragma: no cover
@@ -600,6 +786,7 @@ class PartPixelTracker:
                 "Part pixel tracking requires PyTorch and CoTracker. Install the tracking extra and CoTracker first."
             ) from exc
 
+        setup_started = time.perf_counter()
         episode_path = Path(self.config.episode_path).resolve()
         episode_root = episode_path.parent
         episode = load_episode(episode_path)
@@ -621,7 +808,9 @@ class PartPixelTracker:
         resource_samples: list[dict[str, Any]] = []
         _reset_torch_peak_stats(torch, device)
         resource_samples.append(_torch_resource_snapshot(torch, device, "before_model_load"))
+        model_started = time.perf_counter()
         model = _load_cotracker_model(self.config, torch, device)
+        model_load_s = time.perf_counter() - model_started
         resource_samples.append(_torch_resource_snapshot(torch, device, "after_model_load"))
         depth_convention = _depth_convention(episode.metadata)
         part_segmentation = (
@@ -677,6 +866,10 @@ class PartPixelTracker:
             for part_id in sorted(part_metadata)
         }
         depth_cache: dict[Path, list[list[int]]] = {}
+        setup_s = time.perf_counter() - setup_started - model_load_s
+        video_load_s = 0.0
+        cotracker_forward_s = 0.0
+        track_postprocess_s = 0.0
         progress = _ProgressPrinter(
             total_steps=view_count * max(1, len(part_metadata)),
             enabled=bool(self.config.show_progress),
@@ -700,17 +893,27 @@ class PartPixelTracker:
                     f"loading RGB video for view {view_index + 1}/{view_count}",
                 )
                 view_rgb_paths = [paths[view_index] for paths in rgb_paths_by_frame_view]
+                view_intrinsics = _resolve_view_intrinsics(
+                    episode.camera_intrinsics, episode.metadata, view_index
+                )
+                video_started = time.perf_counter()
                 video = _load_video_tensor(view_rgb_paths, torch, device)
+                video_load_s += time.perf_counter() - video_started
                 resource_samples.append(_torch_resource_snapshot(torch, device, f"view_{view_index}_video_loaded"))
 
                 def run_query_batch(
-                    part_id: int,
                     query_records: list[dict[str, Any]],
                     stage: str,
                 ) -> int:
-                    nonlocal track_id
+                    nonlocal track_id, cotracker_forward_s, track_postprocess_s
                     if not query_records:
                         return 0
+                    query_limit = max(1, int(self.config.max_queries_per_forward))
+                    if len(query_records) > query_limit:
+                        return sum(
+                            run_query_batch(query_records[start : start + query_limit], f"{stage}_chunk_{start // query_limit}")
+                            for start in range(0, len(query_records), query_limit)
+                        )
                     query_payload = [
                         [float(record["frame_index"]), float(record["u"]), float(record["v"])]
                         for record in query_records
@@ -718,11 +921,18 @@ class PartPixelTracker:
                     queries = torch.tensor([query_payload], dtype=torch.float32, device=device)
                     if feature_capture is not None:
                         feature_capture.reset()
+                    forward_started = time.perf_counter()
                     pred_tracks, pred_visibility = model(
                         video,
                         queries=queries,
                         backward_tracking=bool(self.config.allow_backward_tracking),
                     )
+                    if str(device).startswith("cuda") and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    elif str(device).startswith("mps") and hasattr(torch, "mps"):
+                        torch.mps.synchronize()
+                    cotracker_forward_s += time.perf_counter() - forward_started
+                    postprocess_started = time.perf_counter()
                     resource_samples.append(
                         _torch_resource_snapshot(torch, device, f"view_{view_index}_{stage}_cotracker_done")
                     )
@@ -735,12 +945,14 @@ class PartPixelTracker:
                     )
                     emitted = 0
                     for query_index, record in enumerate(query_records):
+                        part_id = int(record["part_id"])
                         reference_frame = int(record["frame_index"])
                         seed_u = int(record["u"])
                         seed_v = int(record["v"])
                         dynamic_birth = bool(record.get("dynamic", False))
                         samples: list[dict[str, Any]] = []
                         reference_xyz: list[float] | None = None
+                        previous_depth_m: float | None = None
                         for frame_index, frame in enumerate(sampled_frames):
                             if frame_index >= pred_tracks.shape[1]:
                                 continue
@@ -753,13 +965,14 @@ class PartPixelTracker:
                                 if view_index < len(part_masks_by_frame_view[frame_index])
                                 else None
                             )
-                            xyz, depth_valid, mask_consistent = _backproject_track_sample(
+                            xyz, depth_valid, mask_consistent, selected_depth_m = (
+                                _backproject_track_sample_depth_consistent(
                                 u_float=float(uv[0]),
                                 v_float=float(uv[1]),
                                 depth_u16=load_depth_cached(depth_path),
                                 part_mask_u16=load_depth_cached(part_mask_path) if part_mask_path is not None else None,
                                 expected_part_id=-1 if object_mask_mode else part_id,
-                                intrinsics=episode.camera_intrinsics,
+                                intrinsics=view_intrinsics,
                                 camera_pose=camera_poses_by_frame_view[frame_index][view_index],
                                 depth_convention=depth_convention,
                                 min_depth_m=float(self.config.min_depth_m),
@@ -767,10 +980,24 @@ class PartPixelTracker:
                                 # Object masks are soft evidence: an opening door may
                                 # legitimately expand beyond a propagated mask.
                                 require_part_mask_consistency=(
-                                    bool(self.config.require_part_mask_consistency) and not object_mask_mode
+                                    bool(self.config.require_part_mask_consistency)
+                                    and (
+                                        not object_mask_mode
+                                        or bool(self.config.strict_object_mask_consistency)
+                                    )
                                 ),
+                                window_radius_px=int(self.config.depth_consistency_window_radius_px),
+                                previous_depth_m=previous_depth_m,
+                                max_delta_m=float(self.config.depth_consistency_max_delta_m),
                             )
-                            after_birth = not dynamic_birth or frame_index >= reference_frame
+                            )
+                            if depth_valid and selected_depth_m is not None:
+                                previous_depth_m = selected_depth_m
+                            after_birth = (
+                                not dynamic_birth
+                                or bool(self.config.dynamic_reseed_bidirectional)
+                                or frame_index >= reference_frame
+                            )
                             visible = (
                                 after_birth
                                 and tracker_visibility >= float(self.config.visibility_threshold)
@@ -789,10 +1016,27 @@ class PartPixelTracker:
                                     "visible": bool(visible),
                                     "tracker_visibility": float(tracker_visibility),
                                     "depth_valid": bool(depth_valid),
+                                    "selected_depth_m": selected_depth_m,
                                     "mask_consistent": bool(mask_consistent),
                                     "confidence": float(tracker_visibility if visible else 0.0),
                                 }
                             )
+                        if self.config.repair_temporal_depth_spikes:
+                            _repair_temporal_depth_spikes(
+                                samples,
+                                intrinsics=view_intrinsics,
+                                camera_poses=[poses[view_index] for poses in camera_poses_by_frame_view],
+                                depth_convention=depth_convention,
+                                jump_threshold_m=float(self.config.depth_spike_jump_threshold_m),
+                                neighbor_tolerance_m=float(self.config.depth_spike_neighbor_tolerance_m),
+                                max_run_frames=int(self.config.depth_spike_max_run_frames),
+                            )
+                            reference_sample = next(
+                                (sample for sample in samples if int(sample["frame_index"]) == reference_frame),
+                                None,
+                            )
+                            if reference_sample is not None and reference_sample.get("xyz_world") is not None:
+                                reference_xyz = [float(value) for value in reference_sample["xyz_world"]]
                         if reference_xyz is None:
                             continue
                         tracks.append(
@@ -814,9 +1058,11 @@ class PartPixelTracker:
                             feature_embeddings.append(query_features[query_index])
                         track_id += 1
                         emitted += 1
+                    track_postprocess_s += time.perf_counter() - postprocess_started
                     return emitted
 
                 view_track_start = len(tracks)
+                initial_queries: list[dict[str, Any]] = []
                 for part_id in sorted(part_metadata):
                     reference_frame = reference_frame_by_part[part_id]
                     if reference_frame >= len(part_masks_by_frame_view):
@@ -847,26 +1093,30 @@ class PartPixelTracker:
                         )
                         continue
 
-                    progress.update(
-                        completed_steps,
-                        (
-                            f"view {view_index + 1}/{view_count} {part_name}: "
-                            f"running CoTracker on {len(seed_pixels)} seeds x {len(sampled_frames)} frames"
-                        ),
-                    )
-                    emitted = run_query_batch(
-                        part_id,
-                        [
-                            {"frame_index": reference_frame, "u": u_coord, "v": v_coord, "dynamic": False}
-                            for u_coord, v_coord in seed_pixels
-                        ],
-                        f"part_{part_id}",
+                    initial_queries.extend(
+                        {
+                            "part_id": part_id,
+                            "frame_index": reference_frame,
+                            "u": u_coord,
+                            "v": v_coord,
+                            "dynamic": False,
+                        }
+                        for u_coord, v_coord in seed_pixels
                     )
                     completed_steps += 1
                     progress.update(
                         completed_steps,
-                        f"view {view_index + 1}/{view_count} {part_name}: emitted {emitted} tracks",
+                        f"view {view_index + 1}/{view_count} {part_name}: queued {len(seed_pixels)} seeds",
                     )
+                if initial_queries:
+                    progress.update(
+                        completed_steps,
+                        (
+                            f"view {view_index + 1}/{view_count}: running one CoTracker forward "
+                            f"for {len(initial_queries)} seeds across {len(part_metadata)} parts"
+                        ),
+                    )
+                    run_query_batch(initial_queries, "all_parts")
 
                 if bool(self.config.dynamic_reseeding):
                     initial_view_tracks = tracks[view_track_start:]
@@ -879,6 +1129,7 @@ class PartPixelTracker:
                     ]
                     bbox = _expanded_robust_bbox(envelope_points, self.config.reseed_bbox_scale)
                     interval = max(1, int(self.config.reseed_interval_frames))
+                    all_dynamic_queries: list[dict[str, Any]] = []
                     for part_id in sorted(part_metadata):
                         part_view_tracks = [
                             track for track in initial_view_tracks if int(track.get("part_id", -1)) == part_id
@@ -926,7 +1177,7 @@ class PartPixelTracker:
                                     depth_u16=frame_depth,
                                     part_mask_u16=frame_mask,
                                     expected_part_id=expected_part_id,
-                                    intrinsics=episode.camera_intrinsics,
+                                    intrinsics=view_intrinsics,
                                     camera_pose=camera_poses_by_frame_view[frame_index][view_index],
                                     depth_convention=depth_convention,
                                     min_depth_m=float(self.config.min_depth_m),
@@ -942,22 +1193,31 @@ class PartPixelTracker:
                                     continue
                                 accepted_xyz.append(xyz)
                                 dynamic_queries.append(
-                                    {"frame_index": frame_index, "u": u_coord, "v": v_coord, "dynamic": True}
+                                    {
+                                        "part_id": part_id,
+                                        "frame_index": frame_index,
+                                        "u": u_coord,
+                                        "v": v_coord,
+                                        "dynamic": True,
+                                    }
                                 )
                         if dynamic_queries:
-                            progress.update(
-                                completed_steps,
-                                (
-                                    f"view {view_index + 1}/{view_count} part {part_id}: "
-                                    f"tracking {len(dynamic_queries)} dynamic seeds"
-                                ),
-                            )
-                            run_query_batch(part_id, dynamic_queries, f"part_{part_id}_dynamic_reseed")
+                            all_dynamic_queries.extend(dynamic_queries)
+                    if all_dynamic_queries:
+                        progress.update(
+                            completed_steps,
+                            (
+                                f"view {view_index + 1}/{view_count}: tracking "
+                                f"{len(all_dynamic_queries)} dynamic seeds across all parts"
+                            ),
+                        )
+                        run_query_batch(all_dynamic_queries, "all_parts_dynamic_reseed")
         progress.finish(f"done; emitted {len(tracks)} total tracks")
         if feature_capture is not None:
             feature_capture.close()
         resource_samples.append(_torch_resource_snapshot(torch, device, "finished"))
 
+        feature_save_started = time.perf_counter()
         feature_artifact: dict[str, Any] | None = None
         if feature_capture is not None:
             if not feature_embeddings:
@@ -983,14 +1243,14 @@ class PartPixelTracker:
                 "pooling": "final-updateformer-token-temporal-mean-l2",
                 "diagnostic_only": True,
             }
+        feature_serialization_s = time.perf_counter() - feature_save_started
 
         track_counts: dict[int, int] = {}
         for track in tracks:
             part_id = int(track["part_id"])
             track_counts[part_id] = track_counts.get(part_id, 0) + 1
 
-        save_json(
-            {
+        payload = {
                 "input_episode_path": str(episode_path),
                 "estimator": "cotracker-depth-backprojection",
                 "frame_count": len(sampled_frames),
@@ -1001,6 +1261,24 @@ class PartPixelTracker:
                 "device": device,
                 "resource_usage": {
                     "torch": _summarize_torch_resource_samples(resource_samples),
+                },
+                "runtime_profile": {
+                    "scope": "cotracker_tracking_feature_generation_and_rgbd_lifting",
+                    "episode_and_camera_setup_s": setup_s,
+                    "model_load_s": model_load_s,
+                    "video_load_s": video_load_s,
+                    "cotracker_accelerator_forward_s": cotracker_forward_s,
+                    "rgbd_lifting_and_track_postprocess_s": track_postprocess_s,
+                    "feature_serialization_s": feature_serialization_s,
+                    "artifact_serialization_s": None,
+                    "total_wall_s": None,
+                    "device": device,
+                    "view_count": view_count,
+                    "source_frame_count": len(episode.frames),
+                    "tracked_frame_count": len(sampled_frames),
+                    "track_count": len(tracks),
+                    "max_queries_per_forward": self.config.max_queries_per_forward,
+                    "inter_object_parallelism": 1,
                 },
                 "cotracker_model": self.config.cotracker_model,
                 "cotracker_repo": None if self.config.cotracker_repo is None else str(self.config.cotracker_repo),
@@ -1019,10 +1297,18 @@ class PartPixelTracker:
                     "min_depth_m": self.config.min_depth_m,
                     "max_depth_m": self.config.max_depth_m,
                     "visibility_threshold": self.config.visibility_threshold,
+                    "depth_consistency_window_radius_px": self.config.depth_consistency_window_radius_px,
+                    "depth_consistency_max_delta_m": self.config.depth_consistency_max_delta_m,
+                    "repair_temporal_depth_spikes": self.config.repair_temporal_depth_spikes,
+                    "depth_spike_jump_threshold_m": self.config.depth_spike_jump_threshold_m,
+                    "depth_spike_neighbor_tolerance_m": self.config.depth_spike_neighbor_tolerance_m,
+                    "depth_spike_max_run_frames": self.config.depth_spike_max_run_frames,
                     "require_part_mask_consistency": self.config.require_part_mask_consistency,
+                    "strict_object_mask_consistency": self.config.strict_object_mask_consistency,
                     "allow_backward_tracking": self.config.allow_backward_tracking,
                     "export_cotracker_features": self.config.export_cotracker_features,
                     "dynamic_reseeding": self.config.dynamic_reseeding,
+                    "dynamic_reseed_bidirectional": self.config.dynamic_reseed_bidirectional,
                     "reseed_interval_frames": self.config.reseed_interval_frames,
                     "reseed_coverage_radius_px": self.config.reseed_coverage_radius_px,
                     "reseed_bbox_scale": self.config.reseed_bbox_scale,
@@ -1037,8 +1323,16 @@ class PartPixelTracker:
                     for part_id, count in sorted(track_counts.items())
                 },
                 "tracks": tracks,
-            },
-            output_json,
+            }
+        artifact_save_started = time.perf_counter()
+        payload["runtime_profile"]["total_wall_s"] = time.perf_counter() - total_started
+        save_json(payload, output_json)
+        runtime_profile = dict(payload["runtime_profile"])
+        runtime_profile["artifact_serialization_s"] = time.perf_counter() - artifact_save_started
+        runtime_profile["total_wall_s"] = time.perf_counter() - total_started
+        save_json(
+            runtime_profile,
+            output_json.with_name(f"{output_json.stem}.runtime.json"),
         )
         return output_json
 
@@ -1075,11 +1369,20 @@ class TrackPartPoseEstimator:
         if not tracks_by_part:
             raise ValueError("No positive part_id tracks found.")
 
-        anchor_part_id = _choose_anchor_part_id(
-            part_metadata,
-            {part_id: len(items) for part_id, items in tracks_by_part.items()},
-            self.config.anchor_part_id,
-        )
+        track_counts = {part_id: len(items) for part_id, items in tracks_by_part.items()}
+        anchor_part_id = _choose_anchor_part_id(part_metadata, track_counts, self.config.anchor_part_id)
+        anchor_motion_scores: dict[int, float] = {}
+        if self.config.anchor_part_id is None and self.config.anchor_selection == "lowest-motion":
+            anchor_motion_scores = {
+                part_id: _track_cluster_motion_range(items, max(3, self.config.min_tracks_per_part))
+                for part_id, items in tracks_by_part.items()
+            }
+            finite_scores = {part_id: score for part_id, score in anchor_motion_scores.items() if math.isfinite(score)}
+            if finite_scores:
+                anchor_part_id = min(
+                    sorted(finite_scores),
+                    key=lambda part_id: (finite_scores[part_id], -track_counts[part_id], part_id),
+                )
         part_tracks: dict[int, dict[str, Any]] = {}
         frame_times = self._frame_times(tracks)
         source_frame_indices = self._source_frame_indices(tracks, sampled_frame_indices)
@@ -1246,6 +1549,12 @@ class TrackPartPoseEstimator:
                 },
                 "anchor_part_id": anchor_part_id,
                 "anchor_part_name": part_tracks[anchor_part_id]["name"],
+                "anchor_selection": self.config.anchor_selection,
+                "anchor_motion_range_m": {
+                    str(part_id): float(score)
+                    for part_id, score in sorted(anchor_motion_scores.items())
+                    if math.isfinite(score)
+                },
                 "parts": [part_tracks[part_id] for part_id in sorted(part_tracks)],
             },
             output_json,

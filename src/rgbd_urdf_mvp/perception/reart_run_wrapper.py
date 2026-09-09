@@ -241,6 +241,7 @@ def _install_optional_dependency_fallbacks() -> None:
     if _module_spec_missing("pointnet2_cuda"):
         pointnet2_module = types.ModuleType("networks.pointnet_lib.pointnet2_utils")
         pointnet2_module.furthest_point_sample = _furthest_point_sample_fallback
+        pointnet2_module.ball_query = _ball_query_fallback
         sys.modules["networks.pointnet_lib.pointnet2_utils"] = pointnet2_module
 
 
@@ -306,6 +307,21 @@ def _furthest_point_sample_fallback(xyz, npoint: int):
         distance[mask] = dist[mask]
         farthest = distance.max(dim=-1).indices
     return centroids
+
+
+def _ball_query_fallback(radius: float, nsample: int, xyz, new_xyz):
+    """Match ReArt's PointNet++ CPU ball-query semantics with torch tensors."""
+    batch_size, point_count, _channels = xyz.shape
+    sample_count = new_xyz.shape[1]
+    nsample = min(int(nsample), point_count)
+    distances = _batched_squared_cdist(new_xyz, xyz)
+    nearest = distances.min(dim=-1).indices.unsqueeze(-1)
+    indices = torch.arange(point_count, dtype=torch.long, device=xyz.device)
+    indices = indices.view(1, 1, point_count).expand(batch_size, sample_count, point_count).clone()
+    indices[distances > float(radius) ** 2] = point_count
+    indices = indices.sort(dim=-1).values[:, :, :nsample]
+    fallback = nearest.expand(batch_size, sample_count, nsample)
+    return torch.where(indices == point_count, fallback, indices)
 
 
 def _patch_reart_real_sequence(reart_root: Path) -> None:

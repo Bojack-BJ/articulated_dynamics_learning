@@ -1,0 +1,5 @@
+object_id	category	paper_object_label	interaction_frames	fps	source_frame_index	protocol_note
+partnet_47024	door	Storage-47024	200	15	199	Paper-listed object; paper-like AiM acquisition and large full-limit staggered excitation
+partnet_11304	refrigerator	Fridge-11304	200	15	199	Paper-listed object; paper-like AiM acquisition and large full-limit staggered excitation
+partnet_47648	door	Storage-47648	500	15	499	Paper-listed complex object; paper-like AiM acquisition and large full-limit staggered excitation
+partnet_31249	door	Table-31249	500	15	499	Paper-listed complex object; paper-like AiM acquisition and large full-limit staggered excitation

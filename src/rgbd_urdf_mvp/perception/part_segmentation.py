@@ -30,29 +30,62 @@ def build_mujoco_body_part_segmentation(
     target_geom_ids: set[int],
     hidden_geom_ids: set[int] | None = None,
 ) -> dict[str, Any]:
+    """Build semantic parts as maximal fixed-connected MuJoCo body groups.
+
+    A body carrying a joint starts a new kinematic part. Bodies without a joint
+    are rigidly attached to their parent and therefore inherit its part. The
+    root body always anchors the base part even when it has a free placement
+    joint. Raw body membership is retained for diagnostics.
+    """
     hidden_geom_ids = hidden_geom_ids or set()
     descendant_body_ids = _collect_descendant_body_ids(model, int(root_body_id))
     target_geom_ids = {int(geom_id) for geom_id in target_geom_ids}
 
-    parts: list[PartSegmentationPart] = []
-    part_id = 1
-    for body_id in sorted(descendant_body_ids):
-        body_geom_ids = sorted(
-            geom_id for geom_id in target_geom_ids if int(model.geom_bodyid[geom_id]) == body_id
-        )
-        if not body_geom_ids:
-            continue
-
-        body_name = _body_name(mujoco, model, body_id)
-        parent_body_id = int(model.body_parentid[body_id])
-        parent_part_body_id = parent_body_id if parent_body_id in descendant_body_ids else None
-        joint_names = [
+    body_joint_names = {
+        body_id: [
             _joint_name(mujoco, model, joint_id)
             for joint_id in range(model.njnt)
             if int(model.jnt_bodyid[joint_id]) == body_id
         ]
+        for body_id in descendant_body_ids
+    }
+    body_anchor: dict[int, int] = {}
+    for body_id in _body_tree_order(model, int(root_body_id), descendant_body_ids):
+        if body_id == int(root_body_id) or body_joint_names[body_id]:
+            body_anchor[body_id] = body_id
+        else:
+            parent_body_id = int(model.body_parentid[body_id])
+            body_anchor[body_id] = body_anchor[parent_body_id]
+
+    anchor_members: dict[int, list[int]] = {}
+    for body_id, anchor_body_id in body_anchor.items():
+        anchor_members.setdefault(anchor_body_id, []).append(body_id)
+
+    parts: list[PartSegmentationPart] = []
+    body_to_part_id: dict[int, int] = {}
+    for body_id in sorted(anchor_members):
+        member_body_ids = sorted(anchor_members[body_id])
+        body_geom_ids = sorted(
+            geom_id
+            for geom_id in target_geom_ids
+            if int(model.geom_bodyid[geom_id]) in member_body_ids
+        )
+        if not body_geom_ids:
+            continue
+        part_id = len(parts) + 1
+
+        body_name = _body_name(mujoco, model, body_id)
+        parent_body_id = int(model.body_parentid[body_id])
+        parent_part_body_id = (
+            body_anchor[parent_body_id]
+            if parent_body_id in descendant_body_ids and body_id != int(root_body_id)
+            else None
+        )
+        joint_names = body_joint_names[body_id]
         visible_geom_ids = [geom_id for geom_id in body_geom_ids if geom_id not in hidden_geom_ids]
-        role = "base" if body_id == int(root_body_id) else ("articulated" if joint_names else "fixed_child")
+        role = "base" if body_id == int(root_body_id) else "articulated"
+        for member_body_id in member_body_ids:
+            body_to_part_id[member_body_id] = part_id
         parts.append(
             PartSegmentationPart(
                 part_id=part_id,
@@ -73,18 +106,98 @@ def build_mujoco_body_part_segmentation(
                 metadata={
                     "geom_count": len(body_geom_ids),
                     "visible_geom_count": len(visible_geom_ids),
+                    "member_body_ids": member_body_ids,
+                    "member_body_names": [
+                        _body_name(mujoco, model, member_body_id)
+                        for member_body_id in member_body_ids
+                    ],
+                    "fixed_connected_body_count": len(member_body_ids),
                 },
             )
         )
-        part_id += 1
 
     return {
         "provider": "mujoco-body-geom-prior",
-        "version": 1,
+        "version": 2,
+        "ontology": "maximal-fixed-joint-connected-components",
         "mask_encoding": "indexed-mask-u16",
         "background_part_id": 0,
         "parts": [part.to_dict() for part in parts],
+        "raw_body_to_part_id": {
+            str(body_id): int(part_id) for body_id, part_id in sorted(body_to_part_id.items())
+        },
     }
+
+
+def collapse_fixed_connected_parts(part_segmentation: dict[str, Any]) -> dict[str, Any]:
+    """Convert a legacy one-body-per-part artifact to the kinematic ontology.
+
+    Legacy recorder artifacts identify a fixed child through ``role=fixed_child``
+    and its ``parent_body_id``. This conversion is deterministic and idempotent;
+    it never uses visibility, track coverage, or predictions from a method.
+    """
+    if part_segmentation.get("ontology") == "maximal-fixed-joint-connected-components":
+        return part_segmentation
+    raw_parts = [part for part in part_segmentation.get("parts", []) if isinstance(part, dict)]
+    by_body = {int(part["body_id"]): part for part in raw_parts if part.get("body_id") is not None}
+    anchor_by_body: dict[int, int] = {}
+
+    def anchor(body_id: int) -> int:
+        if body_id in anchor_by_body:
+            return anchor_by_body[body_id]
+        part = by_body[body_id]
+        parent = part.get("parent_body_id")
+        if part.get("role") != "fixed_child" or parent is None or int(parent) not in by_body:
+            value = body_id
+        else:
+            value = anchor(int(parent))
+        anchor_by_body[body_id] = value
+        return value
+
+    for body_id in by_body:
+        anchor(body_id)
+    groups: dict[int, list[dict[str, Any]]] = {}
+    for body_id, part in by_body.items():
+        groups.setdefault(anchor_by_body[body_id], []).append(part)
+
+    collapsed_parts: list[dict[str, Any]] = []
+    raw_part_to_part_id: dict[str, int] = {}
+    for new_part_id, anchor_body_id in enumerate(sorted(groups), start=1):
+        members = sorted(groups[anchor_body_id], key=lambda item: int(item["body_id"]))
+        anchor_part = by_body[anchor_body_id]
+        collapsed = dict(anchor_part)
+        collapsed["part_id"] = new_part_id
+        collapsed["role"] = "base" if anchor_part.get("role") == "base" else "articulated"
+        collapsed["geom_ids"] = sorted(
+            {int(value) for member in members for value in member.get("geom_ids", [])}
+        )
+        collapsed["geom_names"] = [
+            str(value) for member in members for value in member.get("geom_names", [])
+        ]
+        collapsed["visible_geom_ids"] = sorted(
+            {int(value) for member in members for value in member.get("visible_geom_ids", [])}
+        )
+        metadata = dict(collapsed.get("metadata", {}))
+        metadata.update({
+            "member_body_ids": [int(member["body_id"]) for member in members],
+            "member_body_names": [str(member.get("body_name", "")) for member in members],
+            "fixed_connected_body_count": len(members),
+            "legacy_raw_part_ids": [int(member["part_id"]) for member in members],
+        })
+        collapsed["metadata"] = metadata
+        collapsed_parts.append(collapsed)
+        for member in members:
+            raw_part_to_part_id[str(int(member["part_id"]))] = new_part_id
+
+    output = dict(part_segmentation)
+    output.update({
+        "version": 2,
+        "ontology": "maximal-fixed-joint-connected-components",
+        "parts": collapsed_parts,
+        "raw_part_to_part_id": raw_part_to_part_id,
+        "legacy_raw_parts": raw_parts,
+    })
+    return output
 
 
 def geom_to_part_id_lookup(part_segmentation: dict[str, Any] | None) -> dict[int, int]:
@@ -150,6 +263,24 @@ def _collect_descendant_body_ids(model, root_body_id: int) -> set[int]:
                 descendants.add(int(body_id))
                 changed = True
     return descendants
+
+
+def _body_tree_order(model, root_body_id: int, body_ids: set[int]) -> list[int]:
+    ordered: list[int] = []
+    pending = [int(root_body_id)]
+    while pending:
+        body_id = pending.pop(0)
+        ordered.append(body_id)
+        pending.extend(
+            sorted(
+                candidate
+                for candidate in body_ids
+                if candidate not in ordered
+                and candidate not in pending
+                and int(model.body_parentid[candidate]) == body_id
+            )
+        )
+    return ordered
 
 
 def _body_name(mujoco, model, body_id: int) -> str:

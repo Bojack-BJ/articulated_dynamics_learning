@@ -1,0 +1,4 @@
+method	manifest	slot_model	gpu
+cotracker_only	/lumos-vePFS/suzhou/Users/lixiaotong/articulated_relation_training/outputs/partnet_core_v1/cotracker_learning_manifest.tsv	/lumos-vePFS/suzhou/Users/lixiaotong/articulated_relation_training/outputs/partnet_core_v1_training/cotracker_slots/motion_part_slots.pt	1
+tapip_only	/lumos-vePFS/suzhou/Users/lixiaotong/articulated_relation_training/outputs/partnet_core_v1_tapip/tapip_learning_manifest.tsv	/lumos-vePFS/suzhou/Users/lixiaotong/articulated_relation_training/outputs/partnet_core_v1_training/tapip_slots/motion_part_slots.pt	6
+hybrid	/lumos-vePFS/suzhou/Users/lixiaotong/articulated_relation_training/outputs/partnet_core_v1_tapip/hybrid_learning_manifest.tsv	/lumos-vePFS/suzhou/Users/lixiaotong/articulated_relation_training/outputs/partnet_core_v1_training/hybrid_slots/motion_part_slots.pt	7

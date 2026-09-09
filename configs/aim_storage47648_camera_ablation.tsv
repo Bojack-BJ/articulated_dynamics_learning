@@ -1,0 +1,3 @@
+object_id	recording_id	category	paper_object_label	interaction_frames	fps	source_frame_index	recording_protocol	aim_end_scan_views	camera_azimuth_start_deg	aim_interaction_elevation_amplitude_deg	interaction_camera_trajectory	aim_interaction_motion_end_fraction	protocol_note
+partnet_47648	partnet_47648_current_orbit	door	Storage-47648	500	15	499	aim_style	12	60	10	current_orbit	0.94	Uniform-like single orbit control with unchanged joint schedule
+partnet_47648	partnet_47648_front_loaded_orbit_v3	door	Storage-47648	500	15	499	aim_style	12	300	10	front_loaded_orbit	0.85	Left-front through center-front to right-front over 85 percent of the interaction, then a five-second smooth backside completion

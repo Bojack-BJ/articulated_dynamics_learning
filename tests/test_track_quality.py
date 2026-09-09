@@ -147,6 +147,107 @@ class TrackQualityTests(unittest.TestCase):
             self.assertIn("articulation_residual_m", enriched["tracks"][0]["samples"][0])
             self.assertIn("best_motion_type", enriched["tracks"][0]["track_quality"])
 
+    def test_analyzer_can_mask_large_3d_steps_without_dropping_track_alignment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tracks_path = root / "tracks.json"
+            tracks_path.write_text(
+                json.dumps({"tracks": [_track(7, [[0, 0, 0], [0.01, 0, 0], [0.20, 0, 0]])]}) + "\n"
+            )
+            outputs = TrackQualityAnalyzer().analyze(
+                TrackQualityConfig(
+                    input_tracks=tracks_path,
+                    output_dir=root / "quality",
+                    bad_timestep_threshold=0.0,
+                    mask_bad_timesteps=True,
+                    max_step_m=0.05,
+                )
+            )
+            enriched = json.loads(outputs["motion_tracks_with_quality"].read_text())
+            samples = enriched["tracks"][0]["samples"]
+            self.assertEqual(enriched["tracks"][0]["track_id"], 7)
+            self.assertTrue(samples[1]["visible"])
+            self.assertFalse(samples[2]["visible"])
+            self.assertEqual(samples[2]["quality_rejection_reasons"], ["step_too_large"])
+
+    def test_query_connected_segment_drops_post_jump_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            track = _track(7, [[0, 0, 0], [0.01, 0, 0], [0.02, 0, 0], [0.30, 0, 0], [0.31, 0, 0]])
+            track["query_frame_index"] = 1
+            tracks_path = root / "tracks.json"
+            tracks_path.write_text(json.dumps({"tracks": [track]}) + "\n")
+            outputs = TrackQualityAnalyzer().analyze(
+                TrackQualityConfig(
+                    input_tracks=tracks_path,
+                    output_dir=root / "quality",
+                    bad_timestep_threshold=0.0,
+                    mask_bad_timesteps=True,
+                    max_step_m=0.05,
+                    keep_query_connected_segment=True,
+                    min_query_connected_frames=2,
+                )
+            )
+            enriched = json.loads(outputs["motion_tracks_with_quality"].read_text())
+            samples = enriched["tracks"][0]["samples"]
+            self.assertEqual([sample["visible"] for sample in samples], [True, True, True, False, False])
+            self.assertIn("outside_query_connected_segment", samples[4]["quality_rejection_reasons"])
+
+    def test_query_connected_segment_spans_short_missing_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            track = _track(7, [[0, 0, 0], [0.01, 0, 0], [0.02, 0, 0], [0.03, 0, 0]])
+            track["query_frame_index"] = 0
+            track["samples"][1]["visible"] = False
+            tracks_path = root / "tracks.json"
+            tracks_path.write_text(json.dumps({"tracks": [track]}) + "\n")
+            outputs = TrackQualityAnalyzer().analyze(
+                TrackQualityConfig(
+                    input_tracks=tracks_path,
+                    output_dir=root / "quality",
+                    bad_timestep_threshold=0.0,
+                    mask_bad_timesteps=True,
+                    keep_query_connected_segment=True,
+                    query_connected_max_gap_frames=1,
+                )
+            )
+            enriched = json.loads(outputs["motion_tracks_with_quality"].read_text())
+            samples = enriched["tracks"][0]["samples"]
+            self.assertEqual([sample["visible"] for sample in samples], [True, False, True, True])
+            self.assertEqual(
+                enriched["track_quality"]["query_connected_max_gap_frames"], 1
+            )
+
+    def test_spatial_dbscan_masks_isolated_timestep_without_dropping_dense_parts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tracks = [
+                _track(index, [[0.005 * index, 0, 0], [0.005 * index, 0.01, 0]])
+                for index in range(5)
+            ]
+            tracks.append(_track(99, [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]]))
+            for track in tracks:
+                track["part_id"] = 1
+            tracks_path = root / "tracks.json"
+            tracks_path.write_text(json.dumps({"tracks": tracks}) + "\n")
+            outputs = TrackQualityAnalyzer().analyze(
+                TrackQualityConfig(
+                    input_tracks=tracks_path,
+                    output_dir=root / "quality",
+                    bad_timestep_threshold=0.0,
+                    mask_bad_timesteps=True,
+                    spatial_dbscan_eps_m=0.03,
+                    spatial_dbscan_min_samples=3,
+                )
+            )
+            enriched = json.loads(outputs["motion_tracks_with_quality"].read_text())
+            self.assertTrue(all(sample["visible"] for sample in enriched["tracks"][0]["samples"]))
+            self.assertTrue(all(not sample["visible"] for sample in enriched["tracks"][-1]["samples"]))
+            self.assertIn(
+                "spatial_dbscan_outlier",
+                enriched["tracks"][-1]["samples"][0]["quality_rejection_reasons"],
+            )
+
     def test_observation_weight_uses_track_and_timestep_quality_with_floor(self) -> None:
         track = {"track_quality": {"track_quality_score": 0.25}}
         sample = {"timestep_quality_score": 0.5}

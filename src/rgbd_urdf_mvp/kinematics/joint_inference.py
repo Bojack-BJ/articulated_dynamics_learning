@@ -4,7 +4,7 @@ import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import fmean
+from statistics import fmean, median
 from typing import Any
 
 from ..core.serialization import load_json, save_json
@@ -46,6 +46,19 @@ def _normalize(vec: list[float], fallback: list[float] | None = None) -> list[fl
     if length < 1e-9:
         return list(fallback) if fallback is not None else [0.0, 0.0, 0.0]
     return [value / length for value in vec]
+
+
+def _principal_eigenvector3(matrix: list[list[float]]) -> list[float]:
+    """Return the dominant axis of a symmetric 3x3 matrix without NumPy."""
+    seeds = ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0])
+    seed = max(seeds, key=lambda value: _norm(_matvec3(matrix, list(value))))
+    vector = list(seed)
+    for _ in range(32):
+        updated = _matvec3(matrix, vector)
+        if _norm(updated) < 1e-12:
+            return [1.0, 0.0, 0.0]
+        vector = _normalize(updated)
+    return vector
 
 
 def _cross(a: list[float], b: list[float]) -> list[float]:
@@ -593,8 +606,9 @@ class JointInferencer:
             parent_orientation["applied"] = True
             parent_orientation["reason"] = "anchor_cluster_has_larger_motion_than_child_cluster"
 
+        part_name = str(part.get("name") or f"part_{part.get('part_id', 0)}")
         return {
-            "name": f"{part.get('name', f'part_{part.get('part_id', 0)}')}_joint",
+            "name": f"{part_name}_joint",
             "parent_part_id": parent_part_id,
             "parent_name": parent_name,
             "child_part_id": child_part_id,
@@ -646,9 +660,8 @@ class JointInferencer:
             if len(samples) < 2:
                 continue
             samples = sorted(samples, key=lambda item: int(item.get("frame_index", 0)))
-            start = [float(value) for value in samples[0]["xyz_world"]]
-            end = [float(value) for value in samples[-1]["xyz_world"]]
-            motions.append(_distance(start, end))
+            points = [[float(value) for value in sample["xyz_world"]] for sample in samples]
+            motions.append(max(_distance(first, second) for first in points for second in points))
         if not motions:
             return None
         ordered = sorted(motions)
@@ -766,32 +779,66 @@ class JointInferencer:
         if len(tracks) < self.config.min_track_residual_tracks:
             return None
         displacements = []
+        centered_track_paths: list[list[list[float]]] = []
         for track in tracks:
-            valid_samples = [
+            valid_samples = sorted(
+                [
                 sample
                 for sample in track.get("samples", [])
                 if _valid_track_sample(sample) and int(sample["frame_index"]) in allowed_frames
-            ]
+                ],
+                key=lambda sample: int(sample["frame_index"]),
+            )
             if len(valid_samples) < 2:
                 continue
             start = [float(value) for value in valid_samples[0]["xyz_world"]]
             end = [float(value) for value in valid_samples[-1]["xyz_world"]]
+            track_points = [[float(value) for value in sample["xyz_world"]] for sample in valid_samples]
+            track_center = _mean_point(track_points)
+            centered_track_paths.append([_subtract(point, track_center) for point in track_points])
             displacement = _subtract(end, start)
             if _norm(displacement) < self.config.delta_translation_epsilon_m:
                 continue
             displacements.append(displacement)
-        if len(displacements) < self.config.min_track_residual_tracks:
+        if len(displacements) >= self.config.min_track_residual_tracks:
+            mean_displacement = _mean_point(displacements)
+            if _norm(mean_displacement) >= self.config.translation_threshold_m:
+                axis = _normalize(mean_displacement, fallback=[1.0, 0.0, 0.0])
+                return {
+                    "source": "track_endpoint_centroid_displacement",
+                    "axis": axis,
+                    "track_count": len(displacements),
+                    "displacement": mean_displacement,
+                    "displacement_norm_m": _norm(mean_displacement),
+                }
+
+        # Endpoint displacement vanishes when a drawer is pulled out and returned.
+        # Accumulate per-track centered path covariance so changing visibility cannot
+        # turn a straight translation into a curved aggregate-centroid trajectory.
+        centered_points = [point for path in centered_track_paths for point in path]
+        if len(centered_points) < 3 * self.config.min_track_residual_tracks:
             return None
-        mean_displacement = _mean_point(displacements)
-        if _norm(mean_displacement) < self.config.translation_threshold_m:
+        covariance = [[0.0, 0.0, 0.0] for _ in range(3)]
+        for offset in centered_points:
+            for row in range(3):
+                for col in range(3):
+                    covariance[row][col] += offset[row] * offset[col]
+        axis = _principal_eigenvector3(covariance)
+        track_extents = []
+        for path in centered_track_paths:
+            projections = [_dot(point, axis) for point in path]
+            if projections:
+                track_extents.append(max(projections) - min(projections))
+        displacement_norm = float(median(track_extents)) if track_extents else 0.0
+        if displacement_norm < self.config.translation_threshold_m:
             return None
-        axis = _normalize(mean_displacement, fallback=[1.0, 0.0, 0.0])
         return {
-            "source": "track_endpoint_centroid_displacement",
+            "source": "track_centered_path_pca",
             "axis": axis,
-            "track_count": len(displacements),
-            "displacement": mean_displacement,
-            "displacement_norm_m": _norm(mean_displacement),
+            "track_count": len(tracks),
+            "sample_count": len(centered_points),
+            "displacement": _scale(axis, displacement_norm),
+            "displacement_norm_m": displacement_norm,
         }
 
     def _select_joint_type(

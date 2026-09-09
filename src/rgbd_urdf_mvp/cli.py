@@ -79,6 +79,42 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"path_mode": str(args.path), **result.to_dict()}, indent=2))
         return 0
 
+    if args.command == "convert-gapartnet-mjcf":
+        from .sim.gapartnet_adapter import GAPartNetMJCFAdapter, GAPartNetMJCFConfig
+
+        output = GAPartNetMJCFAdapter().convert(
+            GAPartNetMJCFConfig(
+                asset_dir=args.asset_dir,
+                output_mjcf=args.output_mjcf,
+                urdf_name=str(args.urdf_name),
+                density_kg_m3=float(args.density_kg_m3),
+                minimum_proxy_size_m=float(args.minimum_proxy_size_m),
+                add_floor=bool(args.add_floor),
+                source_up_axis=str(args.source_up_axis),
+            )
+        )
+        print(json.dumps({"gapartnet_mjcf": str(output.resolve())}, indent=2))
+        return 0
+
+    if args.command == "prepare-gapartnet-recordings":
+        from .sim.gapartnet_dataset import (
+            DEFAULT_PILOT_IDS,
+            GAPartNetDatasetConfig,
+            GAPartNetDatasetPreparer,
+        )
+
+        result = GAPartNetDatasetPreparer().prepare(
+            GAPartNetDatasetConfig(
+                archive_path=args.archive,
+                output_dir=args.output_dir,
+                object_ids=tuple(args.object_ids or DEFAULT_PILOT_IDS),
+                force=bool(args.force),
+                density_kg_m3=float(args.density_kg_m3),
+            )
+        )
+        print(json.dumps(result, indent=2))
+        return 0
+
     if args.command == "run-articulation-batch":
         from .batch.articulation_pipeline import ArticulationBatchConfig, ArticulationBatchRunner
 
@@ -99,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
                 cotracker_checkpoint=args.cotracker_checkpoint,
                 track_device=args.track_device,
                 tracking_jobs=args.tracking_jobs,
+                stop_after=str(args.stop_after),
                 fuse_pixel_stride=max(1, int(args.fuse_pixel_stride)),
                 fuse_voxel_size_m=float(args.fuse_voxel_size_m),
                 min_tracks_per_part=max(3, int(args.min_tracks_per_part)),
@@ -106,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
                 joint_translation_threshold_m=args.joint_translation_threshold_m,
                 mujoco_prior_mode=str(args.mujoco_prior),
                 generate_viewer=not bool(args.no_generate_viewer),
+                viewer_mode=str(args.viewer_mode),
+                viewer_axis_remap=str(args.viewer_axis_remap),
                 dynamics_backend=str(args.dynamics_backend),
                 dynamics_config=args.dynamics_config,
                 dynamics_jobs=args.dynamics_jobs,
@@ -234,6 +273,10 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.reference_frame < 0:
             parser.error("--reference-frame must be >= 0")
+        if args.start_frame < 0:
+            parser.error("--start-frame must be >= 0")
+        if args.end_frame is not None and args.end_frame < args.start_frame:
+            parser.error("--end-frame must be >= --start-frame")
         if args.frame_stride < 1:
             parser.error("--frame-stride must be a positive integer")
         if args.seed_stride_px < 1:
@@ -257,6 +300,8 @@ def main(argv: list[str] | None = None) -> int:
                 sam2_offload_video_to_cpu=bool(args.sam2_offload_video_to_cpu),
                 sam2_offload_state_to_cpu=bool(args.sam2_offload_state_to_cpu),
                 reference_frame=int(args.reference_frame),
+                start_frame=int(args.start_frame),
+                end_frame=args.end_frame,
                 frame_stride=int(args.frame_stride),
                 view_indices=args.view_indices,
                 device=str(args.device),
@@ -334,6 +379,7 @@ def main(argv: list[str] | None = None) -> int:
                 motion_tracks=args.motion_tracks,
                 output_dir=args.output_dir,
                 joint_inference=args.joint_inference,
+                gt_joint_annotation=args.gt_joint_annotation,
                 evaluation_json=args.evaluation_json,
                 local_split_summary=args.local_split_summary,
                 candidate_eval=args.candidate_eval,
@@ -365,13 +411,19 @@ def main(argv: list[str] | None = None) -> int:
                 motion_tracks=args.motion_tracks,
                 output_html=args.output_html,
                 joint_inference=args.joint_inference,
+                gt_joint_annotation=args.gt_joint_annotation,
                 evaluation_json=args.evaluation_json,
                 background_fusion_manifest=args.background_fusion_manifest,
+                background_episode=args.background_episode,
+                background_exclude_object_mask=bool(args.background_exclude_object_mask),
                 background_max_points=max(1, int(args.background_max_points)),
+                background_persistent=bool(args.background_persistent),
+                background_voxel_size_m=float(args.background_voxel_size_m),
                 mjcf_replay_episode=args.mjcf_replay_episode,
                 mjcf_mesh_opacity=float(args.mjcf_mesh_opacity),
                 max_tracks=max(1, int(args.max_tracks)),
                 frame_stride=max(1, int(args.frame_stride)),
+                full_timeline=bool(args.full_timeline),
                 trail_length=max(0, int(args.trail_length)),
                 axis_remap=args.axis_remap,
                 color_by=str(args.color_by),
@@ -389,6 +441,19 @@ def main(argv: list[str] | None = None) -> int:
                 output_dir=args.output_dir,
                 bad_track_threshold=float(args.bad_track_threshold),
                 bad_timestep_threshold=float(args.bad_timestep_threshold),
+                mask_bad_timesteps=bool(args.mask_bad_timesteps),
+                max_step_m=(None if args.max_step_m is None else max(0.0, float(args.max_step_m))),
+                keep_query_connected_segment=bool(args.keep_query_connected_segment),
+                min_query_connected_frames=max(1, int(args.min_query_connected_frames)),
+                query_connected_max_gap_frames=max(
+                    0, int(args.query_connected_max_gap_frames)
+                ),
+                spatial_dbscan_eps_m=(
+                    None
+                    if args.spatial_dbscan_eps_m is None
+                    else max(1e-9, float(args.spatial_dbscan_eps_m))
+                ),
+                spatial_dbscan_min_samples=max(2, int(args.spatial_dbscan_min_samples)),
             )
         )
         print(json.dumps({key: str(path.resolve()) for key, path in outputs.items()}, indent=2))
@@ -410,13 +475,22 @@ def main(argv: list[str] | None = None) -> int:
                 frame_stride=max(1, int(args.frame_stride)),
                 seed_stride_px=max(1, int(args.seed_stride_px)),
                 max_tracks_per_part_view=max(1, int(args.max_tracks_per_part_view)),
+                max_queries_per_forward=max(1, int(args.max_queries_per_forward)),
                 visibility_threshold=float(args.visibility_threshold),
+                depth_consistency_window_radius_px=max(0, int(args.depth_consistency_window_radius_px)),
+                depth_consistency_max_delta_m=max(0.0, float(args.depth_consistency_max_delta_m)),
+                repair_temporal_depth_spikes=bool(args.repair_temporal_depth_spikes),
+                depth_spike_jump_threshold_m=max(0.0, float(args.depth_spike_jump_threshold_m)),
+                depth_spike_neighbor_tolerance_m=max(0.0, float(args.depth_spike_neighbor_tolerance_m)),
+                depth_spike_max_run_frames=max(1, int(args.depth_spike_max_run_frames)),
                 require_part_mask_consistency=not bool(args.no_part_mask_consistency),
+                strict_object_mask_consistency=bool(args.strict_object_mask_consistency),
                 allow_backward_tracking=not bool(args.no_backward_tracking),
                 show_progress=not bool(args.no_progress),
                 export_cotracker_features=bool(args.export_cotracker_features),
                 cotracker_features_output=args.cotracker_features_output,
                 dynamic_reseeding=bool(args.dynamic_reseeding),
+                dynamic_reseed_bidirectional=bool(args.dynamic_reseed_bidirectional),
                 reseed_interval_frames=max(1, int(args.reseed_interval_frames)),
                 reseed_coverage_radius_px=max(0.0, float(args.reseed_coverage_radius_px)),
                 reseed_bbox_scale=max(1.0, float(args.reseed_bbox_scale)),
@@ -583,9 +657,22 @@ def main(argv: list[str] | None = None) -> int:
                 part_balanced_assignment=not bool(args.no_part_balanced_assignment),
                 canonicalize_geometry=not bool(args.no_canonicalize_geometry),
                 geometry_augmentation=not bool(args.no_geometry_augmentation),
+                geometry_noise_std=max(0.0, float(args.geometry_noise_std)),
+                depth_bias_probability=max(0.0, min(float(args.depth_bias_probability), 1.0)),
+                depth_bias_std=max(0.0, float(args.depth_bias_std)),
+                sampled_depth_spike_probability=max(
+                    0.0, min(float(args.sampled_depth_spike_probability), 1.0)
+                ),
                 track_dropout_ratio=max(0.0, min(float(args.track_dropout_ratio), 0.8)),
+                view_dropout_probability=max(
+                    0.0, min(float(args.view_dropout_probability), 1.0)
+                ),
+                max_dropped_views=max(0, int(args.max_dropped_views)),
                 pair_samples_per_object=max(0, int(args.pair_samples_per_object)),
+                object_batch_size=max(1, int(args.object_batch_size)),
+                data_loader_workers=max(0, int(args.data_loader_workers)),
                 topology_balanced_sampling=not bool(args.no_topology_balanced_sampling),
+                collapse_fixed_connected_labels=bool(args.collapse_fixed_connected_labels),
                 device=str(args.device),
                 seed=int(args.seed),
             )
@@ -608,10 +695,151 @@ def main(argv: list[str] | None = None) -> int:
                 ransac_inlier_threshold_m=max(1e-6, float(args.ransac_inlier_threshold_m)),
                 ransac_min_inliers=max(3, int(args.ransac_min_inliers)),
                 slot_existence_threshold=max(0.0, min(float(args.slot_existence_threshold), 1.0)),
+                min_visible_frames=max(0, int(args.min_visible_frames)),
+                min_visible_ratio=max(0.0, min(float(args.min_visible_ratio), 1.0)),
+                max_trajectory_jump_m=max(0.0, float(args.max_trajectory_jump_m)),
                 seed=int(args.seed),
             )
         ).infer()
         print(json.dumps({"motion_part_tracks": str(output_json.resolve())}, indent=2))
+        return 0
+
+    if args.command == "train-slot-relation-head":
+        from .kinematics.pairwise_relation_head import SlotRelationTrainer, SlotRelationTrainingConfig
+
+        model_path = SlotRelationTrainer(
+            SlotRelationTrainingConfig(
+                manifest_path=args.manifest,
+                slot_model_path=args.slot_model,
+                output_dir=args.output_dir,
+                epochs=max(1, int(args.epochs)),
+                object_batch_size=max(1, int(args.object_batch_size)),
+                hidden_dim=max(16, int(args.hidden_dim)),
+                learning_rate=max(1e-8, float(args.learning_rate)),
+                weight_decay=max(0.0, float(args.weight_decay)),
+                edge_positive_weight=max(1.0, float(args.edge_positive_weight)),
+                joint_type_loss_weight=max(0.0, float(args.joint_type_loss_weight)),
+                axis_loss_weight=max(0.0, float(args.axis_loss_weight)),
+                axis_line_loss_weight=max(0.0, float(args.axis_line_loss_weight)),
+                joint_replay_loss_weight=max(0.0, float(args.joint_replay_loss_weight)),
+                slot_assignment_loss_weight=max(0.0, float(args.slot_assignment_loss_weight)),
+                slot_dice_loss_weight=max(0.0, float(args.slot_dice_loss_weight)),
+                slot_pairwise_loss_weight=max(0.0, float(args.slot_pairwise_loss_weight)),
+                slot_pair_samples_per_object=max(0, int(args.slot_pair_samples_per_object)),
+                slot_rigid_loss_weight=max(0.0, float(args.slot_rigid_loss_weight)),
+                slot_existence_loss_weight=max(0.0, float(args.slot_existence_loss_weight)),
+                slot_assignment_consistency_loss_weight=max(
+                    0.0, float(args.slot_assignment_consistency_loss_weight)
+                ),
+                joint_type_balanced_loss=not bool(args.no_joint_type_balanced_loss),
+                rotation_augmentation=(
+                    bool(args.rotation_augmentation) and not bool(args.no_rotation_augmentation)
+                ),
+                rotation_augmentation_probability=float(args.rotation_augmentation_probability),
+                rotation_augmentation_mode=str(args.rotation_augmentation_mode),
+                rotation_augmentation_scope=str(args.rotation_augmentation_scope),
+                slot_input_mode=str(args.slot_input_mode),
+                slot_geometry_representation=str(args.slot_geometry_representation),
+                temporal_occlusion_augmentation=bool(args.temporal_occlusion_augmentation),
+                temporal_occlusion_probability=max(
+                    0.0, min(float(args.temporal_occlusion_probability), 1.0)
+                ),
+                temporal_occlusion_min_fraction=max(
+                    0.0, min(float(args.temporal_occlusion_min_fraction), 0.9)
+                ),
+                temporal_occlusion_max_fraction=max(
+                    0.0, min(float(args.temporal_occlusion_max_fraction), 0.9)
+                ),
+                temporal_occlusion_track_fraction=max(
+                    0.0, min(float(args.temporal_occlusion_track_fraction), 1.0)
+                ),
+                trajectory_corruption_augmentation=bool(args.trajectory_corruption_augmentation),
+                trajectory_corruption_probability=max(
+                    0.0, min(float(args.trajectory_corruption_probability), 1.0)
+                ),
+                trajectory_corruption_track_fraction=max(
+                    0.0, min(float(args.trajectory_corruption_track_fraction), 1.0)
+                ),
+                trajectory_drift_scale_fraction=max(
+                    0.0, float(args.trajectory_drift_scale_fraction)
+                ),
+                trajectory_spike_probability=max(
+                    0.0, min(float(args.trajectory_spike_probability), 1.0)
+                ),
+                coherent_drift_probability=max(
+                    0.0, min(float(args.coherent_drift_probability), 1.0)
+                ),
+                recovery_offset_probability=max(
+                    0.0, min(float(args.recovery_offset_probability), 1.0)
+                ),
+                track_id_switch_probability=max(
+                    0.0, min(float(args.track_id_switch_probability), 1.0)
+                ),
+                slot_contamination_probability=max(
+                    0.0, min(float(args.slot_contamination_probability), 1.0)
+                ),
+                slot_contamination_fraction=max(
+                    0.0, min(float(args.slot_contamination_fraction), 1.0)
+                ),
+                excitation_weighted_axis_loss=bool(args.excitation_weighted_axis_loss),
+                min_axis_excitation=max(0.0, float(args.min_axis_excitation)),
+                full_axis_excitation=max(0.0, float(args.full_axis_excitation)),
+                hard_axis_focal_gamma=max(0.0, float(args.hard_axis_focal_gamma)),
+                hard_axis_max_weight=max(1.0, float(args.hard_axis_max_weight)),
+                axis_geometry_branch=bool(args.axis_geometry_branch),
+                axis_head_type=str(args.axis_head_type),
+                vector_pivot_parameterization=str(args.vector_pivot_parameterization),
+                relation_train_scope=str(args.relation_train_scope),
+                geometry_encoder_type=str(args.geometry_encoder_type),
+                trajectory_hidden_dim=max(16, int(args.trajectory_hidden_dim)),
+                trajectory_samples=max(2, int(args.trajectory_samples)),
+                quality_weighted_trajectories=bool(args.quality_weighted_trajectories),
+                robust_segment_weights=bool(args.robust_segment_weights),
+                geometry_max_tracks=max(1, int(args.geometry_max_tracks)),
+                geometry_attention_heads=max(1, int(args.geometry_attention_heads)),
+                geometry_transformer_layers=max(1, int(args.geometry_transformer_layers)),
+                axis_equivariance_loss_weight=max(0.0, float(args.axis_equivariance_loss_weight)),
+                axis_line_equivariance_loss_weight=max(
+                    0.0, float(args.axis_line_equivariance_loss_weight)
+                ),
+                edge_consistency_loss_weight=max(0.0, float(args.edge_consistency_loss_weight)),
+                type_consistency_loss_weight=max(0.0, float(args.type_consistency_loss_weight)),
+                unfreeze_slot_backbone=bool(args.unfreeze_slot_backbone),
+                slot_unfreeze_scope=str(args.slot_unfreeze_scope),
+                slot_learning_rate_scale=max(0.0, float(args.slot_learning_rate_scale)),
+                initial_relation_model_path=args.initial_relation_model,
+                load_initial_slot_state=not bool(args.ignore_initial_slot_state),
+                device=str(args.device),
+                seed=int(args.seed),
+            )
+        ).train()
+        print(json.dumps({"slot_relation_model": str(model_path.resolve())}, indent=2))
+        return 0
+
+    if args.command == "infer-slot-relation-head":
+        from .kinematics.pairwise_relation_head import SlotRelationInferencer, SlotRelationInferenceConfig
+
+        output_json = SlotRelationInferencer(
+            SlotRelationInferenceConfig(
+                tracks_path=args.tracks,
+                features_npz=args.features_npz,
+                slot_model_path=args.slot_model,
+                relation_model_path=args.relation_model,
+                output_json=args.output_json,
+                device=str(args.device),
+                slot_existence_threshold=max(0.0, min(1.0, float(args.slot_existence_threshold))),
+                edge_threshold=max(0.0, min(1.0, float(args.edge_threshold))),
+                min_axis_confidence=max(0.0, float(args.min_axis_confidence)),
+                min_axis_observability=max(0.0, float(args.min_axis_observability)),
+                min_edge_observability=max(0.0, float(args.min_edge_observability)),
+                gate_selected_edges=bool(args.gate_selected_edges),
+                quality_weighted_trajectories=args.quality_weighted_trajectories,
+                min_trajectory_quality=max(0.0, float(args.min_trajectory_quality)),
+                robust_segment_weights=args.robust_segment_weights,
+                trajectory_assignment_override=args.trajectory_assignment_override,
+            )
+        ).infer()
+        print(json.dumps({"slot_relation_predictions": str(output_json.resolve())}, indent=2))
         return 0
 
     if args.command == "estimate-part-poses":
@@ -631,6 +859,7 @@ def main(argv: list[str] | None = None) -> int:
                     output_json=args.output_json,
                     min_tracks_per_part=max(3, int(args.min_tracks_per_part)),
                     anchor_part_id=args.anchor_part_id,
+                    anchor_selection=str(args.anchor_selection),
                     quality_weighted=bool(args.quality_weighted),
                     quality_weight_field=str(args.quality_weight_field),
                     track_quality_field=str(args.track_quality_field),
@@ -1261,6 +1490,8 @@ def main(argv: list[str] | None = None) -> int:
                 output_dir=args.output_dir,
                 frame_stride=max(1, int(args.frame_stride)),
                 max_frames=args.max_frames,
+                frame_indices=tuple(args.frame_indices) if args.frame_indices is not None else None,
+                protocol_profile=str(args.protocol_profile),
                 max_points_per_frame=args.max_points_per_frame,
                 foreground_only=not bool(args.include_background),
                 random_seed=int(args.random_seed),
@@ -1542,6 +1773,17 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.all_joints and (args.joint_name is not None or args.joint_id is not None):
             parser.error("--all-joints cannot be combined with --joint-name/--joint-id")
+        if args.control_mode in {"staggered", "paper_sequential", "paper_simultaneous"} and (
+            args.joint_name is not None or args.joint_id is not None
+        ):
+            parser.error(
+                "--control-mode staggered/paper_sequential/paper_simultaneous cannot be combined with "
+                "--joint-name/--joint-id"
+            )
+        if args.control_mode in {"paper_sequential", "paper_simultaneous"} and not args.paper_simultaneous_joint:
+            parser.error("paper_sequential/paper_simultaneous requires --paper-simultaneous-joint")
+        if args.control_mode not in {"paper_sequential", "paper_simultaneous"} and args.paper_simultaneous_joint:
+            parser.error("--paper-simultaneous-joint requires paper_sequential/paper_simultaneous")
         if args.joint_name is not None and args.joint_id is not None:
             parser.error("Provide only one of --joint-name or --joint-id")
 
@@ -1559,18 +1801,43 @@ def main(argv: list[str] | None = None) -> int:
             depth_format=args.depth_format,
             write_concat_assets=bool(args.write_concat_assets),
             camera_distance=args.camera_distance,
+            auto_camera_fit=bool(args.auto_camera_fit),
+            camera_fit_fill_ratio=float(args.camera_fit_fill_ratio),
             camera_elevation_deg=args.camera_elevation_deg,
             camera_azimuth_start_deg=args.camera_azimuth_start_deg,
             camera_azimuth_span_deg=args.camera_azimuth_span_deg,
             camera_fovy_deg=args.camera_fovy_deg,
             camera_mode=args.camera_mode,
             camera_triview_spacing_deg=args.camera_triview_spacing_deg,
+            recording_protocol=args.recording_protocol,
+            aim_static_scan_views=int(args.aim_static_scan_views),
+            aim_end_scan_views=int(args.aim_end_scan_views),
+            aim_static_scan_elevation_deg=float(args.aim_static_scan_elevation_deg),
+            aim_interaction_camera_orbits=float(args.aim_interaction_camera_orbits),
+            aim_interaction_elevation_amplitude_deg=float(
+                args.aim_interaction_elevation_amplitude_deg
+            ),
+            aim_interaction_camera_trajectory=args.interaction_camera_trajectory,
+            aim_interaction_motion_end_fraction=float(
+                args.aim_interaction_motion_end_fraction
+            ),
+            aim_interaction_fixed_view_azimuths_deg=tuple(
+                args.aim_interaction_fixed_view_azimuths_deg
+            ),
+            aim_interaction_fixed_view_elevations_deg=tuple(
+                args.aim_interaction_fixed_view_elevations_deg
+            ),
             lookat=tuple(args.lookat),
             perturbation_scale=args.perturbation_scale,
             control_kp=args.control_kp,
             control_kd=args.control_kd,
+            staggered_max_acceleration=args.staggered_max_acceleration,
             seed=args.seed,
             control_mode=args.control_mode,
+            paper_simultaneous_joints=tuple(
+                (str(name), float(start_q), float(end_q))
+                for name, start_q, end_q in args.paper_simultaneous_joint
+            ),
             random_initial_qpos=bool(args.random_initial_qpos),
             auto_initial_qvel_from_limits=bool(args.auto_initial_qvel_from_limits),
             auto_initial_qvel_direction_mode=args.auto_initial_qvel_direction_mode,
@@ -1599,10 +1866,15 @@ def main(argv: list[str] | None = None) -> int:
             part_segmentation_masks=bool(args.part_segmentation_masks),
             mask_format=args.mask_format,
             disable_target_mesh_collision=bool(args.disable_target_mesh_collision),
+            disable_target_collision=bool(args.disable_target_collision),
+            disable_gravity=bool(args.disable_gravity),
             hide_clear_meshes=bool(args.hide_clear_meshes),
             joint_name=args.joint_name,
             joint_id=args.joint_id,
-            all_joints=bool(args.all_joints),
+            all_joints=bool(
+                args.all_joints
+                or args.control_mode in {"staggered", "paper_sequential", "paper_simultaneous"}
+            ),
         )
         episode_path = MuJoCoEpisodeRecorder(config).record()
         print(json.dumps({"episode_path": str(episode_path.resolve())}, indent=2))

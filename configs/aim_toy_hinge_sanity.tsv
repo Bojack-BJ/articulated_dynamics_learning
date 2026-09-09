@@ -1,0 +1,2 @@
+object_id	recording_id	category	paper_object_label	interaction_frames	fps	source_frame_index	recording_protocol	aim_end_scan_views	camera_fit_fill_ratio	camera_azimuth_start_deg	aim_interaction_elevation_amplitude_deg	interaction_camera_trajectory	protocol_note
+toy_hinge_door	toy_hinge_door_aim_sanity	door	Toy-Hinge-Door	200	15	199	aim_style_fixed_end	12	0.58	-25	2	current_orbit	Minimal non-oracle base-plus-single-hinge-door chain sanity check

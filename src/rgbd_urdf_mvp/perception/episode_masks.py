@@ -118,6 +118,8 @@ class EpisodeMaskPropagationConfig:
     sam2_offload_video_to_cpu: bool = False
     sam2_offload_state_to_cpu: bool = False
     reference_frame: int = 0
+    start_frame: int = 0
+    end_frame: int | None = None
     frame_stride: int = 1
     view_indices: Sequence[int] | None = None
     device: str = "auto"
@@ -750,8 +752,12 @@ class EpisodeMaskPropagator:
         episode = load_episode(episode_path)
         if not episode.frames:
             raise ValueError("Episode has no frames to propagate.")
-        reference_frame = min(max(0, int(config.reference_frame)), len(episode.frames) - 1)
-        sampled_frame_indices = list(range(0, len(episode.frames), max(1, int(config.frame_stride))))
+        start_frame = min(max(0, int(config.start_frame)), len(episode.frames) - 1)
+        end_frame = len(episode.frames) - 1 if config.end_frame is None else min(int(config.end_frame), len(episode.frames) - 1)
+        if end_frame < start_frame:
+            raise ValueError("Propagation end frame must not precede start frame")
+        reference_frame = min(max(start_frame, int(config.reference_frame)), end_frame)
+        sampled_frame_indices = list(range(start_frame, end_frame + 1, max(1, int(config.frame_stride))))
         if reference_frame not in sampled_frame_indices:
             sampled_frame_indices = sorted({reference_frame, *sampled_frame_indices})
         sampled_frames = [episode.frames[index] for index in sampled_frame_indices]
@@ -923,6 +929,7 @@ class EpisodeMaskPropagator:
             "provider": "sam2-video",
             "mask_kind": config.mask_kind,
             "reference_frame": reference_frame,
+            "frame_range": [start_frame, end_frame],
             "sam2_part_mode": config.sam2_part_mode,
             "output_dir": str(output_root),
             "prediction_count": len(predictions),

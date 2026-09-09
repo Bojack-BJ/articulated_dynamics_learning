@@ -12,17 +12,26 @@ Requires-Dist: pillow>=10.0.0; extra == "viz"
 Requires-Dist: numpy>=1.26; extra == "viz"
 Requires-Dist: imageio>=2.34.0; extra == "viz"
 Requires-Dist: imageio-ffmpeg>=0.5.0; extra == "viz"
+Requires-Dist: matplotlib>=3.8; extra == "viz"
+Requires-Dist: plotly>=5.24; extra == "viz"
 Provides-Extra: tracking
 Requires-Dist: torch>=2.1; extra == "tracking"
 Requires-Dist: torchvision>=0.16; extra == "tracking"
 Requires-Dist: pillow>=10.0.0; extra == "tracking"
 Requires-Dist: numpy>=1.26; extra == "tracking"
+Requires-Dist: scipy>=1.11; extra == "tracking"
+Provides-Extra: imitation
+Requires-Dist: torch>=2.1; extra == "imitation"
+Requires-Dist: numpy>=1.26; extra == "imitation"
+Requires-Dist: mujoco>=3.1.0; extra == "imitation"
 Provides-Extra: mjx
 Requires-Dist: jax>=0.4.30; extra == "mjx"
 Requires-Dist: mujoco-mjx>=3.3.0; extra == "mjx"
 Provides-Extra: remote-server
 Requires-Dist: fastapi>=0.110; extra == "remote-server"
 Requires-Dist: uvicorn>=0.29; extra == "remote-server"
+Provides-Extra: external-baselines
+Requires-Dist: remotezip>=0.12.3; extra == "external-baselines"
 
 # Articulated Dynamics Learning From RGB-D
 
@@ -40,8 +49,15 @@ The current code is scaffold-first. It is meant to keep the full contract execut
 - Project overview: [docs/overview.md](docs/overview.md)
 - End-to-end model-to-joint-inference tutorial: [docs/end-to-end-articulation.md](docs/end-to-end-articulation.md)
 - MuJoCo recording and USD-to-MJCF conversion: [docs/mujoco-recording.md](docs/mujoco-recording.md)
+- GAPartNet asset conversion and dataset setup: [docs/gapartnet-integration.md](docs/gapartnet-integration.md)
+- PartNet-Mobility splits and recording policy: [docs/partnet-mobility-recording-strategy.md](docs/partnet-mobility-recording-strategy.md)
 - RGB-D fusion, part segmentation, and viewer workflow: [docs/pointcloud.md](docs/pointcloud.md)
+- Object-mask motion segmentation experiments: [docs/object-mask-motion-segmentation.md](docs/object-mask-motion-segmentation.md)
 - Dynamics identification and Lagrangian-network handoff: [docs/dynamics-identification.md](docs/dynamics-identification.md)
+- Downstream MuJoCo manipulation planning: [docs/downstream-manipulation.md](docs/downstream-manipulation.md)
+- Ballistic dynamics-conditioned IL pipeline: [docs/ballistic-il-pipeline.md](docs/ballistic-il-pipeline.md)
+- Real-data adapters: [docs/real-data-adapters.md](docs/real-data-adapters.md)
+- Segmentation providers: [docs/segmentation-providers.md](docs/segmentation-providers.md)
 - MuJoCo MJX setup for differentiable rollouts: [docs/mjx-setup.md](docs/mjx-setup.md)
 - Remote 3D generation client/server setup: [docs/remote-generation.md](docs/remote-generation.md)
 - Research-stack replacement points: [docs/research-stack.md](docs/research-stack.md)
@@ -74,6 +90,12 @@ Optional CoTracker support for track-based part trajectories:
 
 ```bash
 python -m pip install -e ".[tracking]"
+```
+
+Optional ballistic imitation-learning support:
+
+```bash
+python -m pip install -e ".[imitation]"
 ```
 
 Optional MuJoCo MJX support for differentiable JAX rollouts:

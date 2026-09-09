@@ -393,7 +393,7 @@ def _choose_anchor_part_id(meta: dict[str, Any], per_part_counts: dict[int, int]
     part_segmentation = meta.get("part_segmentation")
     if isinstance(part_segmentation, dict):
         for raw_part in part_segmentation.get("parts", []):
-            if isinstance(raw_part, dict) and str(raw_part.get("role")) in {"base", "static"}:
+            if isinstance(raw_part, dict) and str(raw_part.get("role")) in {"base", "static", "fixed_child"}:
                 part_id = int(raw_part.get("part_id", 0))
                 if part_id in per_part_counts:
                     return part_id

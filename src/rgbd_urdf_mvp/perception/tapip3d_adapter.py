@@ -17,6 +17,7 @@ class TAPIP3DInputConfig:
     view_index: int = 0
     frame_stride: int = 1
     seed_tracks: str | Path | None = None
+    compressed: bool = True
 
 
 @dataclass(slots=True)
@@ -79,11 +80,15 @@ class TAPIP3DInputPreparer:
             "intrinsics": intrinsics.astype(np.float32, copy=False),
             "extrinsics": np.stack(extrinsics, axis=0).astype(np.float32, copy=False),
             "source_frame_indices": np.asarray(indices, dtype=np.int64),
+            "timestamps_s": np.asarray(
+                [float(episode.frames[index].timestamp_s) for index in indices], dtype=np.float64
+            ),
             "view_index": np.asarray([int(self.config.view_index)], dtype=np.int64),
         }
         if self.config.seed_tracks is not None:
             payload.update(_query_payload(self.config.seed_tracks, int(self.config.view_index), indices))
-        np.savez_compressed(output_path, **payload)
+        save = np.savez_compressed if self.config.compressed else np.savez
+        save(output_path, **payload)
         return output_path
 
 
@@ -103,6 +108,11 @@ class TAPIP3DTrackImporter:
                 raise ValueError("TAPIP input NPZ has no track_ids. Recreate it with --seed-tracks.")
             track_ids = np.asarray(input_payload["track_ids"], dtype=np.int64)
             source_frame_indices = np.asarray(input_payload["source_frame_indices"], dtype=np.int64)
+            timestamps_s = (
+                np.asarray(input_payload["timestamps_s"], dtype=np.float64)
+                if "timestamps_s" in input_payload
+                else None
+            )
             view_index = int(np.asarray(input_payload["view_index"]).reshape(-1)[0])
             coords = np.asarray(result_payload["coords"], dtype=np.float64)
             visibs = np.asarray(result_payload["visibs"], dtype=bool)
@@ -124,7 +134,11 @@ class TAPIP3DTrackImporter:
                 visible = bool(visibs[frame_index, query_index])
                 samples.append({
                     "frame_index": int(frame_index), "source_frame_index": int(source_frame_index),
-                    "timestamp_s": float(seed_sample.get("timestamp_s", frame_index)), "uv": None,
+                    "timestamp_s": float(
+                        timestamps_s[frame_index]
+                        if timestamps_s is not None
+                        else seed_sample.get("timestamp_s", frame_index)
+                    ),
                     "xyz_world": [float(value) for value in coords[frame_index, query_index]],
                     "visible": visible, "tracker_visibility": float(visible), "depth_valid": True,
                     "mask_consistent": True, "confidence": float(visible),
@@ -136,12 +150,19 @@ class TAPIP3DTrackImporter:
             output_track.update({"view_index": view_index, "reference_xyz_world": reference, "samples": samples})
             tracks.append(output_track)
         output_path = Path(self.config.output_json).expanduser().resolve()
+        effective_fps = None
+        if timestamps_s is not None and len(timestamps_s) > 1:
+            deltas = np.diff(timestamps_s)
+            positive = deltas[deltas > 1e-9]
+            if len(positive):
+                effective_fps = float(1.0 / np.median(positive))
         payload = {
             **{key: value for key, value in seed_artifact.items() if key != "tracks"},
             "estimator": "tapip3d-world-track-import", "tapip_input_npz": str(input_path),
             "tapip_result_npz": str(result_path), "frame_count": int(coords.shape[0]),
             "source_frame_count": int(seed_artifact.get("source_frame_count", int(source_frame_indices[-1]) + 1)),
             "sampled_frame_indices": [int(value) for value in source_frame_indices.tolist()],
+            "effective_tracking_fps_hz": effective_fps,
             "view_count": 1, "tapip_visibility_threshold": float(self.config.visibility_threshold), "tracks": tracks,
         }
         save_json(payload, output_path)
@@ -257,9 +278,17 @@ def _merge_feature_npz(
         raise ValueError("Each TAPIP feature artifact must contain track_ids and embeddings.")
     merged = {key: np.concatenate(values, axis=0) for key, values in arrays.items()}
     ids = [int(value) for value in merged["track_ids"].tolist()]
-    if len(ids) != len(set(ids)) or set(ids) != expected_track_ids:
-        raise ValueError("Merged TAPIP features do not align with merged world tracks.")
+    if len(ids) != len(set(ids)):
+        raise ValueError("Merged TAPIP features contain duplicate track IDs.")
+    missing = expected_track_ids - set(ids)
+    if missing:
+        raise ValueError(f"Merged TAPIP features are missing {len(missing)} imported world tracks.")
+    keep = np.asarray([track_id in expected_track_ids for track_id in ids], dtype=bool)
+    for key, values in list(merged.items()):
+        if values.shape[0] == len(ids):
+            merged[key] = values[keep]
     merged["feature_source"] = np.asarray(sorted(set(feature_sources)) or ["tapip3d_updateformer"])
+    merged["filtered_invisible_feature_count"] = np.asarray([int((~keep).sum())], dtype=np.int64)
     output = Path(output_path).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output, **merged)

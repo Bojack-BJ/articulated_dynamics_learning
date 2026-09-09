@@ -35,6 +35,11 @@ def main() -> int:
     parser.add_argument("--view-index", type=int, default=0)
     parser.add_argument("--frame-index", type=int, default=0)
     parser.add_argument(
+        "--allow-external-assets",
+        action="store_true",
+        help="Allow absolute episode asset paths outside the episode directory on a trusted local server.",
+    )
+    parser.add_argument(
         "--propagate-python",
         type=Path,
         default=None,
@@ -54,6 +59,7 @@ def main() -> int:
         output_episode=args.output_episode,
         default_view_index=args.view_index,
         default_frame_index=args.frame_index,
+        allow_external_assets=args.allow_external_assets,
         propagate_python=args.propagate_python,
         sam2_root=args.sam2_root,
         sam2_config=args.sam2_config,
@@ -83,6 +89,7 @@ class AnnotationState:
         output_episode: Path | None,
         default_view_index: int,
         default_frame_index: int,
+        allow_external_assets: bool = False,
         propagate_python: Path | None,
         sam2_root: Path,
         sam2_config: str,
@@ -113,6 +120,7 @@ class AnnotationState:
             )
         self.default_view_index = max(0, int(default_view_index))
         self.default_frame_index = max(0, int(default_frame_index))
+        self.allow_external_assets = bool(allow_external_assets)
         self.prompt_log_path = self.output_dir / "annotation_prompts.json"
         self.prompt_log: dict[str, Any] = (
             _load_json(self.prompt_log_path) if self.prompt_log_path.exists() else {"records": []}
@@ -169,7 +177,11 @@ class AnnotationState:
         if live_path is not None and live_path.exists():
             return live_path
         frame = self.frame(frame_index)
-        paths = frame.get("part_mask_paths_by_view") or ([frame.get("part_mask_path")] if frame.get("part_mask_path") else [])
+        paths = frame.get("part_mask_paths_by_view") or (
+            [frame.get("part_mask_path")] if frame.get("part_mask_path") else []
+        )
+        if not paths:
+            paths = frame.get("mask_paths_by_view") or ([frame.get("mask_path")] if frame.get("mask_path") else [])
         if view_index >= len(paths) or not paths[view_index]:
             return None
         return self._resolve_episode_path(paths[view_index])
@@ -204,10 +216,11 @@ class AnnotationState:
         path = Path(raw)
         resolved = path if path.is_absolute() else self.episode_root / path
         resolved = resolved.expanduser().resolve()
-        try:
-            resolved.relative_to(self.episode_root)
-        except ValueError as exc:
-            raise ValueError(f"Episode asset path escapes episode root: {raw}") from exc
+        if not self.allow_external_assets:
+            try:
+                resolved.relative_to(self.episode_root)
+            except ValueError as exc:
+                raise ValueError(f"Episode asset path escapes episode root: {raw}") from exc
         return resolved
 
     def save_mask(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -356,6 +369,10 @@ class AnnotationState:
     def start_propagation(self, payload: dict[str, Any]) -> dict[str, Any]:
         backend = str(payload.get("backend") or "sam2-video")
         reference_frame = int(payload.get("reference_frame", self.default_frame_index))
+        start_frame = max(0, int(payload.get("start_frame", reference_frame)))
+        end_frame = min(self.frame_count() - 1, int(payload.get("end_frame", reference_frame)))
+        if not start_frame <= reference_frame <= end_frame:
+            raise ValueError("Propagation range must contain the current reference frame.")
         view_index = int(payload.get("view_index", self.default_view_index))
         frame_stride = max(1, int(payload.get("frame_stride", 1)))
         sam2_part_mode = str(payload.get("sam2_part_mode") or "independent")
@@ -387,6 +404,10 @@ class AnnotationState:
             "part",
             "--reference-frame",
             str(reference_frame),
+            "--start-frame",
+            str(start_frame),
+            "--end-frame",
+            str(end_frame),
             "--frame-stride",
             str(frame_stride),
             "--view-indices",
@@ -595,7 +616,10 @@ def _make_handler(state: AnnotationState) -> type[BaseHTTPRequestHandler]:
 
         def _send_label_png(self, path: Path) -> None:
             labels = np.asarray(Image.open(path), dtype=np.uint16)
-            label8 = np.clip(labels, 0, 255).astype(np.uint8)
+            # Keep small indexed labels visible through browser image decoding.
+            if labels.max(initial=0) > 223:
+                raise ValueError("Browser mask preview supports part ids up to 223")
+            label8 = np.where(labels > 0, labels + 32, 0).astype(np.uint8)
             import io
 
             buffer = io.BytesIO()
@@ -835,9 +859,10 @@ INDEX_HTML = r"""<!doctype html>
     .stage {
       position: relative;
       margin: 24px;
+      max-width: calc(100% - 48px);
       box-shadow: 0 0 0 1px #000, 0 18px 60px rgba(0,0,0,.45);
     }
-    canvas { display: block; image-rendering: auto; }
+    canvas { display: block; max-width: 100%; height: auto; image-rendering: auto; }
     #overlayCanvas, #promptCanvas {
       position: absolute;
       left: 0;
@@ -985,8 +1010,8 @@ INDEX_HTML = r"""<!doctype html>
         <input id="brushSize" type="range" min="1" max="80" value="18" />
         <span id="brushSizeLabel" class="muted">18</span>
         <label class="muted">Overlay</label>
-        <input id="overlayAlpha" type="range" min="0" max="100" value="48" />
-        <span id="overlayAlphaLabel" class="muted">48%</span>
+        <input id="overlayAlpha" type="range" min="0" max="100" value="72" />
+        <span id="overlayAlphaLabel" class="muted">72%</span>
         <label class="inline-check"><input id="currentOnlyToggle" type="checkbox" /> Current only</label>
         <button id="undoBtn">Undo</button>
         <button id="keepLargestBtn">Keep Largest</button>
@@ -1027,6 +1052,7 @@ INDEX_HTML = r"""<!doctype html>
           <option value="joint">SAM2 parts: joint</option>
         </select>
         <div class="row"><label>Stride</label><input id="propFrameStride" type="number" min="1" value="1" style="width: 88px" /></div>
+        <div class="row"><label>Segment</label><input id="propStartFrame" type="number" min="0" value="0" style="width: 76px" /><span>to</span><input id="propEndFrame" type="number" min="0" value="20" style="width: 76px" /></div>
         <div class="row">
           <button id="startPropBtn">Start From Current</button>
           <button id="pausePropBtn" class="danger">Pause Backend</button>
@@ -1100,6 +1126,10 @@ async function init() {
   slider.value = currentFrame;
   document.getElementById("frameInput").value = currentFrame;
   document.getElementById("viewInput").value = currentView;
+  document.getElementById("propStartFrame").max = Math.max(0, state.frame_count - 1);
+  document.getElementById("propEndFrame").max = Math.max(0, state.frame_count - 1);
+  document.getElementById("propStartFrame").value = Math.max(0, currentFrame - 10);
+  document.getElementById("propEndFrame").value = Math.min(state.frame_count - 1, currentFrame + 10);
   renderParts();
   await loadFrame();
   await pollPropagation();
@@ -1137,7 +1167,7 @@ async function loadFrame() {
     await loadExistingMask();
     drawOverlay();
     drawPrompts();
-    setStatus(`Frame ${currentFrame}, view ${currentView}.`);
+    setStatus(`Frame ${currentFrame}, view ${currentView}. Mask ${foregroundPixelCount()} px.`);
   };
   img.src = `/api/frame?frame=${currentFrame}&view=${currentView}&t=${Date.now()}`;
 }
@@ -1156,7 +1186,10 @@ async function loadExistingMask() {
   const ctx = c.getContext("2d");
   ctx.drawImage(bitmap, 0, 0);
   const data = ctx.getImageData(0, 0, width, height).data;
-  for (let i = 0; i < width * height; i++) labels[i] = data[i * 4];
+  for (let i = 0; i < width * height; i++) {
+    const encoded = data[i * 4];
+    labels[i] = encoded >= 32 ? encoded - 32 : 0;
+  }
   discardUnknownLabels();
 }
 
@@ -1168,7 +1201,7 @@ async function refreshCurrentMaskFromStatus(maskStatus, force=false) {
   await loadExistingMask();
   loadedMaskKey = key;
   drawOverlay();
-  setStatus(`Frame ${currentFrame}, view ${currentView}. Mask updated.`);
+  setStatus(`Frame ${currentFrame}, view ${currentView}. Mask updated (${foregroundPixelCount()} px).`);
   return true;
 }
 
@@ -1181,6 +1214,12 @@ async function setFrame(frameIndex) {
   const bounded = Math.max(0, Math.min(state.frame_count - 1, Number(frameIndex)));
   document.getElementById("frameInput").value = bounded;
   document.getElementById("frameSlider").value = bounded;
+  const startInput = document.getElementById("propStartFrame");
+  const endInput = document.getElementById("propEndFrame");
+  if (bounded < Number(startInput.value) || bounded > Number(endInput.value)) {
+    startInput.value = Math.max(0, bounded - 10);
+    endInput.value = Math.min(state.frame_count - 1, bounded + 10);
+  }
   await loadFrame();
   renderMaskStrip(lastPropagation?.mask_status || null);
 }
@@ -1263,6 +1302,8 @@ async function startPropagation() {
   const payload = {
     backend: document.getElementById("backendSelect").value,
     reference_frame: currentFrame,
+    start_frame: Number(document.getElementById("propStartFrame").value),
+    end_frame: Number(document.getElementById("propEndFrame").value),
     view_index: currentView,
     frame_stride: Number(document.getElementById("propFrameStride").value || 1),
     sam2_part_mode: document.getElementById("sam2PartModeSelect").value,
@@ -1376,7 +1417,7 @@ function restoreHistory(snapshot) {
 function drawOverlay() {
   overlayCtx.clearRect(0, 0, width, height);
   if (!labels) return;
-  const alphaScale = Number(document.getElementById("overlayAlpha")?.value || 48) / 100;
+  const alphaScale = Number(document.getElementById("overlayAlpha")?.value || 72) / 100;
   const currentOnly = Boolean(document.getElementById("currentOnlyToggle")?.checked);
   const img = overlayCtx.createImageData(width, height);
   for (let i = 0; i < labels.length; i++) {
@@ -1387,7 +1428,7 @@ function drawOverlay() {
     img.data[i*4] = r;
     img.data[i*4+1] = g;
     img.data[i*4+2] = b;
-    const baseAlpha = id === currentPart ? 150 : 95;
+    const baseAlpha = id === currentPart ? 255 : 180;
     img.data[i*4+3] = Math.round(baseAlpha * alphaScale);
   }
   overlayCtx.putImageData(img, 0, 0);

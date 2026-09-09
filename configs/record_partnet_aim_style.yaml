@@ -1,0 +1,36 @@
+# AiM-inspired approximation. The released AiM code consumes the camera frames
+# listed by its dataset transforms and does not define these numeric acquisition
+# settings. Do not label this configuration as an exact native-protocol reproduction.
+command: record-mujoco
+args:
+  model: outputs/partnet_core_v1/models/partnet_10638.xml
+  category: refrigerator
+  object-id: partnet_10638
+  output-dir: outputs/aim_style_protocol_recordings
+  duration-s: 8
+  fps: 15
+  width: 480
+  height: 352
+  control-mode: staggered
+  staggered-max-acceleration: 50.0
+  all-joints: true
+  disable-gravity: true
+  disable-target-collision: true
+  perturbation-scale: 0.0
+  rgb-format: png
+  depth-format: png
+  mask-format: png
+  camera-distance: 3.0
+  auto-camera-fit: true
+  camera-fit-fill-ratio: 0.42
+  camera-mode: orbit
+  camera-elevation-deg: -15
+  camera-fovy-deg: 60
+  lookat: [0.0, 0.0, 0.0]
+  segmentation-masks: true
+  part-segmentation-masks: true
+  recording-protocol: aim_style
+  aim-static-scan-views: 24
+  aim-static-scan-elevation-deg: 15
+  aim-interaction-camera-orbits: 1.0
+  aim-interaction-elevation-amplitude-deg: 10

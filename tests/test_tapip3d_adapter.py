@@ -70,11 +70,13 @@ class TAPIP3DAdapterTests(unittest.TestCase):
                 self.assertEqual(data["video"].shape, (2, 3, 4, 3))
                 self.assertEqual(data["query_point"].shape, (1, 4))
                 np.testing.assert_array_equal(data["track_ids"], [7])
+                np.testing.assert_allclose(data["timestamps_s"], [0.0, 0.1])
             result_path = root / "result.npz"
             np.savez(result_path, coords=np.asarray([[[0.0, 0.0, 1.0]], [[0.1, 0.0, 1.0]]]), visibs=np.asarray([[True], [True]]))
             output_path = TAPIP3DTrackImporter(TAPIP3DImportConfig(tapip_input_npz=input_path, tapip_result_npz=result_path, seed_tracks=seed_path, output_json=root / "tracks.json")).import_tracks()
             imported = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(imported["estimator"], "tapip3d-world-track-import")
+            self.assertAlmostEqual(imported["effective_tracking_fps_hz"], 10.0)
             self.assertEqual(imported["tracks"][0]["track_id"], 7)
             self.assertEqual(imported["tracks"][0]["samples"][1]["xyz_world"], [0.1, 0.0, 1.0])
 
@@ -112,3 +114,31 @@ class TAPIP3DAdapterTests(unittest.TestCase):
             with np.load(features_output) as merged_features:
                 np.testing.assert_array_equal(merged_features["track_ids"], [10, 20])
                 self.assertEqual(merged_features["temporal_tokens"].shape, (2, 2, 2))
+
+    def test_multiview_merge_filters_features_for_dropped_invisible_tracks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            track_paths = []
+            feature_paths = []
+            for view_index, (kept_id, dropped_id) in enumerate(((10, 11), (20, 21))):
+                track_path = root / f"view{view_index}.json"
+                track_path.write_text(json.dumps({
+                    "tracks": [{"track_id": kept_id, "view_index": view_index, "samples": []}],
+                }), encoding="utf-8")
+                feature_path = root / f"view{view_index}.npz"
+                np.savez_compressed(
+                    feature_path,
+                    track_ids=np.asarray([kept_id, dropped_id]),
+                    embeddings=np.ones((2, 6), dtype=np.float32),
+                )
+                track_paths.append(track_path)
+                feature_paths.append(feature_path)
+            _, features_output = TAPIP3DMultiViewMerger(TAPIP3DMergeConfig(
+                track_paths=track_paths,
+                output_tracks=root / "merged.json",
+                feature_paths=feature_paths,
+                output_features=root / "merged.npz",
+            )).merge()
+            with np.load(features_output) as merged:
+                np.testing.assert_array_equal(merged["track_ids"], [10, 20])
+                self.assertEqual(int(merged["filtered_invisible_feature_count"][0]), 2)

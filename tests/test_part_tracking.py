@@ -11,8 +11,11 @@ from rgbd_urdf_mvp.perception.part_tracking import (
     TrackPartPoseEstimationConfig,
     TrackPartPoseEstimator,
     _backproject_track_sample,
+    _backproject_track_sample_depth_consistent,
+    _choose_anchor_part_id,
     _expanded_robust_bbox,
     _point_in_bbox,
+    _repair_temporal_depth_spikes,
     _sample_foreground_seed_pixels,
     _sample_uncovered_foreground_seed_pixels,
 )
@@ -67,6 +70,13 @@ def _track(track_id: int, part_id: int, source: list[float], target: list[float]
 
 
 class PartTrackingTests(unittest.TestCase):
+    def test_fixed_child_is_preferred_as_static_anchor(self) -> None:
+        metadata = {
+            2: {"part_id": 2, "role": "fixed_child"},
+            3: {"part_id": 3, "role": "articulated"},
+        }
+        self.assertEqual(_choose_anchor_part_id(metadata, {2: 20, 3: 100}, None), 2)
+
     def test_track_part_pixels_parser_accepts_mac_device(self) -> None:
         parser = build_parser()
         args = parser.parse_args(
@@ -88,6 +98,8 @@ class PartTrackingTests(unittest.TestCase):
                 "4",
                 "--seed-stride-px",
                 "12",
+                "--max-queries-per-forward",
+                "256",
                 "--no-progress",
                 "--export-cotracker-features",
                 "--cotracker-features-output",
@@ -102,6 +114,7 @@ class PartTrackingTests(unittest.TestCase):
         self.assertTrue(args.unsafe_force_mps)
         self.assertEqual(args.frame_stride, 4)
         self.assertEqual(args.seed_stride_px, 12)
+        self.assertEqual(args.max_queries_per_forward, 256)
         self.assertTrue(args.no_progress)
         self.assertTrue(args.export_cotracker_features)
         self.assertEqual(args.cotracker_features_output, Path("features.npz"))
@@ -169,6 +182,81 @@ class PartTrackingTests(unittest.TestCase):
         self.assertTrue(depth_valid)
         self.assertTrue(mask_consistent)
         self.assertIsNotNone(xyz)
+
+    def test_depth_consistency_prefers_previous_surface_over_background_toggle(self) -> None:
+        depth = [[1900 for _ in range(5)] for _ in range(5)]
+        depth[1][1] = depth[1][2] = depth[2][1] = 700
+        xyz, valid, mask_consistent, selected_depth = _backproject_track_sample_depth_consistent(
+            u_float=2.0,
+            v_float=2.0,
+            depth_u16=depth,
+            part_mask_u16=[[1 for _ in range(5)] for _ in range(5)],
+            expected_part_id=-1,
+            intrinsics={"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0},
+            camera_pose=[
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            depth_convention="z-depth",
+            min_depth_m=0.05,
+            max_depth_m=6.0,
+            require_part_mask_consistency=True,
+            window_radius_px=1,
+            previous_depth_m=0.69,
+            max_delta_m=0.08,
+        )
+        self.assertTrue(valid)
+        self.assertTrue(mask_consistent)
+        self.assertEqual(selected_depth, 0.7)
+        self.assertIsNotNone(xyz)
+
+    def test_depth_consistency_rejects_window_without_matching_surface(self) -> None:
+        xyz, valid, _, selected_depth = _backproject_track_sample_depth_consistent(
+            u_float=1.0,
+            v_float=1.0,
+            depth_u16=[[1900 for _ in range(3)] for _ in range(3)],
+            part_mask_u16=[[1 for _ in range(3)] for _ in range(3)],
+            expected_part_id=-1,
+            intrinsics={"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0},
+            camera_pose=[
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            depth_convention="z-depth",
+            min_depth_m=0.05,
+            max_depth_m=6.0,
+            require_part_mask_consistency=True,
+            window_radius_px=1,
+            previous_depth_m=0.7,
+            max_delta_m=0.08,
+        )
+        self.assertFalse(valid)
+        self.assertIsNone(xyz)
+        self.assertIsNone(selected_depth)
+
+    def test_temporal_depth_spike_repair_only_repairs_short_aba_toggle(self) -> None:
+        samples = [
+            {"frame_index": index, "uv": [0.0, 0.0], "selected_depth_m": depth, "xyz_world": [0.0, 0.0, depth]}
+            for index, depth in enumerate([0.70, 1.90, 1.88, 0.71, 0.75, 0.82, 0.90])
+        ]
+        identity = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+        repaired = _repair_temporal_depth_spikes(
+            samples,
+            intrinsics={"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0},
+            camera_poses=[identity for _ in samples],
+            depth_convention="z-depth",
+            jump_threshold_m=0.08,
+            neighbor_tolerance_m=0.03,
+            max_run_frames=2,
+        )
+        self.assertEqual(repaired, 2)
+        self.assertAlmostEqual(samples[1]["selected_depth_m"], 0.7033333333)
+        self.assertAlmostEqual(samples[2]["selected_depth_m"], 0.7066666667)
+        self.assertEqual([sample["selected_depth_m"] for sample in samples[4:]], [0.75, 0.82, 0.90])
 
     def test_dynamic_reseed_samples_only_uncovered_valid_depth(self) -> None:
         mask = [[1 for _ in range(8)] for _ in range(8)]

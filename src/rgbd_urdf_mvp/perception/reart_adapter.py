@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import random
+import re
 import shutil
 import time
 import zipfile
@@ -20,6 +21,8 @@ class ReArtSequenceExportConfig:
     output_dir: str | Path
     frame_stride: int = 1
     max_frames: int | None = None
+    frame_indices: tuple[int, ...] | None = None
+    protocol_profile: str = "custom"
     max_points_per_frame: int | None = 20000
     foreground_only: bool = True
     random_seed: int = 1234
@@ -32,6 +35,12 @@ class ReArtSequenceExporter:
         per_frame_dir = _resolve_manifest_path(manifest_path, manifest.get("per_frame_dir"))
         if per_frame_dir is None or not per_frame_dir.exists():
             raise FileNotFoundError(f"fusion_manifest.json does not reference an existing per_frame_dir: {manifest_path}")
+        mask_aware_fusion = bool(manifest.get("mask_aware_fusion"))
+        labeled_part_ids = {
+            int(value)
+            for value in manifest.get("part_ids_present", [])
+            if int(value) > 0
+        }
 
         output_dir = Path(config.output_dir).expanduser().resolve()
         if output_dir.exists():
@@ -40,17 +49,40 @@ class ReArtSequenceExporter:
 
         rng = random.Random(int(config.random_seed))
         frame_paths = sorted(per_frame_dir.glob("frame_*.ply"))
-        selected = frame_paths[:: max(1, int(config.frame_stride))]
-        if config.max_frames is not None:
-            selected = selected[: max(1, int(config.max_frames))]
+        source_frames = [(_source_frame_index(path), path) for path in frame_paths]
+        if config.frame_indices is not None:
+            if int(config.frame_stride) != 1 or config.max_frames is not None:
+                raise ValueError("Explicit frame_indices cannot be combined with frame_stride or max_frames.")
+            frame_by_index = {index: path for index, path in source_frames}
+            missing = [index for index in config.frame_indices if index not in frame_by_index]
+            if missing:
+                raise ValueError(f"Requested ReArt source frame indices are unavailable: {missing}")
+            selected = [(index, frame_by_index[index]) for index in config.frame_indices]
+            temporal_sampling_provenance = "explicit_source_frame_indices"
+        else:
+            selected = source_frames[:: max(1, int(config.frame_stride))]
+            if config.max_frames is not None:
+                selected = selected[: max(1, int(config.max_frames))]
+            temporal_sampling_provenance = "adapter_stride_and_prefix_cap"
+        if config.protocol_profile not in {"custom", "sapien_count_matched_4frame"}:
+            raise ValueError(f"Unsupported ReArt protocol profile: {config.protocol_profile}")
+        if config.protocol_profile == "sapien_count_matched_4frame" and len(selected) != 4:
+            raise ValueError("sapien_count_matched_4frame requires exactly four exported point-cloud frames.")
         if len(selected) < 2:
             raise ValueError("ReArt needs at least two frames; lower --frame-stride or increase --max-frames.")
 
         exported_frames = []
-        for local_index, frame_path in enumerate(selected):
+        for local_index, (source_frame_index, frame_path) in enumerate(selected):
             points = _read_frame_ply(frame_path)
-            if bool(config.foreground_only):
+            # Object-mask-only fusion uses part_id=0 for valid foreground points.
+            # Positive IDs are available only when simulation part masks were fused.
+            if bool(config.foreground_only) and labeled_part_ids:
                 points = [point for point in points if int(point[3]) > 0]
+            elif bool(config.foreground_only) and not mask_aware_fusion:
+                raise ValueError(
+                    "Foreground-only ReArt export requires an object/part-mask-aware fusion manifest. "
+                    "Re-fuse with object masks or pass --include-background explicitly."
+                )
             if not points:
                 raise ValueError(f"No points left after filtering {frame_path}")
             max_points = config.max_points_per_frame
@@ -62,6 +94,7 @@ class ReArtSequenceExporter:
             exported_frames.append(
                 {
                     "local_frame_index": local_index,
+                    "source_frame_index": source_frame_index,
                     "source_frame_path": str(frame_path),
                     "output_path": str(out_path),
                     "point_count": len(points),
@@ -75,13 +108,31 @@ class ReArtSequenceExporter:
             "output_dir": str(output_dir),
             "frame_stride": int(config.frame_stride),
             "max_frames": config.max_frames,
+            "requested_frame_indices": list(config.frame_indices) if config.frame_indices is not None else None,
+            "source_frame_indices": [item["source_frame_index"] for item in exported_frames],
+            "protocol_profile": config.protocol_profile,
+            "temporal_sampling_provenance": temporal_sampling_provenance,
             "max_points_per_frame": config.max_points_per_frame,
             "foreground_only": bool(config.foreground_only),
+            "foreground_filter_mode": (
+                "positive-part-id"
+                if bool(config.foreground_only) and labeled_part_ids
+                else "object-mask-prefiltered"
+                if bool(config.foreground_only) and mask_aware_fusion
+                else "disabled"
+            ),
+            "source_mask_aware_fusion": mask_aware_fusion,
+            "source_part_ids_present": sorted(labeled_part_ids),
             "frame_count": len(exported_frames),
             "frames": exported_frames,
             "notes": [
-                "Files are vertex-only PLY point clouds. Use the project ReArt wrapper or patched dataset loader.",
+                "Files are xyz-only vertex PLY point clouds. Simulation GT part labels are not exported.",
                 "ReArt's upstream real loader samples mesh surfaces; the wrapper samples vertices for point-cloud PLY inputs.",
+                (
+                    "The official ReArt Sapiens benchmark provides four point-cloud frames per object. "
+                    "The sapien_count_matched_4frame profile matches only that count; source states, "
+                    "timestamps, and camera/global transforms remain adapter-defined."
+                ),
             ],
         }
         (output_dir / "reart_sequence_manifest.json").write_text(
@@ -89,6 +140,13 @@ class ReArtSequenceExporter:
             encoding="utf-8",
         )
         return output_dir
+
+
+def _source_frame_index(path: Path) -> int:
+    match = re.fullmatch(r"frame_(\d+)", path.stem)
+    if match is None:
+        raise ValueError(f"Expected a frame_<index>.ply filename, got: {path.name}")
+    return int(match.group(1))
 
 
 @dataclass(slots=True)
@@ -284,11 +342,10 @@ def _write_vertex_only_ply(path: Path, points: list[tuple[float, float, float, i
         "property float x",
         "property float y",
         "property float z",
-        "property ushort part_id",
         "end_header",
     ]
-    for x_coord, y_coord, z_coord, part_id in points:
-        lines.append(f"{x_coord:.6f} {y_coord:.6f} {z_coord:.6f} {int(part_id)}")
+    for x_coord, y_coord, z_coord, _part_id in points:
+        lines.append(f"{x_coord:.6f} {y_coord:.6f} {z_coord:.6f}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

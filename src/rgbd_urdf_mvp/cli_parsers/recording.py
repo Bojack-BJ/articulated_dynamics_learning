@@ -7,6 +7,34 @@ from ..core.categories import SUPPORTED_CATEGORIES, normalize_category
 
 
 def register(subparsers: Any) -> None:
+    prepare_gapartnet_parser = subparsers.add_parser(
+        "prepare-gapartnet-recordings",
+        help="Selectively extract GAPartNet assets and generate MuJoCo recording inputs",
+    )
+    prepare_gapartnet_parser.add_argument("archive", type=Path, help="GAPartNet partnet_mobility_part.zip")
+    prepare_gapartnet_parser.add_argument("--output-dir", type=Path, required=True)
+    prepare_gapartnet_parser.add_argument(
+        "--object-id",
+        action="append",
+        dest="object_ids",
+        default=None,
+        help="Object id to prepare; repeat for multiple ids (defaults to the five-object pilot)",
+    )
+    prepare_gapartnet_parser.add_argument("--density-kg-m3", type=float, default=30.0)
+    prepare_gapartnet_parser.add_argument("--force", action="store_true")
+
+    gapartnet_parser = subparsers.add_parser(
+        "convert-gapartnet-mjcf",
+        help="Convert a GAPartNet asset URDF into a MuJoCo-loadable proxy MJCF",
+    )
+    gapartnet_parser.add_argument("asset_dir", type=Path, help="GAPartNet object directory")
+    gapartnet_parser.add_argument("--output-mjcf", type=Path, required=True)
+    gapartnet_parser.add_argument("--urdf-name", default="mobility_annotation_gapartnet.urdf")
+    gapartnet_parser.add_argument("--density-kg-m3", type=float, default=30.0)
+    gapartnet_parser.add_argument("--minimum-proxy-size-m", type=float, default=0.002)
+    gapartnet_parser.add_argument("--add-floor", action="store_true")
+    gapartnet_parser.add_argument("--source-up-axis", choices=["y", "z"], default="y")
+
     import_rbo_parser = subparsers.add_parser(
         "import-rbo-recording",
         help="Convert an RBO/ROSbag-like RGB-D folder export into an episode.json recording",
@@ -225,6 +253,17 @@ def register(subparsers: Any) -> None:
         help="Orbit camera distance from lookat",
     )
     record_parser.add_argument(
+        "--auto-camera-fit",
+        action="store_true",
+        help="Fit camera lookat and distance to the target object's MuJoCo geometry bounds",
+    )
+    record_parser.add_argument(
+        "--camera-fit-fill-ratio",
+        type=float,
+        default=0.42,
+        help="Target fraction of vertical field of view occupied by the object bounding sphere",
+    )
+    record_parser.add_argument(
         "--camera-elevation-deg",
         type=float,
         default=-28.0,
@@ -255,6 +294,85 @@ def register(subparsers: Any) -> None:
         help="Camera mode: orbit sweep or fixed tri-view capture",
     )
     record_parser.add_argument(
+        "--recording-protocol",
+        choices=["standard", "aim_style", "aim_style_fixed_end"],
+        default="standard",
+        help=(
+            "Acquisition protocol. aim_style adds a fixed-state dense orbit scan followed by a "
+            "single-view moving-camera interaction video; aim_style_fixed_end additionally "
+            "records a fixed-final-state orbit."
+        ),
+    )
+    record_parser.add_argument(
+        "--aim-static-scan-views",
+        type=int,
+        default=24,
+        help="Number of uniformly spaced views in the AiM start-state scan",
+    )
+    record_parser.add_argument(
+        "--aim-static-scan-elevation-deg",
+        type=float,
+        default=15.0,
+        help="Camera elevation for the AiM start-state scan",
+    )
+    record_parser.add_argument(
+        "--aim-end-scan-views",
+        type=int,
+        default=12,
+        help="Number of fixed-final-state views for aim_style_fixed_end",
+    )
+    record_parser.add_argument(
+        "--aim-interaction-camera-orbits",
+        type=float,
+        default=1.0,
+        help="Number of camera orbits during the AiM monocular interaction video",
+    )
+    record_parser.add_argument(
+        "--aim-interaction-elevation-amplitude-deg",
+        type=float,
+        default=10.0,
+        help="Sinusoidal elevation amplitude during the AiM interaction video",
+    )
+    record_parser.add_argument(
+        "--interaction-camera-trajectory",
+        choices=["current_orbit", "front_loaded_orbit", "front_static_then_orbit", "front_oscillate"],
+        default="current_orbit",
+        help=(
+            "AiM interaction camera timing. front_loaded_orbit spends the articulated-motion "
+            "interval on the front hemisphere and completes the orbit after motion ends; "
+            "front_oscillate stays on the front and uses camera-orbits as its half-amplitude in turns."
+        ),
+    )
+    record_parser.add_argument(
+        "--aim-interaction-motion-end-fraction",
+        type=float,
+        default=0.94,
+        help=(
+            "Normalized frame time when articulated motion ends; used only by non-uniform "
+            "AiM interaction camera trajectories"
+        ),
+    )
+    record_parser.add_argument(
+        "--aim-interaction-fixed-view-azimuths-deg",
+        type=float,
+        nargs="+",
+        default=(),
+        help=(
+            "Diagnostic synchronized fixed interaction views. Every listed object-centric "
+            "azimuth is rendered at each simulation timestep with the same deformation time."
+        ),
+    )
+    record_parser.add_argument(
+        "--aim-interaction-fixed-view-elevations-deg",
+        type=float,
+        nargs="+",
+        default=(),
+        help=(
+            "Optional elevations paired with the fixed interaction azimuths. If omitted, "
+            "all fixed views use --camera-elevation-deg."
+        ),
+    )
+    record_parser.add_argument(
         "--camera-triview-spacing-deg",
         type=float,
         default=45.0,
@@ -277,9 +395,14 @@ def register(subparsers: Any) -> None:
 
     record_parser.add_argument(
         "--control-mode",
-        choices=["track", "free"],
+        choices=["track", "free", "staggered", "paper_sequential", "paper_simultaneous"],
         default="track",
-        help="Control mode: 'track' uses PD tracking; 'free' only applies initial conditions then runs with no external force",
+        help=(
+            "Control mode: 'track' drives one joint, 'free' applies only initial conditions, and "
+            "'staggered' drives every hinge/slide joint in a distinct time slot, and "
+            "'paper_sequential' and 'paper_simultaneous' drive explicit per-joint ranges with "
+            "sequential or synchronized smoothstep timing"
+        ),
     )
     record_parser.add_argument(
         "--random-initial-qpos",
@@ -419,6 +542,28 @@ def register(subparsers: Any) -> None:
     )
     record_parser.add_argument("--control-kp", type=float, default=30.0, help="Joint tracking P gain")
     record_parser.add_argument("--control-kd", type=float, default=3.0, help="Joint tracking D gain")
+    record_parser.add_argument(
+        "--staggered-max-acceleration",
+        type=float,
+        default=50.0,
+        help="Maximum inertia-scaled joint acceleration used by staggered PD control",
+    )
+    record_parser.add_argument(
+        "--paper-simultaneous-joint",
+        action="append",
+        nargs=3,
+        metavar=("NAME", "START_Q", "END_Q"),
+        default=[],
+        help=(
+            "Exact joint range for --control-mode paper_sequential/paper_simultaneous. Repeat once for every "
+            "controlled hinge/slide joint."
+        ),
+    )
+    record_parser.add_argument(
+        "--disable-gravity",
+        action="store_true",
+        help="Disable gravity during recording; useful for kinematic sweeps with placeholder inertial parameters",
+    )
     record_parser.add_argument("--seed", type=int, default=0, help="Random seed")
 
     record_parser.add_argument(
@@ -470,6 +615,11 @@ def register(subparsers: Any) -> None:
         "--disable-target-mesh-collision",
         action="store_true",
         help="Disable collision on the target object's mesh geoms while keeping them rendered",
+    )
+    record_parser.add_argument(
+        "--disable-target-collision",
+        action="store_true",
+        help="Disable collision on every target-object geom while keeping visual geoms rendered",
     )
     record_parser.add_argument(
         "--hide-clear-meshes",

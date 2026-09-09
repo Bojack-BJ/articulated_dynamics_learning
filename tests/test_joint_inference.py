@@ -21,6 +21,43 @@ def _rotation_z(angle_rad: float) -> list[list[float]]:
 
 
 class JointInferenceTests(unittest.TestCase):
+    def test_track_translation_axis_uses_full_path_for_round_trip_motion(self) -> None:
+        inferencer = JointInferencer(
+            JointInferenceConfig(
+                input_path="unused.json",
+                mujoco_prior="off",
+                min_track_residual_tracks=4,
+                translation_threshold_m=0.02,
+            )
+        )
+        offsets = [0.0, 0.05, 0.10, 0.05, 0.0]
+        inferencer._tracks_by_part = {
+            2: [
+                {
+                    "track_id": track_id,
+                    "part_id": 2,
+                    "samples": [
+                        {
+                            "frame_index": frame_index,
+                            "xyz_world": [0.01 * track_id, offset, 0.0],
+                            "visible": True,
+                            "depth_valid": True,
+                        }
+                        for frame_index, offset in enumerate(offsets)
+                    ],
+                }
+                for track_id in range(8)
+            ]
+        }
+
+        result = inferencer._track_translation_axis(2, set(range(len(offsets))))
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["source"], "track_centered_path_pca")
+        self.assertAlmostEqual(abs(result["axis"][1]), 1.0, places=5)
+        self.assertAlmostEqual(result["displacement_norm_m"], 0.10, places=5)
+
     def test_infer_joints_parser_accepts_arguments(self) -> None:
         parser = build_parser()
         args = parser.parse_args(

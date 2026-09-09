@@ -1,0 +1,5 @@
+object_id	category	paper_object_label	interaction_frames	fps	source_frame_index	recording_protocol	aim_end_scan_views	protocol_note
+partnet_47024	door	Storage-47024	200	15	199	aim_style_fixed_end	12	Paper-like interaction plus fixed-final-state 12-view scan
+partnet_11304	refrigerator	Fridge-11304	200	15	199	aim_style_fixed_end	12	Paper-like interaction plus fixed-final-state 12-view scan
+partnet_47648	door	Storage-47648	500	15	499	aim_style_fixed_end	12	Paper-like interaction plus fixed-final-state 12-view scan
+partnet_31249	door	Table-31249	500	15	499	aim_style_fixed_end	12	Paper-like interaction plus fixed-final-state 12-view scan

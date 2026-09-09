@@ -63,6 +63,7 @@ class BatchObjectArtifacts:
     poses_json: Path
     joints_json: Path
     viewer_html: Path
+    quality_tracks_json: Path
     inferred_articulation_dir: Path
     articulation_artifact_json: Path
     mjcf_xml: Path
@@ -84,6 +85,7 @@ class BatchObjectArtifacts:
             poses_json=pointcloud_dir / "part_poses.json",
             joints_json=pointcloud_dir / "joint_inference.json",
             viewer_html=pointcloud_dir / "viewer_pose_flow.html",
+            quality_tracks_json=pointcloud_dir / "track_quality" / "motion_part_tracks_with_quality.json",
             inferred_articulation_dir=inferred_articulation_dir,
             articulation_artifact_json=inferred_articulation_dir / "articulation_artifact.json",
             mjcf_xml=urdf_dir / f"{object_id}.mjcf.xml",
@@ -107,6 +109,7 @@ class ArticulationBatchConfig:
     cotracker_checkpoint: Path | None = None
     track_device: str | None = None
     tracking_jobs: int | None = None
+    stop_after: str = "full"
     fuse_pixel_stride: int = 8
     fuse_voxel_size_m: float = 0.02
     min_tracks_per_part: int = 4
@@ -114,6 +117,8 @@ class ArticulationBatchConfig:
     joint_translation_threshold_m: float | None = None
     mujoco_prior_mode: str = "off"
     generate_viewer: bool = True
+    viewer_mode: str = "advanced"
+    viewer_axis_remap: str = "x,z,-y"
     dynamics_backend: str = "off"
     dynamics_config: Path | None = None
     dynamics_jobs: int | None = None
@@ -435,7 +440,10 @@ class ArticulationBatchRunner:
             )
             self._run_cli(record_argv, stream)
 
-        if self._should_skip(artifacts.manifest_json):
+        if self.config.stop_after == "recording":
+            return "completed"
+
+        if self.config.stop_after != "tracking" and self._should_skip(artifacts.manifest_json):
             self._announce(
                 spec.object_id,
                 index,
@@ -443,7 +451,7 @@ class ArticulationBatchRunner:
                 f"resume: skip fuse-pointcloud; found {artifacts.manifest_json}",
                 stream,
             )
-        else:
+        elif self.config.stop_after != "tracking":
             self._announce(spec.object_id, index, total, "fuse-pointcloud", stream)
             self._run_cli(
                 [
@@ -493,6 +501,9 @@ class ArticulationBatchRunner:
                     track_overrides,
                 )
                 self._run_cli(track_argv, stream)
+
+        if self.config.stop_after == "tracking":
+            return "completed"
 
         if self._should_skip(artifacts.poses_json):
             self._announce(
@@ -637,10 +648,55 @@ class ArticulationBatchRunner:
                     stream,
                 )
             else:
-                self._announce(spec.object_id, index, total, "visualize-pointcloud", stream)
-                self._run_cli(
-                    [
-                        "visualize-pointcloud",
+                viewer_stage = (
+                    "visualize-object-mask-flow-html"
+                    if self.config.viewer_mode == "advanced"
+                    else "visualize-pointcloud"
+                )
+                self._announce(spec.object_id, index, total, viewer_stage, stream)
+                if self.config.viewer_mode == "advanced":
+                    if self._should_skip(artifacts.quality_tracks_json):
+                        self._announce(
+                            spec.object_id,
+                            index,
+                            total,
+                            f"resume: skip compute-track-quality; found {artifacts.quality_tracks_json}",
+                            stream,
+                        )
+                    else:
+                        self._announce(spec.object_id, index, total, "compute-track-quality", stream)
+                        self._run_cli(
+                            [
+                                "compute-track-quality",
+                                str(artifacts.tracks_json),
+                                "--output-dir",
+                                str(artifacts.quality_tracks_json.parent),
+                            ],
+                            stream,
+                        )
+                    viewer_argv = [
+                        viewer_stage,
+                        str(artifacts.quality_tracks_json),
+                        "--output-html",
+                        str(artifacts.viewer_html),
+                        "--joint-inference",
+                        str(artifacts.joints_json),
+                        "--background-fusion-manifest",
+                        str(artifacts.manifest_json),
+                        "--background-max-points",
+                        "5000",
+                        "--mjcf-replay-episode",
+                        str(artifacts.episode_json),
+                        "--max-tracks",
+                        "1000",
+                        "--frame-stride",
+                        "1",
+                        "--axis-remap",
+                        self.config.viewer_axis_remap,
+                    ]
+                else:
+                    viewer_argv = [
+                        viewer_stage,
                         str(artifacts.manifest_json),
                         "--output-html",
                         str(artifacts.viewer_html),
@@ -650,20 +706,29 @@ class ArticulationBatchRunner:
                         str(artifacts.poses_json),
                         "--joint-inference-json",
                         str(artifacts.joints_json),
-                    ],
-                    stream,
-                )
+                    ]
+                self._run_cli(viewer_argv, stream)
         return "completed"
 
     def _should_skip(self, output_path: Path) -> bool:
         return bool(self.config.resume and output_path.exists())
 
     def _terminal_stage_name(self) -> str:
+        if self.config.stop_after == "recording":
+            return "record-mujoco"
+        if self.config.stop_after == "tracking":
+            return "track-part-pixels"
         if self.config.dynamics_backend != "off":
             return f"identify-dynamics-{self.config.dynamics_backend}"
-        return "visualize-pointcloud" if self.config.generate_viewer else "infer-joints"
+        if self.config.generate_viewer:
+            return "visualize-object-mask-flow-html" if self.config.viewer_mode == "advanced" else "visualize-pointcloud"
+        return "infer-joints"
 
     def _terminal_artifact(self, artifacts: BatchObjectArtifacts) -> Path:
+        if self.config.stop_after == "recording":
+            return artifacts.episode_json
+        if self.config.stop_after == "tracking":
+            return artifacts.tracks_json
         if self.config.dynamics_backend != "off":
             return self._dynamics_artifact(artifacts)
         return artifacts.viewer_html if self.config.generate_viewer else artifacts.joints_json

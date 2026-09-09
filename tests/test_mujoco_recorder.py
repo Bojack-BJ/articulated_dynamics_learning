@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import math
+import random
 import tempfile
 import unittest
-import random
 from pathlib import Path
+
+import numpy as np
 
 from rgbd_urdf_mvp.cli import build_parser
 from rgbd_urdf_mvp.core.serialization import load_json
@@ -14,12 +17,201 @@ from rgbd_urdf_mvp.sim.mujoco_recorder import (
     MuJoCoEpisodeRepackConfig,
     MuJoCoEpisodeRepacker,
     MuJoCoRecordConfig,
+    _fit_camera_to_bounding_spheres,
     _fovy_deg_from_intrinsics,
+    aim_interaction_camera_angles,
+    aim_static_scan_camera_angles,
     orbit_camera_pose,
 )
 
 
 class MuJoCoRecorderTests(unittest.TestCase):
+    def test_aim_static_scan_covers_full_orbit_without_duplicate_endpoint(self) -> None:
+        angles = aim_static_scan_camera_angles(
+            24,
+            azimuth_start_deg=20.0,
+            elevation_deg=15.0,
+        )
+        self.assertEqual(len(angles), 24)
+        self.assertAlmostEqual(angles[0][0], 20.0)
+        self.assertAlmostEqual(angles[-1][0], 365.0)
+        self.assertEqual({elevation for _, elevation in angles}, {15.0})
+        self.assertEqual(len({round(azimuth % 360.0, 6) for azimuth, _ in angles}), 24)
+
+    def test_aim_interaction_camera_path_is_not_linear_in_joint_open_fraction(self) -> None:
+        samples = []
+        joint_fractions = []
+        for index in range(21):
+            alpha = index / 20.0
+            azimuth, elevation = aim_interaction_camera_angles(
+                alpha,
+                azimuth_start_deg=10.0,
+                elevation_deg=15.0,
+                orbit_count=1.0,
+                elevation_amplitude_deg=10.0,
+            )
+            samples.append((azimuth, elevation))
+            joint_fractions.append(0.5 - 0.5 * math.cos(math.pi * alpha))
+        camera_steps = np.diff([azimuth for azimuth, _ in samples])
+        self.assertGreater(float(np.std(camera_steps)), 0.1)
+        linear_fit = np.polyfit(joint_fractions, [azimuth for azimuth, _ in samples], deg=1)
+        residual = np.asarray([azimuth for azimuth, _ in samples]) - np.polyval(linear_fit, joint_fractions)
+        self.assertGreater(float(np.max(np.abs(residual))), 5.0)
+        self.assertGreater(float(np.ptp([elevation for _, elevation in samples])), 10.0)
+
+    def test_front_loaded_orbit_uses_front_arc_then_completes_back_scan(self) -> None:
+        split = 0.94
+        samples = [
+            aim_interaction_camera_angles(
+                alpha,
+                azimuth_start_deg=300.0,
+                elevation_deg=-15.0,
+                orbit_count=1.0,
+                elevation_amplitude_deg=0.0,
+                trajectory="front_loaded_orbit",
+                motion_end_fraction=split,
+            )[0]
+            for alpha in (0.0, split, 1.0)
+        ]
+        self.assertEqual(samples, [300.0, 420.0, 660.0])
+
+    def test_front_loaded_orbit_is_monotonic_and_speed_continuous(self) -> None:
+        split = 0.8
+        alpha = np.linspace(0.0, 1.0, 1001)
+        azimuth = np.asarray(
+            [
+                aim_interaction_camera_angles(
+                    value,
+                    azimuth_start_deg=-90.0,
+                    elevation_deg=-15.0,
+                    orbit_count=1.0,
+                    elevation_amplitude_deg=0.0,
+                    trajectory="front_loaded_orbit",
+                    motion_end_fraction=split,
+                )[0]
+                for value in alpha
+            ]
+        )
+        self.assertTrue(np.all(np.diff(azimuth) >= 0.0))
+        split_index = int(split * 1000)
+        left_speed = azimuth[split_index] - azimuth[split_index - 1]
+        right_speed = azimuth[split_index + 1] - azimuth[split_index]
+        self.assertLess(abs(left_speed), 0.02)
+        self.assertLess(abs(right_speed), 0.2)
+
+    def test_front_oscillate_remains_within_front_arc(self) -> None:
+        samples = [
+            aim_interaction_camera_angles(
+                alpha,
+                azimuth_start_deg=50.0,
+                elevation_deg=-15.0,
+                orbit_count=35.0 / 360.0,
+                elevation_amplitude_deg=0.0,
+                trajectory="front_oscillate",
+            )[0]
+            for alpha in (0.0, 0.25, 0.5, 0.75, 1.0)
+        ]
+        np.testing.assert_allclose(samples, [50.0, 85.0, 50.0, 15.0, 50.0])
+
+    def test_record_parser_accepts_aim_style_protocol(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "record-mujoco",
+                "model.xml",
+                "--category",
+                "door",
+                "--object-id",
+                "aim-style-test",
+                "--recording-protocol",
+                "aim_style",
+                "--aim-static-scan-views",
+                "32",
+                "--aim-static-scan-elevation-deg",
+                "12",
+                "--aim-interaction-camera-orbits",
+                "1.5",
+                "--aim-interaction-elevation-amplitude-deg",
+                "8",
+                "--interaction-camera-trajectory",
+                "front_loaded_orbit",
+                "--aim-interaction-motion-end-fraction",
+                "0.9",
+                "--aim-interaction-fixed-view-azimuths-deg",
+                "-45",
+                "45",
+                "135",
+                "225",
+                "--aim-interaction-fixed-view-elevations-deg",
+                "-10",
+                "-10",
+                "-10",
+                "25",
+            ]
+        )
+        self.assertEqual(args.recording_protocol, "aim_style")
+        self.assertEqual(args.aim_static_scan_views, 32)
+        self.assertAlmostEqual(args.aim_static_scan_elevation_deg, 12.0)
+        self.assertAlmostEqual(args.aim_interaction_camera_orbits, 1.5)
+        self.assertAlmostEqual(args.aim_interaction_elevation_amplitude_deg, 8.0)
+        self.assertEqual(args.interaction_camera_trajectory, "front_loaded_orbit")
+        self.assertAlmostEqual(args.aim_interaction_motion_end_fraction, 0.9)
+        self.assertEqual(
+            args.aim_interaction_fixed_view_azimuths_deg,
+            [-45.0, 45.0, 135.0, 225.0],
+        )
+        self.assertEqual(
+            args.aim_interaction_fixed_view_elevations_deg,
+            [-10.0, -10.0, -10.0, 25.0],
+        )
+
+    def test_record_parser_accepts_single_fixed_aim_interaction_view(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "record-mujoco",
+                "model.xml",
+                "--category",
+                "door",
+                "--object-id",
+                "aim-fixed-front-test",
+                "--recording-protocol",
+                "aim_style_fixed_end",
+                "--aim-interaction-fixed-view-azimuths-deg",
+                "50",
+                "--aim-interaction-fixed-view-elevations-deg",
+                "15",
+            ]
+        )
+        self.assertEqual(args.aim_interaction_fixed_view_azimuths_deg, [50.0])
+        self.assertEqual(args.aim_interaction_fixed_view_elevations_deg, [15.0])
+
+    def test_camera_fit_scales_with_object_bounds(self) -> None:
+        lookat, distance, radius = _fit_camera_to_bounding_spheres(
+            [[-0.5, 0.0, 0.0], [0.5, 0.0, 0.0]],
+            [0.25, 0.25],
+            fovy_deg=60.0,
+            fill_ratio=0.6,
+        )
+        self.assertEqual(lookat, [0.0, 0.0, 0.0])
+        self.assertAlmostEqual(radius, 0.75)
+        self.assertGreater(distance, radius)
+
+    def test_record_parser_accepts_auto_camera_fit(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "record-mujoco",
+                "model.xml",
+                "--category",
+                "door",
+                "--object-id",
+                "camera-fit-test",
+                "--auto-camera-fit",
+                "--camera-fit-fill-ratio",
+                "0.55",
+            ]
+        )
+        self.assertTrue(args.auto_camera_fit)
+        self.assertAlmostEqual(args.camera_fit_fill_ratio, 0.55)
+
     def test_fovy_inferred_from_intrinsics(self) -> None:
         fovy_deg = _fovy_deg_from_intrinsics(
             height=480,
@@ -61,6 +253,81 @@ class MuJoCoRecorderTests(unittest.TestCase):
         self.assertEqual(args.object_id, "door-unit-test-001")
         self.assertEqual(args.rgb_format, "png")
         self.assertEqual(args.depth_format, "png")
+
+    def test_record_mujoco_parser_accepts_staggered_control(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "record-mujoco",
+                "model.xml",
+                "--category",
+                "door",
+                "--object-id",
+                "multi-joint-test",
+                "--control-mode",
+                "staggered",
+            ]
+        )
+        self.assertEqual(args.control_mode, "staggered")
+
+    def test_paper_simultaneous_target_uses_shared_smoothstep(self) -> None:
+        target = MuJoCoEpisodeRecorder._paper_simultaneous_target
+        self.assertAlmostEqual(target(time_s=0.0, duration_s=4.0, start_q=0.0, end_q=1.0), 0.0)
+        self.assertAlmostEqual(target(time_s=2.0, duration_s=4.0, start_q=0.0, end_q=1.0), 0.5)
+        self.assertAlmostEqual(target(time_s=4.0, duration_s=4.0, start_q=0.0, end_q=1.0), 1.0)
+        self.assertAlmostEqual(target(time_s=2.0, duration_s=4.0, start_q=0.0, end_q=0.7), 0.35)
+
+    def test_paper_sequential_target_uses_same_range_in_nonoverlapping_slots(self) -> None:
+        target = MuJoCoEpisodeRecorder._paper_sequential_target
+        common = {"duration_s": 4.0, "joint_count": 2, "start_q": 0.0, "end_q": 1.0}
+        self.assertAlmostEqual(target(time_s=1.0, joint_index=0, **common), 0.5)
+        self.assertAlmostEqual(target(time_s=1.0, joint_index=1, **common), 0.0)
+        self.assertAlmostEqual(target(time_s=3.0, joint_index=0, **common), 1.0)
+        self.assertAlmostEqual(target(time_s=3.0, joint_index=1, **common), 0.5)
+
+    def test_record_mujoco_parser_accepts_paper_simultaneous_control(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "record-mujoco",
+                "model.xml",
+                "--category",
+                "refrigerator",
+                "--object-id",
+                "paper-test",
+                "--control-mode",
+                "paper_simultaneous",
+                "--paper-simultaneous-joint",
+                "hinge",
+                "0",
+                "1.570796",
+            ]
+        )
+        self.assertEqual(args.control_mode, "paper_simultaneous")
+        self.assertEqual(args.paper_simultaneous_joint, [["hinge", "0", "1.570796"]])
+
+    def test_staggered_targets_use_isolated_slots_and_alternating_directions(self) -> None:
+        target = MuJoCoEpisodeRecorder._staggered_target
+        self.assertAlmostEqual(
+            target(time_s=0.0, duration_s=6.0, joint_index=0, joint_count=2, lower=0.0, upper=1.0),
+            0.0,
+        )
+        self.assertAlmostEqual(
+            target(time_s=0.0, duration_s=6.0, joint_index=1, joint_count=2, lower=0.0, upper=1.0),
+            1.0,
+        )
+        self.assertAlmostEqual(
+            target(time_s=2.5, duration_s=6.0, joint_index=0, joint_count=2, lower=0.0, upper=1.0),
+            1.0,
+        )
+        self.assertAlmostEqual(
+            target(time_s=2.5, duration_s=6.0, joint_index=1, joint_count=2, lower=0.0, upper=1.0),
+            1.0,
+        )
+        self.assertLess(
+            target(time_s=4.0, duration_s=6.0, joint_index=1, joint_count=2, lower=0.0, upper=1.0),
+            1.0,
+        )
 
     def test_record_mujoco_parser_accepts_video_arguments(self) -> None:
         parser = build_parser()
@@ -143,6 +410,21 @@ class MuJoCoRecorderTests(unittest.TestCase):
             ]
         )
         self.assertTrue(args.disable_target_mesh_collision)
+
+    def test_record_mujoco_parser_accepts_disable_target_collision(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "record-mujoco",
+                "model.xml",
+                "--category",
+                "microwave",
+                "--object-id",
+                "microwave-unit-test-001",
+                "--disable-target-collision",
+            ]
+        )
+        self.assertTrue(args.disable_target_collision)
 
     def test_record_mujoco_parser_accepts_hide_clear_meshes(self) -> None:
         parser = build_parser()
@@ -423,6 +705,22 @@ class MuJoCoRecorderTests(unittest.TestCase):
                 continue
             self.assertEqual(int(model.geom_contype[geom_id]), 0)
             self.assertEqual(int(model.geom_conaffinity[geom_id]), 0)
+
+    def test_disable_target_collision_zeros_all_target_contacts(self) -> None:
+        try:
+            import mujoco  # type: ignore
+        except ImportError:
+            self.skipTest("mujoco not installed")
+
+        model_path = Path(__file__).resolve().parents[1] / "examples" / "mujoco_models" / "Microwave041.xml"
+        model = mujoco.MjModel.from_xml_path(str(model_path))
+        recorder = MuJoCoEpisodeRecorder(
+            MuJoCoRecordConfig(model_path, Path("outputs"), "microwave-test", "microwave")
+        )
+        target_geom_ids = set(range(model.ngeom))
+        recorder._disable_target_collision(model, target_geom_ids)
+        self.assertTrue(all(int(model.geom_contype[geom_id]) == 0 for geom_id in target_geom_ids))
+        self.assertTrue(all(int(model.geom_conaffinity[geom_id]) == 0 for geom_id in target_geom_ids))
 
     def test_collect_clear_mesh_geom_ids_finds_microwave_clear_door(self) -> None:
         try:

@@ -24,6 +24,22 @@ def _write_pgm_u16(path: Path, width: int, height: int, values: list[int]) -> No
 
 
 class PointCloudFusionTests(unittest.TestCase):
+    def test_opencv_z_depth_uses_image_y_down(self) -> None:
+        point = _camera_to_world_point(
+            u_coord=1,
+            v_coord=2,
+            depth_m=1.0,
+            intrinsics={"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0},
+            camera_pose=[
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            depth_convention="opencv-z-depth",
+        )
+        self.assertEqual(point, (1.0, 2.0, 1.0))
+
     def test_camera_to_world_point_maps_center_ray_to_lookat_for_mujoco_orbit_pose(self) -> None:
         intrinsics = {"fx": 240.0, "fy": 240.0, "cx": 319.5, "cy": 239.5}
         lookat = [0.0, 0.0, 1.0]

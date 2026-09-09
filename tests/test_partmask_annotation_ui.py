@@ -14,6 +14,12 @@ from PIL import Image
 
 
 class PartMaskAnnotationUiTest(unittest.TestCase):
+    def test_existing_mask_transport_decodes_visible_label_offset(self) -> None:
+        source = Path("scripts/serve_partmask_annotation.py").read_text()
+        self.assertIn("labels + 32", source)
+        self.assertIn("encoded - 32", source)
+        self.assertIn("max-width: calc(100% - 48px)", source)
+
     def test_mask_status_exposes_mask_file_version(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

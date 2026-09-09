@@ -110,6 +110,8 @@ class ArticulationBatchTests(unittest.TestCase):
                 "--dynamics-render-gl-backend",
                 "cgl",
                 "--plot-dynamics",
+                "--stop-after",
+                "tracking",
             ]
         )
 
@@ -119,6 +121,7 @@ class ArticulationBatchTests(unittest.TestCase):
         self.assertTrue(args.dynamics_enable_pjrt_compatibility)
         self.assertEqual(args.dynamics_render_gl_backend, "cgl")
         self.assertTrue(args.plot_dynamics)
+        self.assertEqual(args.stop_after, "tracking")
 
     def test_convert_usd_mjcf_batch_parser_accepts_arguments(self) -> None:
         parser = build_parser()

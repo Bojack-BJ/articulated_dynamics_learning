@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "status": "annotation_pilot_not_training_ready",
+  "target_interactions": [20, 30],
+  "training_source": "PartNet pretraining plus reviewed original Arti4D",
+  "exclude_from_training": ["all_self_recorded_real_scenes"],
+  "split_policy": "physical-instance grouping; freeze only after identity review",
+  "annotation_policy": {
+    "preserve_source_masks": true,
+    "object_mask_is_not_part_gt": true,
+    "propagation_scope": "single interaction segment",
+    "overwrite_reviewed_frames": false,
+    "axis_coordinate_frame": "documented common world frame",
+    "prismatic_pivot_supervision": false,
+    "training_requires": ["identity_review", "rgb_depth_pose_review", "part_review", "axis_review"]
+  },
+  "candidates": [
+    {
+      "id": "rh078_right_drawer_1",
+      "environment": "rh078",
+      "sequence": "scene_2025-04-09-10-38-38",
+      "axis_name": "right-drawer-1",
+      "source_cue_range_inclusive": [508, 563],
+      "local_cue_range_inclusive": [30, 85],
+      "raw_frames": 116,
+      "interaction_frames": 56,
+      "remote_data_path": "/lumos-vePFS/suzhou/Users/lixiaotong/datasets/arti4d/scene_2025-04-09-10-38-38",
+      "physical_instance_id": null,
+      "split": "pending",
+      "review_status": "pending"
+    },
+    {
+      "id": "rh078_blue_drawer",
+      "environment": "rh078",
+      "sequence": "scene_2025-04-07-11-48-40",
+      "axis_name": "blue-drawer",
+      "source_cue_range_inclusive": [1063, 1132],
+      "local_cue_range_inclusive": [30, 99],
+      "raw_frames": 130,
+      "interaction_frames": 70,
+      "remote_data_path": "/lumos-vePFS/suzhou/Users/lixiaotong/datasets/arti4d_subsets/arti4d_blue_drawer",
+      "physical_instance_id": null,
+      "split": "pending",
+      "review_status": "pending"
+    },
+    {
+      "id": "rh078_cabinet_right",
+      "environment": "rh078",
+      "sequence": "scene_2025-04-04-19-14-38",
+      "axis_name": "cabinet-right",
+      "source_cue_range_inclusive": [366, 475],
+      "local_cue_range_inclusive": [30, 139],
+      "raw_frames": 170,
+      "interaction_frames": 110,
+      "remote_data_path": "/lumos-vePFS/suzhou/Users/lixiaotong/datasets/arti4d_subsets/arti4d_cabinet_right",
+      "physical_instance_id": null,
+      "split": "pending",
+      "review_status": "pending"
+    }
+  ]
+}

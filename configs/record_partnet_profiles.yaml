@@ -1,0 +1,29 @@
+command: record-mujoco
+args:
+  model: outputs/partnet_profile_samples/models/partnet_12531.xml
+  category: dishwasher
+  object-id: partnet_single_revolute_12531
+  output-dir: outputs/partnet_profile_recordings
+  duration-s: 8
+  fps: 30
+  width: 480
+  height: 352
+  control-mode: staggered
+  staggered-max-acceleration: 50.0
+  all-joints: true
+  disable-gravity: true
+  disable-target-collision: true
+  perturbation-scale: 0.0
+  rgb-format: png
+  depth-format: png
+  mask-format: png
+  camera-distance: 3.0
+  auto-camera-fit: true
+  camera-fit-fill-ratio: 0.42
+  camera-mode: triview
+  camera-triview-spacing-deg: 60
+  camera-elevation-deg: -15
+  camera-fovy-deg: 60
+  lookat: [0.0, 0.0, 0.0]
+  segmentation-masks: true
+  part-segmentation-masks: true

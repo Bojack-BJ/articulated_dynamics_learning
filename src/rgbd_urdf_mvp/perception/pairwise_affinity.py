@@ -69,7 +69,9 @@ def load_pairwise_manifest(path: str | Path) -> list[dict[str, str]]:
     if not rows or not required.issubset(rows[0]):
         raise ValueError(f"Pairwise manifest requires columns: {sorted(required)}")
     for row in rows:
-        for key in ("tracks_path", "features_npz"):
+        for key in ("tracks_path", "features_npz", "relation_gt_path"):
+            if not row.get(key):
+                continue
             candidate = Path(row[key]).expanduser()
             if not candidate.is_absolute():
                 candidate = manifest_path.parent / candidate

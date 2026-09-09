@@ -1,0 +1,9 @@
+scene_id	scene_dir_name	dataset_root	camera_pose_order	output_name	status
+scene29	scene29_case	/lumos-vePFS/suzhou/Users/lixiaotong/datasets/track2art_real_20260814/scenes	0	real_scene29_track2art_dense_filtered_v1	complete
+scene30	scene30_small_box	/lumos-vePFS/suzhou/Users/lixiaotong/datasets/track2art_real_20260814/scenes	0,1,2	real_scene30_track2art_dense_filtered_v1	complete
+scene31	scene31_small_fridge	/lumos-vePFS/suzhou/Users/lixiaotong/datasets/track2art_real_20260814/scenes	0,1,2	real_scene31_track2art_dense_filtered_v1	complete
+scene32	scene32	/lumos-vePFS/suzhou/Users/lixiaotong/datasets/track2art_real_20260814/scenes	2,0,1	real_scene32_track2art_dense_filtered_v1	complete
+scene33	scene33	/lumos-vePFS/suzhou/Users/lixiaotong/datasets/track2art_real_20260814/scenes	0,1,2	real_scene33_track2art_dense_filtered_v1	needs_mask
+scene34	scene34	/lumos-vePFS/suzhou/Users/lixiaotong/datasets/track2art_real_20260814/scenes	2,0,1	real_scene34_track2art_dense_filtered_v1	complete
+drawer_hand	drawer_hand	/lumos-vePFS/suzhou/Users/lixiaotong/datasets/track2art_real_20260830/extracted	0,1,2	real_drawer_hand_track2art_dense_filtered_v1	complete
+drawer_hand2	drawer_hand2	/lumos-vePFS/suzhou/Users/lixiaotong/datasets/track2art_real_20260830/extracted	0,1,2	real_drawer_hand2_track2art_dense_filtered_v1	complete

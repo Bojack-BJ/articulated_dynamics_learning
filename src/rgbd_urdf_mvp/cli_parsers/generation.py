@@ -298,6 +298,19 @@ def register(subparsers: Any) -> None:
     reart_export_parser.add_argument("--frame-stride", type=int, default=1, help="Export every Nth frame")
     reart_export_parser.add_argument("--max-frames", type=int, default=None, help="Optional cap on exported frames")
     reart_export_parser.add_argument(
+        "--frame-indices",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Explicit source frame indices; mutually exclusive with non-default stride/max-frames",
+    )
+    reart_export_parser.add_argument(
+        "--protocol-profile",
+        choices=("custom", "sapien_count_matched_4frame"),
+        default="custom",
+        help="Record whether sampling is custom or matches only the official Sapiens four-frame count",
+    )
+    reart_export_parser.add_argument(
         "--max-points-per-frame",
         type=int,
         default=20000,

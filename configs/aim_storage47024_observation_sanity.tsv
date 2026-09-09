@@ -1,0 +1,4 @@
+object_id	recording_id	category	paper_object_label	interaction_frames	fps	source_frame_index	recording_protocol	aim_end_scan_views	camera_fit_fill_ratio	camera_azimuth_start_deg	aim_interaction_elevation_amplitude_deg	interaction_camera_trajectory	interaction_fixed_view_azimuths_deg	interaction_fixed_view_elevations_deg	protocol_note
+partnet_47024	partnet_47024_paper_like_current	door	Storage-47024	200	15	199	aim_style	12	0.42	50	10	current_orbit			Existing paper-like monocular control
+partnet_47024	partnet_47024_close_monocular_v3	door	Storage-47024	200	15	199	aim_style	12	0.48	50	10	current_orbit			Same monocular orbit and joint trajectory with safe close-range framing and no intended clipping
+partnet_47024	partnet_47024_four_view_upper_bound	door	Storage-47024	200	15	199	aim_style_fixed_end	12	0.60	50	0	current_orbit	-45,45,135,225	-15,-15,-15,25	Synchronized generic fixed four-view interaction plus fixed end scan

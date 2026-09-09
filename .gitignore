@@ -2,6 +2,13 @@ __pycache__/
 *.pyc
 .DS_Store
 outputs/
+data/
+backups/
+.tmp/
+tmp/
+.pytest_cache/
+paper_assets/
+patches/
 .venv/
 .venvs/
 Lightwheel/

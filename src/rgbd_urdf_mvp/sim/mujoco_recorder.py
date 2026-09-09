@@ -59,6 +59,67 @@ def orbit_camera_pose(
     ]
 
 
+def aim_static_scan_camera_angles(
+    view_count: int,
+    *,
+    azimuth_start_deg: float,
+    elevation_deg: float,
+) -> list[tuple[float, float]]:
+    """Return a complete, endpoint-exclusive static orbit."""
+    if view_count < 2:
+        raise ValueError("AiM static scan requires at least two views")
+    return [
+        (float(azimuth_start_deg) + 360.0 * index / view_count, float(elevation_deg))
+        for index in range(view_count)
+    ]
+
+
+def aim_interaction_camera_angles(
+    alpha: float,
+    *,
+    azimuth_start_deg: float,
+    elevation_deg: float,
+    orbit_count: float,
+    elevation_amplitude_deg: float,
+    trajectory: str = "current_orbit",
+    motion_end_fraction: float = 0.94,
+) -> tuple[float, float]:
+    """Return an AiM-style camera path independent of the joint controller."""
+    alpha = min(max(float(alpha), 0.0), 1.0)
+    if trajectory == "current_orbit":
+        # The phase modulation deliberately differs from all joint control curves.
+        orbit_phase = alpha + 0.035 * math.sin(2.0 * math.pi * 1.7 * alpha + 0.43)
+    elif trajectory in {"front_loaded_orbit", "front_static_then_orbit"}:
+        split = min(max(float(motion_end_fraction), 0.05), 0.99)
+
+        def smoothstep(value: float) -> float:
+            value = min(max(value, 0.0), 1.0)
+            return value * value * (3.0 - 2.0 * value)
+
+        # Storage-like objects expose their articulated front over a 120-degree
+        # front-oblique arc. Reserve the remaining 240 degrees for reconstruction
+        # after the sequential joint schedule completes.
+        front_fraction = 1.0 / 3.0 if trajectory == "front_loaded_orbit" else 0.08
+        if alpha <= split:
+            orbit_phase = front_fraction * smoothstep(alpha / split)
+        else:
+            post_motion_alpha = (alpha - split) / (1.0 - split)
+            orbit_phase = front_fraction + (1.0 - front_fraction) * smoothstep(
+                post_motion_alpha
+            )
+    elif trajectory == "front_oscillate":
+        # Keep the interaction camera on the object front while retaining smooth
+        # parallax. Here orbit_count is the azimuth half-amplitude in turns.
+        orbit_phase = math.sin(2.0 * math.pi * alpha)
+    else:
+        raise ValueError(f"Unsupported AiM interaction camera trajectory: {trajectory}")
+    azimuth = float(azimuth_start_deg) + 360.0 * float(orbit_count) * orbit_phase
+    elevation = float(elevation_deg) + float(elevation_amplitude_deg) * math.sin(
+        2.0 * math.pi * 0.73 * alpha + 0.91
+    )
+    return azimuth, elevation
+
+
 def _write_ppm(path: Path, rgb: Any) -> None:
     height, width, channels = rgb.shape
     if channels != 3:
@@ -204,6 +265,34 @@ def _fovy_deg_from_intrinsics(height: int, camera_intrinsics: dict[str, Any]) ->
     return math.degrees(2.0 * math.atan(0.5 * float(height) / fy_value))
 
 
+def _fit_camera_to_bounding_spheres(
+    centers: list[list[float]],
+    radii: list[float],
+    *,
+    fovy_deg: float,
+    fill_ratio: float,
+    minimum_distance: float = 0.25,
+) -> tuple[list[float], float, float]:
+    """Fit a free camera to object geoms represented by conservative spheres."""
+    if not centers or len(centers) != len(radii):
+        raise ValueError("centers and radii must contain the same non-zero number of entries")
+    if not 0.0 < fill_ratio < 1.0:
+        raise ValueError("fill_ratio must be between 0 and 1")
+    if not 0.0 < fovy_deg < 180.0:
+        raise ValueError("fovy_deg must be between 0 and 180")
+
+    lower = [min(center[axis] - radius for center, radius in zip(centers, radii)) for axis in range(3)]
+    upper = [max(center[axis] + radius for center, radius in zip(centers, radii)) for axis in range(3)]
+    lookat = [(lower[axis] + upper[axis]) * 0.5 for axis in range(3)]
+    radius = max(
+        math.sqrt(sum((center[axis] - lookat[axis]) ** 2 for axis in range(3))) + geom_radius
+        for center, geom_radius in zip(centers, radii)
+    )
+    half_target_angle = math.radians(fovy_deg) * fill_ratio * 0.5
+    distance = max(float(minimum_distance), radius / max(math.sin(half_target_angle), 1e-6))
+    return lookat, distance, radius
+
+
 @dataclass(slots=True)
 class MuJoCoRecordConfig:
     model_path: str | Path
@@ -218,18 +307,33 @@ class MuJoCoRecordConfig:
     rgb_format: str = "ppm"
     depth_format: str = "pgm"
     camera_distance: float = 1.8
+    auto_camera_fit: bool = False
+    camera_fit_fill_ratio: float = 0.42
     camera_elevation_deg: float = 22.0
     camera_azimuth_start_deg: float = 20.0
     camera_azimuth_span_deg: float = 140.0
     camera_fovy_deg: float = 45.0
     camera_mode: str = "orbit"  # 'orbit' or 'triview'
     camera_triview_spacing_deg: float = 45.0
+    recording_protocol: str = "standard"
+    aim_static_scan_views: int = 24
+    aim_end_scan_views: int = 12
+    aim_static_scan_elevation_deg: float = 15.0
+    aim_interaction_camera_orbits: float = 1.0
+    aim_interaction_elevation_amplitude_deg: float = 10.0
+    aim_interaction_camera_trajectory: str = "current_orbit"
+    aim_interaction_motion_end_fraction: float = 0.94
+    aim_interaction_fixed_view_azimuths_deg: tuple[float, ...] = ()
+    aim_interaction_fixed_view_elevations_deg: tuple[float, ...] = ()
     lookat: tuple[float, float, float] = (0.0, 0.0, 0.8)
     perturbation_scale: float = 0.3
     control_kp: float = 30.0
     control_kd: float = 3.0
+    staggered_max_acceleration: float = 50.0
     seed: int = 0
-    control_mode: str = "track"  # 'track' or 'free'
+    control_mode: str = "track"  # 'track', 'free', 'staggered', 'paper_sequential', or 'paper_simultaneous'
+    # Explicit (joint name, start qpos, end qpos) targets for paper-style synchronized motion.
+    paper_simultaneous_joints: tuple[tuple[str, float, float], ...] = ()
     random_initial_qpos: bool = False
     auto_initial_qvel_from_limits: bool = False
     auto_initial_qvel_direction_mode: str = "away-from-qpos0"
@@ -259,6 +363,8 @@ class MuJoCoRecordConfig:
     mask_format: str = "pgm"
     write_concat_assets: bool = False
     disable_target_mesh_collision: bool = False
+    disable_target_collision: bool = False
+    disable_gravity: bool = False
     hide_clear_meshes: bool = False
     joint_name: str | None = None
     joint_id: int | None = None
@@ -314,12 +420,55 @@ class MuJoCoEpisodeRecorder:
             raise ValueError("rgb_format must be 'ppm' or 'png'")
         if self.config.depth_format not in {"pgm", "png"}:
             raise ValueError("depth_format must be 'pgm' or 'png'")
-        if self.config.control_mode not in {"track", "free"}:
-            raise ValueError("control_mode must be 'track' or 'free'")
+        if self.config.control_mode not in {
+            "track",
+            "free",
+            "staggered",
+            "paper_sequential",
+            "paper_simultaneous",
+        }:
+            raise ValueError(
+                "control_mode must be 'track', 'free', 'staggered', 'paper_sequential', or "
+                "'paper_simultaneous'"
+            )
+        if self.config.staggered_max_acceleration <= 0.0:
+            raise ValueError("staggered_max_acceleration must be positive")
         if self.config.camera_mode not in {"orbit", "triview"}:
             raise ValueError("camera_mode must be 'orbit' or 'triview'")
+        if self.config.recording_protocol not in {"standard", "aim_style", "aim_style_fixed_end"}:
+            raise ValueError(
+                "recording_protocol must be 'standard', 'aim_style', or 'aim_style_fixed_end'"
+            )
+        if self.config.aim_static_scan_views < 2:
+            raise ValueError("aim_static_scan_views must be >= 2")
+        if self.config.aim_end_scan_views < 2:
+            raise ValueError("aim_end_scan_views must be >= 2")
+        if self.config.aim_interaction_camera_orbits <= 0.0:
+            raise ValueError("aim_interaction_camera_orbits must be positive")
+        if self.config.aim_interaction_elevation_amplitude_deg < 0.0:
+            raise ValueError("aim_interaction_elevation_amplitude_deg must be >= 0")
+        if self.config.aim_interaction_camera_trajectory not in {
+            "current_orbit",
+            "front_loaded_orbit",
+            "front_static_then_orbit",
+            "front_oscillate",
+        }:
+            raise ValueError(
+                "aim_interaction_camera_trajectory must be 'current_orbit', "
+                "'front_loaded_orbit', 'front_static_then_orbit', or 'front_oscillate'"
+            )
+        if not 0.05 <= self.config.aim_interaction_motion_end_fraction <= 0.99:
+            raise ValueError("aim_interaction_motion_end_fraction must be in [0.05, 0.99]")
+        fixed_azimuths = self.config.aim_interaction_fixed_view_azimuths_deg
+        fixed_elevations = self.config.aim_interaction_fixed_view_elevations_deg
+        if fixed_elevations and len(fixed_elevations) != len(fixed_azimuths):
+            raise ValueError(
+                "AiM fixed interaction azimuth/elevation lists must have equal lengths"
+            )
         if self.config.camera_triview_spacing_deg <= 0.0:
             raise ValueError("camera_triview_spacing_deg must be positive")
+        if not 0.0 < self.config.camera_fit_fill_ratio < 1.0:
+            raise ValueError("camera_fit_fill_ratio must be between 0 and 1")
         if self.config.kick_duration_s < 0.0:
             raise ValueError("kick_duration_s must be >= 0")
         if self.config.kick_start_s < 0.0:
@@ -352,8 +501,20 @@ class MuJoCoEpisodeRecorder:
             raise ValueError("video_fps must be positive")
         if self.config.mask_format not in {"pgm", "png"}:
             raise ValueError("mask_format must be 'pgm' or 'png'")
-        if self.config.all_joints and self.config.control_mode != "free":
-            raise ValueError("all_joints requires control_mode='free'")
+        if self.config.all_joints and self.config.control_mode not in {
+            "free",
+            "staggered",
+            "paper_sequential",
+            "paper_simultaneous",
+        }:
+            raise ValueError(
+                "all_joints requires control_mode='free', 'staggered', 'paper_sequential', or "
+                "'paper_simultaneous'"
+            )
+        if self.config.control_mode == "staggered" and not self.config.all_joints:
+            raise ValueError("control_mode='staggered' requires all_joints")
+        if self.config.control_mode in {"paper_sequential", "paper_simultaneous"} and not self.config.all_joints:
+            raise ValueError("paper_sequential/paper_simultaneous requires all_joints")
         if self.config.staged_initial_qvel and self.config.control_mode != "free":
             raise ValueError("staged_initial_qvel requires control_mode='free'")
         if self.config.staged_initial_qvel and (self.config.joint_name is not None or self.config.joint_id is not None):
@@ -369,16 +530,21 @@ class MuJoCoEpisodeRecorder:
         model = mujoco.MjModel.from_xml_path(str(Path(self.config.model_path)))
         data = mujoco.MjData(model)
         model.opt.timestep = self.config.sim_dt
+        if self.config.disable_gravity:
+            model.opt.gravity[:] = 0.0
 
         model.vis.global_.fovy = self.config.camera_fovy_deg
         scene_option = None
         renderer = mujoco.Renderer(model, width=self.config.width, height=self.config.height)
 
         controlled = self._select_controlled_joints(mujoco, model)
+        paper_targets = self._paper_simultaneous_targets(mujoco, model, controlled)
         primary_joint_id, primary_qpos_adr, primary_dof_adr = controlled[0]
         target_root_body_id = self._infer_object_root_body_id(model, controlled)
         target_geom_ids = self._collect_target_geom_ids(model, target_root_body_id)
-        if self.config.disable_target_mesh_collision:
+        if self.config.disable_target_collision:
+            self._disable_target_collision(model, target_geom_ids)
+        elif self.config.disable_target_mesh_collision:
             self._disable_target_mesh_collision(model, target_geom_ids)
         hidden_clear_geom_ids: set[int] = set()
         if self.config.hide_clear_meshes:
@@ -413,24 +579,57 @@ class MuJoCoEpisodeRecorder:
                     index,
                     rng,
                 )
+            elif self.config.control_mode == "staggered":
+                lower, upper = self._joint_limits(model, joint_id)
+                data.qpos[qpos_adr] = upper if index % 2 else lower
+                data.qvel[dof_adr] = 0.0
+            elif self.config.control_mode in {"paper_sequential", "paper_simultaneous"}:
+                start_q, _ = paper_targets[joint_id]
+                data.qpos[qpos_adr] = start_q
+                data.qvel[dof_adr] = 0.0
             else:
                 data.qvel[dof_adr] = float(self.config.initial_joint_qvel)
 
-        if self.config.control_mode == "free":
-            mujoco.mj_forward(model, data)
+        mujoco.mj_forward(model, data)
+
+        camera_lookat = [float(value) for value in self.config.lookat]
+        camera_distance = float(self.config.camera_distance)
+        camera_fit_radius = None
+        if self.config.auto_camera_fit:
+            geom_centers = [[float(value) for value in data.geom_xpos[geom_id]] for geom_id in target_geom_ids]
+            geom_radii = [max(0.0, float(model.geom_rbound[geom_id])) for geom_id in target_geom_ids]
+            camera_lookat, camera_distance, camera_fit_radius = _fit_camera_to_bounding_spheres(
+                geom_centers,
+                geom_radii,
+                fovy_deg=float(self.config.camera_fovy_deg),
+                fill_ratio=float(self.config.camera_fit_fill_ratio),
+            )
 
         output_dir = Path(self.config.output_dir).resolve() / self.config.object_instance_id
         assets_dir = output_dir / "assets"
         assets_dir.mkdir(parents=True, exist_ok=True)
 
+        aim_protocol = self.config.recording_protocol in {"aim_style", "aim_style_fixed_end"}
+        effective_camera_mode = "orbit" if aim_protocol else self.config.camera_mode
+        fixed_aim_view_count = len(self.config.aim_interaction_fixed_view_azimuths_deg)
+        interaction_view_count = (
+            fixed_aim_view_count
+            if aim_protocol and fixed_aim_view_count
+            else 3
+            if effective_camera_mode == "triview"
+            else 1
+        )
+        multi_view_interaction = interaction_view_count > 1
         write_concat_assets = _triview_writes_concat_assets(
-            self.config.camera_mode,
+            "triview" if multi_view_interaction else effective_camera_mode,
             self.config.write_concat_assets,
         )
         concat_assets_dir = assets_dir
         per_view_assets_dirs: list[Path] = []
-        if self.config.camera_mode == "triview":
-            per_view_assets_dirs = [assets_dir / f"view_{index}" for index in range(3)]
+        if multi_view_interaction:
+            per_view_assets_dirs = [
+                assets_dir / f"view_{index}" for index in range(interaction_view_count)
+            ]
             for view_dir in per_view_assets_dirs:
                 view_dir.mkdir(parents=True, exist_ok=True)
             if write_concat_assets:
@@ -449,13 +648,82 @@ class MuJoCoEpisodeRecorder:
             self.config.camera_azimuth_start_deg + self.config.camera_triview_spacing_deg,
         ]
 
+        # Mesh bounding spheres can be very conservative. Close the loop with a
+        # few segmentation renders so objects of different scales occupy a
+        # consistent fraction of the image without relying on category tuning.
+        camera_fit_render_fraction = None
+        if self.config.auto_camera_fit:
+            fit_azimuths = (
+                list(self.config.aim_interaction_fixed_view_azimuths_deg)
+                if aim_protocol and fixed_aim_view_count
+                else triview_azimuths
+                if effective_camera_mode == "triview"
+                else [self.config.camera_azimuth_start_deg]
+            )
+            for _ in range(3):
+                observed_fraction = 0.0
+                for azimuth in fit_azimuths:
+                    camera.azimuth = azimuth
+                    camera.elevation = self.config.camera_elevation_deg
+                    camera.distance = camera_distance
+                    camera.lookat[:] = camera_lookat
+                    renderer.enable_segmentation_rendering()
+                    renderer.update_scene(data, camera=camera, scene_option=scene_option)
+                    segmentation = renderer.render()
+                    renderer.disable_segmentation_rendering()
+                    binary_mask = self._segmentation_to_binary_mask_u16(
+                        mujoco=mujoco,
+                        segmentation=segmentation,
+                        target_geom_ids=target_geom_ids,
+                    )
+                    ys, xs = np.nonzero(binary_mask)
+                    if len(xs) == 0:
+                        continue
+                    bbox_fraction = max(
+                        float(xs.max() - xs.min() + 1) / float(self.config.width),
+                        float(ys.max() - ys.min() + 1) / float(self.config.height),
+                    )
+                    observed_fraction = max(observed_fraction, bbox_fraction)
+                if observed_fraction <= 0.0:
+                    break
+                camera_fit_render_fraction = observed_fraction
+                ratio = observed_fraction / float(self.config.camera_fit_fill_ratio)
+                if abs(ratio - 1.0) < 0.03:
+                    break
+                camera_distance *= min(1.5, max(0.35, ratio))
+
+        camera_intrinsics = _intrinsics_from_fovy(
+            width=self.config.width,
+            height=self.config.height,
+            fovy_deg=self.config.camera_fovy_deg,
+        )
+        joint_names = [self._joint_name(mujoco, model, joint_id) for joint_id, _, _ in controlled]
+        aim_static_scan_payload: dict[str, Any] | None = None
+        if aim_protocol:
+            aim_static_scan_payload = self._record_aim_static_scan(
+                mujoco=mujoco,
+                model=model,
+                data=data,
+                renderer=renderer,
+                camera=camera,
+                scene_option=scene_option,
+                output_dir=output_dir,
+                target_geom_ids=target_geom_ids,
+                part_segmentation=part_segmentation,
+                controlled=controlled,
+                joint_names=joint_names,
+                camera_lookat=camera_lookat,
+                camera_distance=camera_distance,
+                camera_intrinsics=camera_intrinsics,
+            )
+
         frame_payload: list[dict[str, Any]] = []
         dynamics_log_rows: list[dict[str, Any]] = []
         concat_video_writer = None
         view_video_writers: list[Any] = []
         if self.config.make_video:
             fps = self.config.video_fps if self.config.video_fps is not None else 1.0 / self.config.frame_dt
-            if self.config.camera_mode == "triview":
+            if multi_view_interaction:
                 concat_video_writer = self._open_video_writer(
                     output_dir=output_dir,
                     fps=fps,
@@ -467,7 +735,7 @@ class MuJoCoEpisodeRecorder:
                         fps=fps,
                         filename=f"episode_view_{index}.mp4",
                     )
-                    for index in range(3)
+                    for index in range(interaction_view_count)
                 ]
             else:
                 concat_video_writer = self._open_video_writer(
@@ -476,8 +744,7 @@ class MuJoCoEpisodeRecorder:
                     filename="episode.mp4",
                 )
         previous_target = joint_limits[0]
-        previous_tracking_force = 0.0
-        joint_names = [self._joint_name(mujoco, model, joint_id) for joint_id, _, _ in controlled]
+        previous_tracking_forces = {joint_id: 0.0 for joint_id, _, _ in controlled}
         staged_secondary_joints = self._select_staged_secondary_joints(mujoco, model, controlled, rng)
         staged_secondary_triggered = False
 
@@ -540,8 +807,82 @@ class MuJoCoEpisodeRecorder:
 
                             raw_tracking_force = self.config.control_kp * (target_q - q) - self.config.control_kd * qdot
                             # A light low-pass filter suppresses high-frequency jitter in rendered motion.
-                            tracking_force = 0.85 * previous_tracking_force + 0.15 * raw_tracking_force
-                            previous_tracking_force = tracking_force
+                            tracking_force = 0.85 * previous_tracking_forces[joint_id] + 0.15 * raw_tracking_force
+                            previous_tracking_forces[joint_id] = tracking_force
+                        elif self.config.control_mode == "staggered":
+                            lower, upper = self._joint_limits(model, joint_id)
+                            target_q = self._staggered_target(
+                                time_s=step_time_s,
+                                duration_s=record_duration_s,
+                                joint_index=joint_index,
+                                joint_count=len(controlled),
+                                lower=lower,
+                                upper=upper,
+                            )
+                            raw_tracking_force = self.config.control_kp * (target_q - q) - self.config.control_kd * qdot
+                            # PartNet contains very light links whose effective joint inertia is
+                            # orders of magnitude below that of doors and drawers. A fixed PD
+                            # torque can make those joints numerically explode, so bound the
+                            # generalized force by an inertia-scaled acceleration limit.
+                            effective_inertia = max(float(model.dof_M0[dof_adr]), 1e-8)
+                            slot_duration = record_duration_s / max(len(controlled), 1)
+                            active_fraction = (0.58, 0.72, 0.64)[joint_index % 3]
+                            active_duration = max(slot_duration * active_fraction, self.config.sim_dt)
+                            peak_target_speed = abs(upper - lower) * math.pi / (2.0 * active_duration)
+                            damping_compensation = float(model.dof_damping[dof_adr]) * peak_target_speed
+                            force_limit = (
+                                effective_inertia * float(self.config.staggered_max_acceleration)
+                                + damping_compensation
+                                + float(model.dof_frictionloss[dof_adr])
+                            )
+                            raw_tracking_force = min(max(raw_tracking_force, -force_limit), force_limit)
+                            tracking_force = 0.85 * previous_tracking_forces[joint_id] + 0.15 * raw_tracking_force
+                            previous_tracking_forces[joint_id] = tracking_force
+                        elif self.config.control_mode == "paper_simultaneous":
+                            start_q, end_q = paper_targets[joint_id]
+                            target_q = self._paper_simultaneous_target(
+                                time_s=step_time_s,
+                                duration_s=record_duration_s,
+                                start_q=start_q,
+                                end_q=end_q,
+                            )
+                            raw_tracking_force = self.config.control_kp * (target_q - q) - self.config.control_kd * qdot
+                            # Use the same conservative force cap as staggered control, but
+                            # derive it from the full synchronized motion duration.
+                            effective_inertia = max(float(model.dof_M0[dof_adr]), 1e-8)
+                            peak_target_speed = abs(end_q - start_q) * 1.5 / max(record_duration_s, self.config.sim_dt)
+                            damping_compensation = float(model.dof_damping[dof_adr]) * peak_target_speed
+                            force_limit = (
+                                effective_inertia * float(self.config.staggered_max_acceleration)
+                                + damping_compensation
+                                + float(model.dof_frictionloss[dof_adr])
+                            )
+                            raw_tracking_force = min(max(raw_tracking_force, -force_limit), force_limit)
+                            tracking_force = 0.85 * previous_tracking_forces[joint_id] + 0.15 * raw_tracking_force
+                            previous_tracking_forces[joint_id] = tracking_force
+                        elif self.config.control_mode == "paper_sequential":
+                            start_q, end_q = paper_targets[joint_id]
+                            target_q = self._paper_sequential_target(
+                                time_s=step_time_s,
+                                duration_s=record_duration_s,
+                                joint_index=joint_index,
+                                joint_count=len(controlled),
+                                start_q=start_q,
+                                end_q=end_q,
+                            )
+                            raw_tracking_force = self.config.control_kp * (target_q - q) - self.config.control_kd * qdot
+                            effective_inertia = max(float(model.dof_M0[dof_adr]), 1e-8)
+                            active_duration = max(record_duration_s / max(len(controlled), 1), self.config.sim_dt)
+                            peak_target_speed = abs(end_q - start_q) * 1.5 / active_duration
+                            damping_compensation = float(model.dof_damping[dof_adr]) * peak_target_speed
+                            force_limit = (
+                                effective_inertia * float(self.config.staggered_max_acceleration)
+                                + damping_compensation
+                                + float(model.dof_frictionloss[dof_adr])
+                            )
+                            raw_tracking_force = min(max(raw_tracking_force, -force_limit), force_limit)
+                            tracking_force = 0.85 * previous_tracking_forces[joint_id] + 0.15 * raw_tracking_force
+                            previous_tracking_forces[joint_id] = tracking_force
 
                         perturb_force = (
                             rng.uniform(-1.0, 1.0) * self.config.perturbation_scale
@@ -578,7 +919,7 @@ class MuJoCoEpisodeRecorder:
                         )
                     mujoco.mj_step(model, data)
 
-                    if self.config.control_mode == "free":
+                    if self.config.control_mode in {"free", "staggered"}:
                         for joint_id, qpos_adr, dof_adr in controlled:
                             lower, upper = self._joint_limits(model, joint_id)
                             if not (math.isfinite(lower) and math.isfinite(upper) and upper > lower):
@@ -592,19 +933,46 @@ class MuJoCoEpisodeRecorder:
                                 data.qvel[dof_adr] = 0.0
                         mujoco.mj_forward(model, data)
 
-                if self.config.camera_mode == "orbit":
+                interaction_elevation_deg = self.config.camera_elevation_deg
+                if aim_protocol:
+                    if fixed_aim_view_count:
+                        azimuths = list(
+                            self.config.aim_interaction_fixed_view_azimuths_deg
+                        )
+                        elevations = list(
+                            self.config.aim_interaction_fixed_view_elevations_deg
+                            or (self.config.camera_elevation_deg,) * fixed_aim_view_count
+                        )
+                    else:
+                        (
+                            interaction_azimuth_deg,
+                            interaction_elevation_deg,
+                        ) = aim_interaction_camera_angles(
+                            alpha,
+                            azimuth_start_deg=self.config.camera_azimuth_start_deg,
+                            elevation_deg=self.config.camera_elevation_deg,
+                            orbit_count=self.config.aim_interaction_camera_orbits,
+                            elevation_amplitude_deg=self.config.aim_interaction_elevation_amplitude_deg,
+                            trajectory=self.config.aim_interaction_camera_trajectory,
+                            motion_end_fraction=self.config.aim_interaction_motion_end_fraction,
+                        )
+                        azimuths = [interaction_azimuth_deg]
+                        elevations = [interaction_elevation_deg]
+                elif effective_camera_mode == "orbit":
                     azimuths = [self.config.camera_azimuth_start_deg + self.config.camera_azimuth_span_deg * alpha]
+                    elevations = [interaction_elevation_deg]
                 else:
                     azimuths = triview_azimuths
+                    elevations = [interaction_elevation_deg] * len(azimuths)
 
                 rgb_views = []
                 depth_views_u16 = []
                 view_camera_poses = []
-                for azimuth in azimuths:
+                for azimuth, elevation in zip(azimuths, elevations, strict=True):
                     camera.azimuth = azimuth
-                    camera.elevation = self.config.camera_elevation_deg
-                    camera.distance = self.config.camera_distance
-                    camera.lookat[:] = list(self.config.lookat)
+                    camera.elevation = elevation
+                    camera.distance = camera_distance
+                    camera.lookat[:] = camera_lookat
 
                     renderer.update_scene(data, camera=camera, scene_option=scene_option)
                     view_camera_poses.append(self._camera_pose_from_scene_camera(renderer.scene.camera[0]))
@@ -651,7 +1019,7 @@ class MuJoCoEpisodeRecorder:
                 view_part_mask_paths: list[Path] = []
                 view_masks_u16: list[Any] = []
                 view_part_masks_u16: list[Any] = []
-                if self.config.camera_mode == "triview":
+                if multi_view_interaction:
                     for view_index, (view_rgb, view_depth_u16) in enumerate(zip(rgb_views, depth_views_u16)):
                         view_rgb_path = per_view_assets_dirs[view_index] / rgb_name
                         view_depth_path = per_view_assets_dirs[view_index] / depth_name
@@ -670,11 +1038,11 @@ class MuJoCoEpisodeRecorder:
                 part_mask_name = f"frame_{frame_index:04d}_part_mask.{mask_ext}"
                 part_mask_path = None
                 if write_binary_masks:
-                    for azimuth in azimuths:
+                    for azimuth, elevation in zip(azimuths, elevations, strict=True):
                         camera.azimuth = azimuth
-                        camera.elevation = self.config.camera_elevation_deg
-                        camera.distance = self.config.camera_distance
-                        camera.lookat[:] = list(self.config.lookat)
+                        camera.elevation = elevation
+                        camera.distance = camera_distance
+                        camera.lookat[:] = camera_lookat
                         renderer.enable_segmentation_rendering()
                         renderer.update_scene(data, camera=camera, scene_option=scene_option)
                         segmentation = renderer.render()
@@ -722,7 +1090,7 @@ class MuJoCoEpisodeRecorder:
                             else:
                                 _write_png_depth_u16(part_mask_path, part_mask_u16)
 
-                    if self.config.camera_mode == "triview":
+                    if multi_view_interaction:
                         for view_index, view_mask_u16 in enumerate(view_masks_u16):
                             view_mask_path = per_view_assets_dirs[view_index] / mask_name
                             if self.config.mask_format == "pgm":
@@ -741,7 +1109,7 @@ class MuJoCoEpisodeRecorder:
                 else:
                     mask_path = None
 
-                if self.config.camera_mode != "triview" and self.config.part_segmentation_masks and part_mask_path is not None:
+                if not multi_view_interaction and self.config.part_segmentation_masks and part_mask_path is not None:
                     view_part_mask_paths = [part_mask_path]
 
                 primary_rgb_path = _primary_view_path(view_rgb_paths, rgb_path)
@@ -817,6 +1185,41 @@ class MuJoCoEpisodeRecorder:
                                 name: float(data.qpos[qpos_adr])
                                 for name, (_, qpos_adr, _) in zip(joint_names, controlled)
                             },
+                            "target_joint_positions": {
+                                name: self._staggered_target(
+                                    time_s=frame_index * self.config.frame_dt,
+                                    duration_s=record_duration_s,
+                                    joint_index=joint_index,
+                                    joint_count=len(controlled),
+                                    lower=self._joint_limits(model, joint_id)[0],
+                                    upper=self._joint_limits(model, joint_id)[1],
+                                )
+                                for joint_index, (name, (joint_id, _, _)) in enumerate(zip(joint_names, controlled))
+                            }
+                            if self.config.control_mode == "staggered"
+                            else {
+                                name: self._paper_simultaneous_target(
+                                    time_s=frame_index * self.config.frame_dt,
+                                    duration_s=record_duration_s,
+                                    start_q=paper_targets[joint_id][0],
+                                    end_q=paper_targets[joint_id][1],
+                                )
+                                for name, (joint_id, _, _) in zip(joint_names, controlled)
+                            }
+                            if self.config.control_mode == "paper_simultaneous"
+                            else {
+                                name: self._paper_sequential_target(
+                                    time_s=frame_index * self.config.frame_dt,
+                                    duration_s=record_duration_s,
+                                    joint_index=joint_index,
+                                    joint_count=len(controlled),
+                                    start_q=paper_targets[joint_id][0],
+                                    end_q=paper_targets[joint_id][1],
+                                )
+                                for joint_index, (name, (joint_id, _, _)) in enumerate(zip(joint_names, controlled))
+                            }
+                            if self.config.control_mode == "paper_sequential"
+                            else {joint_names[0]: float(target_q)},
                         },
                         "joint_position_hint": float(data.qpos[primary_qpos_adr]),
                         "observation_confidence": 1.0,
@@ -832,11 +1235,7 @@ class MuJoCoEpisodeRecorder:
         episode_payload = {
             "object_instance_id": self.config.object_instance_id,
             "category": self.config.category,
-            "camera_intrinsics": _intrinsics_from_fovy(
-                width=self.config.width,
-                height=self.config.height,
-                fovy_deg=self.config.camera_fovy_deg,
-            ),
+            "camera_intrinsics": camera_intrinsics,
             "frames": frame_payload,
             "metadata": {
                 "source": "mujoco-recorder",
@@ -896,30 +1295,44 @@ class MuJoCoEpisodeRecorder:
                     ),
                     "path": (
                         "episode_concat.mp4"
-                        if self.config.make_video and self.config.camera_mode == "triview"
+                        if self.config.make_video and multi_view_interaction
                         else ("episode.mp4" if self.config.make_video else None)
                     ),
                     "paths_by_view": (
-                        [f"episode_view_{index}.mp4" for index in range(3)]
-                        if self.config.make_video and self.config.camera_mode == "triview"
+                        [
+                            f"episode_view_{index}.mp4"
+                            for index in range(interaction_view_count)
+                        ]
+                        if self.config.make_video and multi_view_interaction
                         else []
                     ),
                 },
-                "camera_mode": self.config.camera_mode,
+                "camera_mode": effective_camera_mode,
+                "recording_protocol": self.config.recording_protocol,
                 "camera_pose_convention": "mujoco-gl-forward",
                 "depth_convention": "z-depth",
-                "camera_distance": float(self.config.camera_distance),
+                "camera_distance": float(camera_distance),
+                "auto_camera_fit": bool(self.config.auto_camera_fit),
+                "camera_fit_fill_ratio": float(self.config.camera_fit_fill_ratio),
+                "camera_fit_radius": float(camera_fit_radius) if camera_fit_radius is not None else None,
+                "camera_fit_render_fraction": (
+                    float(camera_fit_render_fraction) if camera_fit_render_fraction is not None else None
+                ),
                 "camera_elevation_deg": float(self.config.camera_elevation_deg),
                 "camera_fovy_deg": float(self.config.camera_fovy_deg),
-                "lookat": [float(v) for v in self.config.lookat],
+                "lookat": [float(v) for v in camera_lookat],
                 "segmentation_masks": bool(self.config.segmentation_masks or self.config.part_segmentation_masks),
                 "part_segmentation_masks": bool(self.config.part_segmentation_masks),
+                "gravity_disabled": bool(self.config.disable_gravity),
                 "mask_format": self.config.mask_format,
                 "triview_asset_layout": (
-                    "concat+views" if write_concat_assets and self.config.camera_mode == "triview" else "views-only"
+                    "concat+views"
+                    if write_concat_assets and multi_view_interaction
+                    else "views-only"
                 ),
                 "part_segmentation": part_segmentation,
                 "disable_target_mesh_collision": bool(self.config.disable_target_mesh_collision),
+                "disable_target_collision": bool(self.config.disable_target_collision),
                 "hide_clear_meshes": bool(self.config.hide_clear_meshes),
                 "hidden_clear_geom_ids": [int(geom_id) for geom_id in sorted(hidden_clear_geom_ids)],
                 "target_root_body_id": int(target_root_body_id),
@@ -927,14 +1340,85 @@ class MuJoCoEpisodeRecorder:
                 "target_geom_ids": [int(geom_id) for geom_id in sorted(target_geom_ids)],
                 "camera_triview_spacing_deg": float(self.config.camera_triview_spacing_deg),
                 "camera_azimuths_deg": (
-                    [float(a) for a in triview_azimuths]
-                    if self.config.camera_mode == "triview"
+                    [
+                        float(a)
+                        for a in self.config.aim_interaction_fixed_view_azimuths_deg
+                    ]
+                    if aim_protocol and fixed_aim_view_count
+                    else [float(a) for a in triview_azimuths]
+                    if effective_camera_mode == "triview"
                     else [float(self.config.camera_azimuth_start_deg), float(self.config.camera_azimuth_start_deg + self.config.camera_azimuth_span_deg)]
+                ),
+                "aim_protocol": (
+                    {
+                        "static_scan_manifest": "aim_protocol/static_scan/cameras.json",
+                        "end_scan_manifest": (
+                            "aim_protocol/end_scan/cameras.json"
+                            if self.config.recording_protocol == "aim_style_fixed_end"
+                            else None
+                        ),
+                        "interaction_camera_manifest": "aim_protocol/interaction/cameras.json",
+                        "interaction_joint_states": "aim_protocol/interaction/joint_states.json",
+                        "static_scan_views": int(self.config.aim_static_scan_views),
+                        "end_scan_views": (
+                            int(self.config.aim_end_scan_views)
+                            if self.config.recording_protocol == "aim_style_fixed_end"
+                            else 0
+                        ),
+                        "static_scan_elevation_deg": float(self.config.aim_static_scan_elevation_deg),
+                        "interaction_camera_orbits": float(self.config.aim_interaction_camera_orbits),
+                        "interaction_camera_trajectory": (
+                            self.config.aim_interaction_camera_trajectory
+                        ),
+                        "interaction_fixed_view_azimuths_deg": [
+                            float(value)
+                            for value in self.config.aim_interaction_fixed_view_azimuths_deg
+                        ],
+                        "interaction_fixed_view_elevations_deg": [
+                            float(value)
+                            for value in self.config.aim_interaction_fixed_view_elevations_deg
+                        ],
+                        "interaction_motion_end_fraction": float(
+                            self.config.aim_interaction_motion_end_fraction
+                        ),
+                        "interaction_elevation_amplitude_deg": float(
+                            self.config.aim_interaction_elevation_amplitude_deg
+                        ),
+                    }
+                    if aim_protocol
+                    else None
                 ),
             },
         }
 
         episode_path = output_dir / "episode.json"
+        if aim_protocol:
+            self._write_aim_interaction_manifests(
+                output_dir=output_dir,
+                frames=frame_payload,
+                camera_intrinsics=camera_intrinsics,
+                static_scan_payload=aim_static_scan_payload,
+            )
+        if self.config.recording_protocol == "aim_style_fixed_end":
+            self._record_aim_static_scan(
+                mujoco=mujoco,
+                model=model,
+                data=data,
+                renderer=renderer,
+                camera=camera,
+                scene_option=scene_option,
+                output_dir=output_dir,
+                target_geom_ids=target_geom_ids,
+                part_segmentation=part_segmentation,
+                controlled=controlled,
+                joint_names=joint_names,
+                camera_lookat=camera_lookat,
+                camera_distance=camera_distance,
+                camera_intrinsics=camera_intrinsics,
+                stage_name="end_scan",
+                stage_label="static_end_state_scan",
+                view_count=self.config.aim_end_scan_views,
+            )
         if self.config.write_dynamics_log:
             dynamics_log_path = output_dir / "dynamics_log.jsonl"
             dynamics_log_path.write_text(
@@ -943,6 +1427,215 @@ class MuJoCoEpisodeRecorder:
             )
         save_json(episode_payload, episode_path)
         return episode_path
+
+    def _record_aim_static_scan(
+        self,
+        *,
+        mujoco: Any,
+        model: Any,
+        data: Any,
+        renderer: Any,
+        camera: Any,
+        scene_option: Any,
+        output_dir: Path,
+        target_geom_ids: set[int],
+        part_segmentation: dict[str, Any] | None,
+        controlled: list[tuple[int, int, int]],
+        joint_names: list[str],
+        camera_lookat: list[float],
+        camera_distance: float,
+        camera_intrinsics: dict[str, float],
+        stage_name: str = "static_scan",
+        stage_label: str = "static_start_state_scan",
+        view_count: int | None = None,
+    ) -> dict[str, Any]:
+        """Render the current fixed joint configuration from a dense orbit."""
+        import numpy as np
+
+        stage_dir = output_dir / "aim_protocol" / stage_name
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        joint_positions = {
+            name: float(data.qpos[qpos_adr])
+            for name, (_, qpos_adr, _) in zip(joint_names, controlled)
+        }
+        views: list[dict[str, Any]] = []
+        angles = aim_static_scan_camera_angles(
+            view_count or self.config.aim_static_scan_views,
+            azimuth_start_deg=self.config.camera_azimuth_start_deg,
+            elevation_deg=self.config.aim_static_scan_elevation_deg,
+        )
+        for view_index, (azimuth_deg, elevation_deg) in enumerate(angles):
+            view_dir = stage_dir / f"view_{view_index:03d}"
+            view_dir.mkdir(parents=True, exist_ok=True)
+            camera.azimuth = azimuth_deg
+            camera.elevation = elevation_deg
+            camera.distance = camera_distance
+            camera.lookat[:] = camera_lookat
+
+            renderer.update_scene(data, camera=camera, scene_option=scene_option)
+            camera_pose = self._camera_pose_from_scene_camera(renderer.scene.camera[0])
+            rgb = renderer.render()
+            renderer.enable_depth_rendering()
+            renderer.update_scene(data, camera=camera, scene_option=scene_option)
+            depth = renderer.render()
+            renderer.disable_depth_rendering()
+            depth_u16 = np.clip(depth * 1000.0, 0.0, 65535.0).astype(np.uint16)
+
+            renderer.enable_segmentation_rendering()
+            renderer.update_scene(data, camera=camera, scene_option=scene_option)
+            segmentation = renderer.render()
+            renderer.disable_segmentation_rendering()
+            if self.config.part_segmentation_masks and part_segmentation is not None:
+                part_mask_u16 = segmentation_to_part_mask_u16(
+                    mujoco=mujoco,
+                    segmentation=segmentation,
+                    target_geom_ids=target_geom_ids,
+                    part_segmentation=part_segmentation,
+                )
+                mask_u16 = self._binary_mask_from_part_mask_u16(part_mask_u16)
+            else:
+                part_mask_u16 = None
+                mask_u16 = self._segmentation_to_binary_mask_u16(
+                    mujoco=mujoco,
+                    segmentation=segmentation,
+                    target_geom_ids=target_geom_ids,
+                )
+
+            rgb_ext = "ppm" if self.config.rgb_format == "ppm" else "png"
+            depth_ext = "pgm" if self.config.depth_format == "pgm" else "png"
+            mask_ext = "pgm" if self.config.mask_format == "pgm" else "png"
+            rgb_path = view_dir / f"rgb.{rgb_ext}"
+            depth_path = view_dir / f"depth.{depth_ext}"
+            mask_path = view_dir / f"mask.{mask_ext}"
+            if self.config.rgb_format == "ppm":
+                _write_ppm(rgb_path, rgb)
+            else:
+                _write_png_rgb(rgb_path, rgb)
+            if self.config.depth_format == "pgm":
+                _write_pgm_u16(depth_path, depth_u16)
+            else:
+                _write_png_depth_u16(depth_path, depth_u16)
+            if self.config.mask_format == "pgm":
+                _write_pgm_u16(mask_path, mask_u16)
+            else:
+                _write_png_depth_u16(mask_path, mask_u16)
+            part_mask_path = None
+            if part_mask_u16 is not None:
+                part_mask_path = view_dir / f"part_mask.{mask_ext}"
+                if self.config.mask_format == "pgm":
+                    _write_pgm_u16(part_mask_path, part_mask_u16)
+                else:
+                    _write_png_depth_u16(part_mask_path, part_mask_u16)
+
+            views.append(
+                {
+                    "view_index": view_index,
+                    "azimuth_deg": azimuth_deg,
+                    "elevation_deg": elevation_deg,
+                    "rgb_path": str(rgb_path.relative_to(output_dir)),
+                    "depth_path": str(depth_path.relative_to(output_dir)),
+                    "mask_path": str(mask_path.relative_to(output_dir)),
+                    "part_mask_path": (
+                        str(part_mask_path.relative_to(output_dir)) if part_mask_path is not None else None
+                    ),
+                    "camera_pose": camera_pose,
+                    "joint_positions": joint_positions,
+                }
+            )
+        payload = {
+            "stage": stage_label,
+            "camera_pose_convention": "mujoco-gl-forward",
+            "camera_intrinsics": camera_intrinsics,
+            "lookat": camera_lookat,
+            "camera_distance": camera_distance,
+            "joint_positions": joint_positions,
+            "views": views,
+        }
+        save_json(payload, stage_dir / "cameras.json")
+        return payload
+
+    def _write_aim_interaction_manifests(
+        self,
+        *,
+        output_dir: Path,
+        frames: list[dict[str, Any]],
+        camera_intrinsics: dict[str, float],
+        static_scan_payload: dict[str, Any] | None,
+    ) -> None:
+        stage_dir = output_dir / "aim_protocol" / "interaction"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        camera_frames = []
+        joint_frames = []
+        for frame_index, frame in enumerate(frames):
+            rgb_paths = frame.get("rgb_paths_by_view") or [frame["rgb_path"]]
+            depth_paths = frame.get("depth_paths_by_view") or [frame["depth_path"]]
+            camera_poses = frame.get("camera_poses_by_view") or [frame["camera_pose"]]
+            mask_paths = frame.get("mask_paths_by_view") or [
+                frame.get("mask_path")
+            ] * len(rgb_paths)
+            camera_frames.append(
+                {
+                    "frame_index": frame_index,
+                    "timestamp_s": frame["timestamp_s"],
+                    "rgb_path": frame["rgb_path"],
+                    "depth_path": frame["depth_path"],
+                    "mask_path": frame.get("mask_path"),
+                    "camera_pose": frame["camera_pose"],
+                    "views": [
+                        {
+                            "view_index": view_index,
+                            "rgb_path": rgb_path,
+                            "depth_path": depth_path,
+                            "mask_path": mask_path,
+                            "camera_pose": camera_pose,
+                        }
+                        for view_index, (
+                            rgb_path,
+                            depth_path,
+                            mask_path,
+                            camera_pose,
+                        ) in enumerate(
+                            zip(
+                                rgb_paths,
+                                depth_paths,
+                                mask_paths,
+                                camera_poses,
+                                strict=True,
+                            )
+                        )
+                    ],
+                }
+            )
+            joint_frames.append(
+                {
+                    "frame_index": frame_index,
+                    "timestamp_s": frame["timestamp_s"],
+                    "joint_positions": frame["action_log"]["joint_positions"],
+                }
+            )
+        save_json(
+            {
+                "stage": (
+                    "synchronized_multiview_interaction"
+                    if any(len(frame["views"]) > 1 for frame in camera_frames)
+                    else "monocular_interaction_video"
+                ),
+                "camera_pose_convention": "mujoco-gl-forward",
+                "camera_intrinsics": camera_intrinsics,
+                "frames": camera_frames,
+            },
+            stage_dir / "cameras.json",
+        )
+        save_json(
+            {
+                "stage": "monocular_interaction_video",
+                "initial_joint_positions": (
+                    static_scan_payload.get("joint_positions", {}) if static_scan_payload else {}
+                ),
+                "frames": joint_frames,
+            },
+            stage_dir / "joint_states.json",
+        )
 
     def _json_dumps(self, value: Any) -> str:
         import json
@@ -1182,6 +1875,92 @@ class MuJoCoEpisodeRecorder:
                 return upper - lower
         return self._target_joint_span_rad(int(model.jnt_type[joint_id]))
 
+    @staticmethod
+    def _staggered_target(
+        *,
+        time_s: float,
+        duration_s: float,
+        joint_index: int,
+        joint_count: int,
+        lower: float,
+        upper: float,
+    ) -> float:
+        """Return a smooth isolated joint target with index-dependent timing and direction."""
+        count = max(1, int(joint_count))
+        slot_s = max(float(duration_s) / count, 1e-6)
+        onset_s = int(joint_index) * slot_s
+        # Vary active duration so different joints do not share a velocity signature.
+        duration_scale = (0.58, 0.72, 0.64)[int(joint_index) % 3]
+        active_s = max(slot_s * duration_scale, 1e-6)
+        phase = min(max((float(time_s) - onset_s) / active_s, 0.0), 1.0)
+        smooth = 0.5 - 0.5 * math.cos(math.pi * phase)
+        fraction = smooth if int(joint_index) % 2 == 0 else 1.0 - smooth
+        return float(lower) + fraction * (float(upper) - float(lower))
+
+    @staticmethod
+    def _paper_simultaneous_target(
+        *,
+        time_s: float,
+        duration_s: float,
+        start_q: float,
+        end_q: float,
+    ) -> float:
+        """Return a shared smoothstep trajectory with no per-joint time offset."""
+        phase = min(max(float(time_s) / max(float(duration_s), 1e-6), 0.0), 1.0)
+        smoothstep = phase * phase * (3.0 - 2.0 * phase)
+        return float(start_q) + smoothstep * (float(end_q) - float(start_q))
+
+    @classmethod
+    def _paper_sequential_target(
+        cls,
+        *,
+        time_s: float,
+        duration_s: float,
+        joint_index: int,
+        joint_count: int,
+        start_q: float,
+        end_q: float,
+    ) -> float:
+        """Use the exact same ranges as paper_simultaneous, but isolated time slots."""
+        slot_s = max(float(duration_s) / max(int(joint_count), 1), 1e-6)
+        local_time_s = float(time_s) - int(joint_index) * slot_s
+        return cls._paper_simultaneous_target(
+            time_s=local_time_s,
+            duration_s=slot_s,
+            start_q=start_q,
+            end_q=end_q,
+        )
+
+    def _paper_simultaneous_targets(self, mujoco, model, controlled: list[tuple[int, int, int]]) -> dict[int, tuple[float, float]]:
+        """Validate exact paper ranges against the controlled MuJoCo joints."""
+        if self.config.control_mode not in {"paper_sequential", "paper_simultaneous"}:
+            return {}
+        configured: dict[str, tuple[float, float]] = {}
+        for name, start_q, end_q in self.config.paper_simultaneous_joints:
+            if name in configured:
+                raise ValueError(f"Duplicate paper simultaneous target for joint {name!r}")
+            configured[str(name)] = (float(start_q), float(end_q))
+        if not configured:
+            raise ValueError("paper_simultaneous requires one or more paper_simultaneous_joints")
+        targets: dict[int, tuple[float, float]] = {}
+        controlled_names = set()
+        for joint_id, _, _ in controlled:
+            name = self._joint_name(mujoco, model, joint_id)
+            controlled_names.add(name)
+            if name not in configured:
+                raise ValueError(f"Missing paper simultaneous target for controlled joint {name!r}")
+            start_q, end_q = configured[name]
+            lower, upper = self._joint_limits(model, joint_id)
+            if not (lower - 1e-6 <= start_q <= upper + 1e-6 and lower - 1e-6 <= end_q <= upper + 1e-6):
+                raise ValueError(
+                    f"Paper target for {name!r} ({start_q}, {end_q}) is outside MuJoCo range ({lower}, {upper})"
+                )
+            targets[joint_id] = (start_q, end_q)
+        unknown = sorted(set(configured) - controlled_names)
+        if unknown:
+            raise ValueError(f"Paper simultaneous targets name uncontrolled joints: {', '.join(unknown)}")
+        return targets
+
     def _target_joint_span_rad(self, joint_type: int) -> float:
         # Prefer door-like partial hinges for hinge-centric categories and short slides
         # for prismatic categories. Full-turn categories bias toward larger rotary spans.
@@ -1337,6 +2116,11 @@ class MuJoCoEpisodeRecorder:
         for geom_id in target_geom_ids:
             if int(model.geom_type[geom_id]) != 7:
                 continue
+            model.geom_contype[geom_id] = 0
+            model.geom_conaffinity[geom_id] = 0
+
+    def _disable_target_collision(self, model, target_geom_ids: set[int]) -> None:
+        for geom_id in target_geom_ids:
             model.geom_contype[geom_id] = 0
             model.geom_conaffinity[geom_id] = 0
 

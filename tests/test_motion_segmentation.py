@@ -785,10 +785,23 @@ class MotionSegmentationTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            gt_path = root / "relation_gt.json"
+            gt_path.write_text(
+                json.dumps({"joints": [{
+                    "name": "door_hinge",
+                    "joint_type": "revolute",
+                    "parent_part_id": 1,
+                    "child_part_id": 2,
+                    "axis": [0.0, 0.0, 1.0],
+                    "pivot": [0.1, 0.2, 0.3],
+                }]}) + "\n",
+                encoding="utf-8",
+            )
             html_path = ObjectMaskFlowHtmlBuilder().build(
                 ObjectMaskFlowHtmlConfig(
                     motion_tracks=tracks_path,
                     output_html=root / "flow.html",
+                    gt_joint_annotation=gt_path,
                     max_tracks=2,
                     frame_stride=1,
                     trail_length=2,
@@ -812,10 +825,28 @@ class MotionSegmentationTests(unittest.TestCase):
             self.assertIn("function clippedAxisSegment", html)
             self.assertIn("Track quality", html)
             self.assertIn("hideLowQualityTimesteps", html)
-            self.assertIn("...buildJointTraces(activeTracks, frameIndex, colorBy)", html)
+            self.assertIn("...buildJointTraces(activeTracks, frameIndex, colorBy, smoothWindow)", html)
+            self.assertIn("...buildGtJointTraces()", html)
+            self.assertIn("Show GT axes", html)
+            self.assertIn('"name":"door_hinge"', html)
+            self.assertIn("smoothWindowSlider", html)
+            self.assertIn("trailWidthSlider", html)
+            self.assertIn("pointSizeSlider", html)
+            self.assertIn("Export current view PNG", html)
             self.assertIn("function childCentroidAtFrame", html)
+            self.assertIn("Number(sample.frame_index) !== Number(prevSample.frame_index) + 1", html)
             self.assertIn("Show GT MJCF mesh replay", html)
             self.assertIn("function buildMjcfMeshTraces", html)
+            self.assertIn("GT joint annotation", html)
+            self.assertIn("Assign clicked track", html)
+            self.assertIn("Assign clicked cluster", html)
+            self.assertIn("Manual GT part annotation", html)
+            self.assertIn("track_labels: trackLabels", html)
+            self.assertIn("part_names: partNames", html)
+            self.assertIn("customdata: group.trackIds", html)
+            self.assertIn("Use click as A/pivot", html)
+            self.assertIn("function exportJointAnnotations", html)
+            self.assertIn('annotation_source: "manual-html-viewer"', html)
             self.assertIn("\"track_count_embedded\":2", html)
             self.assertIn("\"default_color_by\":\"gt_part\"", html)
 
@@ -832,6 +863,45 @@ class MotionSegmentationTests(unittest.TestCase):
             html_path = ObjectMaskFlowHtmlBuilder().build(ObjectMaskFlowHtmlConfig(motion_tracks=tracks_path))
             self.assertEqual(html_path, (root / "viewers" / "object_mask_flow_viewer.html").resolve())
             self.assertTrue(html_path.exists())
+
+    def test_object_mask_flow_html_accepts_neural_relation_selected_edges(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tracks_path = root / "motion_part_tracks.json"
+            tracks_path.write_text(
+                json.dumps({"tracks": [{**_track(1, [0.0, 0.0, 0.0], [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]]), "part_id": 2}]}) + "\n",
+                encoding="utf-8",
+            )
+            joints_path = root / "joint_inference_neural.json"
+            joints_path.write_text(
+                json.dumps(
+                    {
+                        "selected_edges": [
+                            {
+                                "parent_slot_id": 1,
+                                "child_slot_id": 2,
+                                "joint_type": "revolute",
+                                "axis_world": [0.0, 1.0, 0.0],
+                                "axis_line_point_world": [0.1, 0.2, 0.3],
+                            }
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            html_path = ObjectMaskFlowHtmlBuilder().build(
+                ObjectMaskFlowHtmlConfig(
+                    motion_tracks=tracks_path,
+                    joint_inference=joints_path,
+                    output_html=root / "flow.html",
+                )
+            )
+            html = html_path.read_text(encoding="utf-8")
+            self.assertIn('"name":"motion_slot_2_joint"', html)
+            self.assertIn('"parent_part_id":1', html)
+            self.assertIn('"child_part_id":2', html)
+            self.assertIn('"pivot":[0.1,0.2,0.3]', html)
 
     def test_object_mask_flow_html_embeds_source_aligned_background_geometry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

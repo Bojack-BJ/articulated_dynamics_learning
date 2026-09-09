@@ -13,6 +13,7 @@ from rgbd_urdf_mvp.kinematics.evaluation import (
     ObjectMaskKinematicEvaluator,
     _joint_cleanup_recommendation,
     _joint_failure_reason_guess,
+    _object_mask_summary,
 )
 from rgbd_urdf_mvp.kinematics.local_split_candidate_evaluation import (
     LocalSplitCandidateEvaluationConfig,
@@ -21,6 +22,38 @@ from rgbd_urdf_mvp.kinematics.local_split_candidate_evaluation import (
 
 
 class KinematicEvaluationTests(unittest.TestCase):
+    def test_type_mismatch_is_excluded_from_axis_and_pivot_summary(self) -> None:
+        summary = _object_mask_summary(
+            predicted_joints=[{}, {}],
+            gt_priors={1: {}, 2: {}},
+            directed_matches=[
+                {
+                    "ground_truth_joint_type": "revolute",
+                    "joint_type_correct": True,
+                    "axis_angle_error_deg": 4.0,
+                    "pivot_error_m": 0.02,
+                },
+                {
+                    "ground_truth_joint_type": "revolute",
+                    "joint_type_correct": False,
+                    "axis_angle_error_deg": 80.0,
+                    "pivot_error_m": 1.0,
+                },
+            ],
+            undirected_matches=[],
+            reverse_matches=[],
+            overlap={},
+        )
+
+        self.assertEqual(summary["joint_type_accuracy"], 0.5)
+        self.assertEqual(summary["axis_evaluable_joint_count"], 1)
+        self.assertEqual(summary["axis_angle_error_deg_mean"], 4.0)
+        self.assertEqual(summary["axis_angle_error_deg_median"], 4.0)
+        self.assertEqual(summary["pivot_error_m_mean"], 0.02)
+        revolute = summary["by_ground_truth_joint_type"]["revolute"]
+        self.assertEqual(revolute["joint_type_accuracy"], 0.5)
+        self.assertEqual(revolute["axis_evaluable_joint_count"], 1)
+
     def test_parser_accepts_kinematic_eval_command(self) -> None:
         parser = build_parser()
         args = parser.parse_args(
